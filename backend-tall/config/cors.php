@@ -16,12 +16,10 @@ return [
 
     'allowed_methods' => ['*'],
 
-    'allowed_origins' => [
-        env('FRONTEND_URL', 'http://localhost:3000'),
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
-        'http://116.254.113.81',
-    ],
+    // Temporarily open for Vercel deployment.
+    // Once the Vercel URL is known, replace '*' with the specific domain
+    // and re-enable supports_credentials for Sanctum SPA cookie auth.
+    'allowed_origins' => ['*'],
 
     'allowed_origins_patterns' => [],
 
@@ -29,8 +27,8 @@ return [
 
     'exposed_headers' => [],
 
-    'max_age' => 0,
+    'max_age' => 86400,
 
-    'supports_credentials' => true,
+    'supports_credentials' => false,
 
 ];

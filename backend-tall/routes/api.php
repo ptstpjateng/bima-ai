@@ -25,6 +25,7 @@ Route::prefix('auth')->group(function () {
 // ── Internal AI-engine endpoints (X-Internal-Key) ──────────────────────────
 Route::prefix('internal')->group(function () {
     Route::get('/user-context/{userId}', [UserContextController::class, 'show']);
+    Route::post('/ai-logs', [AiLogController::class, 'storeInternal']);
 });
 
 // ── Magic link generation via Sanctum (admin/staff via dashboard) ─────────────

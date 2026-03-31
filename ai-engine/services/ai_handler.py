@@ -114,10 +114,12 @@ async def generate_ai_response(user_id: str, message: str) -> str:
 
 
 async def _call_gemini(prompt: str) -> str:
-    """Call Gemini 1.5 Flash via REST API."""
+    """Call Gemini via REST API."""
+    # Strip 'models/' prefix if user set GEMINI_MODEL=models/gemini-2.5-flash
+    model_name = _GEMINI_MODEL.removeprefix("models/")
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{_GEMINI_MODEL}:generateContent?key={_GEMINI_API_KEY}"
+        f"{model_name}:generateContent?key={_GEMINI_API_KEY}"
     )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -231,17 +233,17 @@ async def _send_telegram_reply(chat_id: int, message: str) -> None:
 # 3. Backend logger (fire-and-forget)
 # ---------------------------------------------------------------------------
 
-async def log_to_backend(user_id: str, prompt: str, ai_response: str) -> None:
+async def log_to_backend(user_id: str, prompt: str, ai_response: str, channel: str = "telegram") -> None:
     if not _LARAVEL_API_KEY:
         logger.warning("LARAVEL_API_KEY not set — skipping log | user_id=%s", user_id)
         return
 
-    session_id = f"tg-{user_id}-{uuid.uuid4().hex[:8]}"
+    session_id = f"{channel[:2]}-{user_id}-{uuid.uuid4().hex[:8]}"
 
     # Log user message
-    await _post_log(session_id, 0, "telegram", "user_message", prompt, user_id)
+    await _post_log(session_id, 0, channel, "user_message", prompt, user_id)
     # Log AI response
-    await _post_log(session_id, 1, "telegram", "ai_response", ai_response, user_id)
+    await _post_log(session_id, 1, channel, "ai_response", ai_response, user_id)
 
 
 async def _post_log(
@@ -252,11 +254,11 @@ async def _post_log(
     content: str,
     user_id: str,
 ) -> None:
-    url = f"{_LARAVEL_BACKEND_URL}/api/ai-logs"
+    url = f"{_LARAVEL_BACKEND_URL}/api/internal/ai-logs"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "Authorization": f"Bearer {_LARAVEL_API_KEY}",
+        "X-Internal-Key": _LARAVEL_API_KEY,
     }
     payload: dict[str, Any] = {
         "session_id":   session_id,

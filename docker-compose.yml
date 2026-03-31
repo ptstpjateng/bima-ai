@@ -74,7 +74,7 @@ services:
         condition: service_healthy
 
   # ──────────────────────────────────────────────
-  # Reverse Proxy (nginx — single public port 80)
+  # Reverse Proxy (nginx — port 80 for admin/assets)
   # ──────────────────────────────────────────────
   proxy:
     image: nginx:1.27-alpine
@@ -87,7 +87,6 @@ services:
       - bima-public
     depends_on:
       - backend
-      - frontend
 
   # ──────────────────────────────────────────────
   # TALL Backend (Laravel 13 + FrankenPHP)
@@ -114,6 +113,8 @@ services:
       CACHE_STORE: redis
       FRONTEND_URL: ${FRONTEND_URL:-http://116.254.113.81}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-me-in-production}
+    ports:
+      - "8000:80"
     volumes:
       - backend_storage:/var/www/html/storage/app
     networks:
@@ -160,24 +161,6 @@ services:
       backend:
         condition: service_healthy
 
-  # ──────────────────────────────────────────────
-  # Frontend (Next.js)
-  # ──────────────────────────────────────────────
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://116.254.113.81}
-    restart: unless-stopped
-    env_file: ./frontend/.env
-    environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://116.254.113.81}
-    networks:
-      - bima-public
-    depends_on:
-      backend:
-        condition: service_healthy
 
 # ──────────────────────────────────────────────
 # Networks

@@ -48,6 +48,24 @@ class AiLogController extends ApiController
     }
 
     /**
+     * POST /api/internal/ai-logs
+     *
+     * Called by the Python AI engine via X-Internal-Key header.
+     * No Sanctum token required.
+     */
+    public function storeInternal(Request $request): JsonResponse
+    {
+        $internalKey = config('app.internal_api_key');
+        $providedKey  = $request->header('X-Internal-Key');
+
+        if (! $internalKey || ! $providedKey || ! hash_equals($internalKey, (string) $providedKey)) {
+            return $this->error('Akses ditolak.', 403, 'FORBIDDEN');
+        }
+
+        return $this->store($request);
+    }
+
+    /**
      * POST /api/ai-logs
      *
      * Called by the Python AI engine to push a chat log entry.
