@@ -95,6 +95,8 @@ services:
       QUEUE_CONNECTION: redis
       SESSION_DRIVER: redis
       CACHE_STORE: redis
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-me-in-production}
     volumes:
       - backend_storage:/var/www/html/storage/app
     ports:

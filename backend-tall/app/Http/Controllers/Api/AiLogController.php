@@ -11,6 +11,43 @@ use Illuminate\Validation\ValidationException;
 class AiLogController extends ApiController
 {
     /**
+     * GET /api/ai-logs
+     *
+     * Returns the AI interaction history for the authenticated user.
+     * Returns the 50 most recent interactions across all sessions.
+     */
+    public function index(Request $request): JsonResponse
+    {
+        try {
+            /** @var \App\Models\User $user */
+            $user = $request->user();
+
+            $interactions = AiInteraction::where('user_id', $user->id)
+                ->orderByDesc('created_at')
+                ->limit(50)
+                ->get([
+                    'id',
+                    'session_id',
+                    'turn_index',
+                    'channel',
+                    'message_type',
+                    'content',
+                    'intent',
+                    'confidence_score',
+                    'created_at',
+                ]);
+
+            return $this->success([
+                'interactions' => $interactions,
+                'total'        => $interactions->count(),
+            ]);
+
+        } catch (\Throwable $e) {
+            return $this->serverError($e, 'AiLogController@index');
+        }
+    }
+
+    /**
      * POST /api/ai-logs
      *
      * Called by the Python AI engine to push a chat log entry.

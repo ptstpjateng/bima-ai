@@ -13,7 +13,11 @@ return [
     |
     */
 
-    'name' => env('APP_NAME', 'Laravel'),
+    'name' => env('APP_NAME', 'BIMA-AI'),
+
+    'frontend_url' => env('FRONTEND_URL', 'http://localhost:3000'),
+
+    'internal_api_key' => env('INTERNAL_API_KEY'),
 
     /*
     |--------------------------------------------------------------------------

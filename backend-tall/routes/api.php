@@ -1,41 +1,41 @@
 <?php
 
 use App\Http\Controllers\Api\AiLogController;
+use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\PermitController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
-/*
-|--------------------------------------------------------------------------
-| API Routes
-|--------------------------------------------------------------------------
-|
-| All routes below are protected by Sanctum token authentication.
-| Unauthenticated requests receive a standardized 401 JSON response.
-|
-*/
-
-// Health check — unauthenticated, used by uptime monitors.
+// ── Health check (unauthenticated) ───────────────────────────────────────────
 Route::get('/health', fn () => response()->json(['status' => 'ok', 'service' => 'BIMA-AI API']));
 
-// ---------------------------------------------------------------------------
-// Authenticated routes (Sanctum token)
-// ---------------------------------------------------------------------------
+// ── Public auth routes ────────────────────────────────────────────────────────
+Route::prefix('auth')->group(function () {
+    Route::post('/login', [AuthController::class, 'login']);
+    Route::get('/magic/{token}', [AuthController::class, 'redeemMagicLink']);
+
+    // Magic link generation via X-Internal-Key (AI engine / internal services).
+    Route::post('/magic-link/generate', [AuthController::class, 'generateMagicLink']);
+});
+
+// ── Magic link generation via Sanctum (admin/staff via dashboard) ─────────────
+Route::middleware('auth:sanctum')->prefix('auth')->group(function () {
+    Route::post('/magic-link/generate-admin', [AuthController::class, 'generateMagicLink']);
+});
+
+// ── Authenticated routes (Sanctum token) ─────────────────────────────────────
 Route::middleware('auth:sanctum')->group(function () {
 
-    // Authenticated user info
     Route::get('/user', fn (Request $request) => response()->json($request->user()));
+    Route::get('/auth/me', [AuthController::class, 'me']);
+    Route::post('/auth/logout', [AuthController::class, 'logout']);
 
-    // --- AI Engine -----------------------------------------------------------
-    // POST /api/ai-logs
-    // Python AI engine pushes chat log entries here.
+    // AI Engine: push chat log entries + fetch history for current user
     Route::post('/ai-logs', [AiLogController::class, 'store']);
+    Route::get('/ai-logs', [AiLogController::class, 'index']);
 
-    // --- Permit Applications -------------------------------------------------
-    // GET  /api/permits/{user_id}  — fetch active permits for a user
-    // POST /api/permits/apply      — submit a new permit application
+    // Permit Applications
     Route::get('/permits/{user_id}', [PermitController::class, 'index'])
         ->whereNumber('user_id');
-
     Route::post('/permits/apply', [PermitController::class, 'apply']);
 });
