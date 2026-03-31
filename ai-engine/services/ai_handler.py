@@ -1,21 +1,17 @@
 """
 BIMA-AI – AI Handler Service
 
-Pipeline for every inbound message:
-  1. generate_ai_response  – placeholder LLM call (swap for LangChain RAG in Step 3)
-  2. send_platform_reply   – dispatches reply back to WhatsApp or Telegram
-  3. log_to_backend        – async POST to Laravel /api/ai-logs (fire-and-forget)
-  4. process_message       – single entry point wiring the steps above
-
-Error contract:
-  - generate_ai_response always returns a string (fallback on failure).
-  - send_platform_reply and log_to_backend never raise; failures are logged only.
-  - A downed Laravel backend or unreachable messaging API must never block the
-    pipeline or surface as an unhandled exception.
+Full pipeline for every inbound message:
+  1. fetch_user_context  – pull user's business profile + license vault from Laravel
+  2. query_regulations   – semantic RAG search in ChromaDB
+  3. generate_ai_response – call Gemini LLM (falls back to smart placeholder)
+  4. send_platform_reply – send reply to WhatsApp or Telegram
+  5. log_to_backend      – async POST to Laravel /api/ai-logs (fire-and-forget)
 """
 
 import logging
 import os
+import uuid
 from typing import Any, Literal
 
 import httpx
@@ -29,15 +25,14 @@ logger = logging.getLogger("bima_ai.ai_handler")
 # Configuration
 # ---------------------------------------------------------------------------
 
-_LARAVEL_BACKEND_URL: str = os.getenv("LARAVEL_BACKEND_URL", "http://localhost:8000")
-_LARAVEL_API_KEY: str = os.getenv("LARAVEL_API_KEY", "")
-_LOG_ENDPOINT: str = f"{_LARAVEL_BACKEND_URL}/api/ai-logs"
-_LOG_TIMEOUT_SECONDS: float = 5.0
+_LARAVEL_BACKEND_URL: str = os.getenv("LARAVEL_BACKEND_URL", "http://backend:80")
+_LARAVEL_API_KEY: str     = os.getenv("LARAVEL_API_KEY", "")
+_GEMINI_API_KEY: str      = os.getenv("GEMINI_API_KEY", "")
+_GEMINI_MODEL: str        = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-_WHATSAPP_API_TOKEN: str = os.getenv("WHATSAPP_API_TOKEN", "")
+_WHATSAPP_API_TOKEN: str   = os.getenv("WHATSAPP_API_TOKEN", "")
 _WHATSAPP_API_VERSION: str = os.getenv("WHATSAPP_API_VERSION", "v19.0")
-
-_TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_TELEGRAM_BOT_TOKEN: str   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 Platform = Literal["whatsapp", "telegram"]
 
@@ -45,108 +40,150 @@ Platform = Literal["whatsapp", "telegram"]
 # System prompt
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT: str = """
-You are BIMA-AI, an intelligent business assistant helping Indonesian MSMEs
-(Usaha Mikro, Kecil, dan Menengah) navigate the OSS RBA (Online Single
-Submission – Risk-Based Approach) licensing system administered by DPMPTSP.
+_SYSTEM_PROMPT = """
+Kamu adalah BIMA-AI, asisten cerdas yang membantu pelaku UMKM Indonesia
+menavigasi sistem perizinan OSS RBA (Online Single Submission – Risk-Based
+Approach) yang dikelola oleh DPMPTSP Jawa Tengah.
 
-Core rules:
-- Be helpful, concise, and empathetic. Translate bureaucratic language into
-  plain, practical guidance a small business owner can act on immediately.
-- Specialise in Central Java (Jawa Tengah) licensing nuances: DPMPTSP
-  requirements, local KBLI (Klasifikasi Baku Lapangan Usaha Indonesia) codes,
-  regional regulation specifics, and Pemerintah Provinsi Jawa Tengah policies.
-- When a user describes a business activity, identify the correct KBLI code(s)
-  and explain which OSS RBA licences, NIB (Nomor Induk Berusaha), or
-  certificates are required.
-- Ask one focused clarifying question if the request is ambiguous rather than
-  guessing.
-- Never fabricate regulation article numbers, ministerial decree references, or
-  legal citations. Acknowledge uncertainty and offer to verify.
-- Match the user's language: respond in Bahasa Indonesia if they write in
-  Indonesian, in English if they write in English.
-- Keep replies short enough to read comfortably on a mobile screen (≤ 5 short
-  paragraphs or a brief bulleted list).
+Aturan utama:
+- Bersikap membantu, ringkas, dan empatik. Terjemahkan bahasa birokrasi menjadi
+  panduan praktis yang langsung bisa dilakukan oleh pemilik usaha kecil.
+- Spesialisasi perizinan Jawa Tengah: persyaratan DPMPTSP, kode KBLI, regulasi
+  daerah, dan kebijakan Pemprov Jateng.
+- Jika pengguna mendeskripsikan kegiatan usaha, identifikasi kode KBLI yang tepat
+  dan jelaskan izin OSS RBA, NIB, atau sertifikat yang dibutuhkan.
+- Jika ada konteks profil pengguna, gunakan informasi tersebut untuk memberikan
+  saran yang dipersonalisasi (sebutkan nama usaha, KBLI, skala, dll).
+- Jika ada konteks regulasi (dari ChromaDB), gunakan sebagai referensi akurat.
+  Jangan mengarang nomor pasal atau referensi hukum.
+- Ajukan satu pertanyaan klarifikasi jika permintaan ambigu.
+- Balas dalam Bahasa Indonesia jika pengguna menulis dalam Bahasa Indonesia,
+  dalam Bahasa Inggris jika dalam Bahasa Inggris.
+- Jawaban singkat — muat dalam layar HP (≤ 5 paragraf pendek atau daftar singkat).
 """.strip()
 
 
 # ---------------------------------------------------------------------------
-# 1. LLM placeholder
+# 1. LLM call (Gemini 1.5 Flash) with graceful fallback
 # ---------------------------------------------------------------------------
 
 async def generate_ai_response(user_id: str, message: str) -> str:
     """
-    Generate an AI reply for the given user message.
-
-    This is a structured placeholder. Replace the marked block below with your
-    LangChain / LlamaIndex RAG chain in Step 3. The function signature, error
-    contract, and return type must remain unchanged.
-
-    Returns:
-        The AI reply string. Never raises; returns a safe fallback on any error.
+    Generate a personalized AI reply:
+    1. Fetch user context from Laravel (business profile + licenses)
+    2. Retrieve relevant regulations from ChromaDB (RAG)
+    3. Call Gemini 1.5 Flash — falls back to structured placeholder if no key
     """
+    from services.rag_service import format_rag_context, query_regulations
+    from services.user_context import fetch_user_context, format_user_context
+
     try:
-        # ------------------------------------------------------------------ #
-        # REPLACE THIS BLOCK IN STEP 3 with your LangChain RAG chain:        #
-        #                                                                      #
-        #   from services.rag_chain import build_chain                        #
-        #   chain = build_chain()                                              #
-        #   result = await chain.ainvoke({                                    #
-        #       "system_prompt": _SYSTEM_PROMPT,                              #
-        #       "question": message,                                           #
-        #       "user_id": user_id,                                            #
-        #   })                                                                 #
-        #   return result["answer"]                                            #
-        # ------------------------------------------------------------------ #
-
-        logger.info("LLM placeholder invoked | user_id=%s", user_id)
-
-        return (
-            f"[BIMA-AI] Halo! Pesan Anda telah diterima:\n\n"
-            f"\"{message}\"\n\n"
-            f"Integrasi RAG/LLM sedang disiapkan. Sebentar lagi saya akan "
-            f"membantu Anda menavigasi perizinan OSS RBA secara penuh. "
-            f"Ada pertanyaan lain yang bisa saya bantu?"
+        # --- Step 1: Fetch user context and RAG in parallel ---
+        import asyncio
+        user_ctx_task = asyncio.create_task(fetch_user_context(user_id))
+        rag_chunks    = await asyncio.get_event_loop().run_in_executor(
+            None, query_regulations, message
         )
+        user_ctx = await user_ctx_task
+
+        user_ctx_str = format_user_context(user_ctx)
+        rag_ctx_str  = format_rag_context(rag_chunks)
+
+        # --- Step 2: Build full prompt ---
+        parts = [_SYSTEM_PROMPT]
+        if user_ctx_str:
+            parts.append("\n" + user_ctx_str)
+        if rag_ctx_str:
+            parts.append("\n" + rag_ctx_str)
+        parts.append(f"\nPertanyaan pengguna: {message}")
+        full_prompt = "\n".join(parts)
+
+        # --- Step 3: Call Gemini ---
+        if _GEMINI_API_KEY:
+            return await _call_gemini(full_prompt)
+        else:
+            # Smart placeholder that still uses context
+            return _smart_placeholder(message, user_ctx, rag_chunks)
 
     except Exception:
-        logger.exception("LLM generation failed | user_id=%s", user_id)
+        logger.exception("generate_ai_response failed | user_id=%s", user_id)
         return (
             "Maaf, terjadi gangguan teknis sementara. "
             "Silakan coba lagi dalam beberapa saat. Terima kasih atas kesabaran Anda."
         )
 
 
+async def _call_gemini(prompt: str) -> str:
+    """Call Gemini 1.5 Flash via REST API."""
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{_GEMINI_MODEL}:generateContent?key={_GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 1024,
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            text = (
+                data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+            )
+            if text:
+                logger.info("Gemini response received | chars=%d", len(text))
+                return text.strip()
+    except Exception:
+        logger.exception("Gemini API call failed — using placeholder.")
+
+    return "Maaf, layanan AI sedang tidak tersedia. Silakan coba lagi sebentar."
+
+
+def _smart_placeholder(
+    message: str,
+    user_ctx: dict,
+    rag_chunks: list,
+) -> str:
+    """
+    Contextual placeholder used when GEMINI_API_KEY is not set.
+    Acknowledges user's business context and shows RAG is working.
+    """
+    user = user_ctx.get("user", {}) if user_ctx.get("found") else {}
+    name = user.get("business_name") or user.get("name") or "Anda"
+
+    rag_note = ""
+    if rag_chunks:
+        top = rag_chunks[0]
+        rag_note = f"\n\nSaya menemukan referensi regulasi terkait: *{top.get('title', '')}*."
+
+    return (
+        f"Halo, *{name}*! Pertanyaan Anda tentang:\n\n"
+        f"_{message}_\n\n"
+        f"sedang saya proses. Integrasi LLM (Gemini) belum dikonfigurasi — "
+        f"tambahkan `GEMINI_API_KEY` ke file `.env` mesin AI untuk mengaktifkan "
+        f"jawaban cerdas penuh berbasis RAG.{rag_note}\n\n"
+        f"Ada yang bisa saya bantu lainnya?"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2. Platform reply senders
 # ---------------------------------------------------------------------------
 
-async def _send_whatsapp_reply(
-    phone_number_id: str,
-    recipient_wa_id: str,
-    message: str,
-) -> None:
-    """
-    Send a text reply via the Meta Cloud API (WhatsApp Business Platform).
-
-    Docs: https://developers.facebook.com/docs/whatsapp/cloud-api/messages/text
-    Requires WHATSAPP_API_TOKEN in the environment.
-    """
+async def _send_whatsapp_reply(phone_number_id: str, recipient_wa_id: str, message: str) -> None:
     if not _WHATSAPP_API_TOKEN:
-        logger.warning(
-            "WHATSAPP_API_TOKEN not set – cannot send reply | recipient=%s",
-            recipient_wa_id,
-        )
+        logger.warning("WHATSAPP_API_TOKEN not set | recipient=%s", recipient_wa_id)
         return
 
-    url = (
-        f"https://graph.facebook.com/{_WHATSAPP_API_VERSION}"
-        f"/{phone_number_id}/messages"
-    )
-    headers = {
-        "Authorization": f"Bearer {_WHATSAPP_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    url = f"https://graph.facebook.com/{_WHATSAPP_API_VERSION}/{phone_number_id}/messages"
+    headers = {"Authorization": f"Bearer {_WHATSAPP_API_TOKEN}", "Content-Type": "application/json"}
     payload: dict[str, Any] = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -154,157 +191,94 @@ async def _send_whatsapp_reply(
         "type": "text",
         "text": {"preview_url": False, "body": message},
     }
-
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            logger.info(
-                "WhatsApp reply sent | recipient=%s | status=%s",
-                recipient_wa_id,
-                response.status_code,
-            )
-    except httpx.TimeoutException:
-        logger.warning(
-            "WhatsApp API timed out | recipient=%s", recipient_wa_id
-        )
-    except httpx.HTTPStatusError as exc:
-        logger.warning(
-            "WhatsApp API error | recipient=%s | status=%s | body=%s",
-            recipient_wa_id,
-            exc.response.status_code,
-            exc.response.text[:300],
-        )
-    except httpx.RequestError as exc:
-        logger.warning(
-            "WhatsApp API unreachable | recipient=%s | error=%s",
-            recipient_wa_id,
-            str(exc),
-        )
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            logger.info("WhatsApp reply sent | recipient=%s", recipient_wa_id)
     except Exception:
-        logger.exception(
-            "Unexpected error sending WhatsApp reply | recipient=%s", recipient_wa_id
-        )
+        logger.exception("WhatsApp reply failed | recipient=%s", recipient_wa_id)
 
 
 async def _send_telegram_reply(chat_id: int, message: str) -> None:
-    """
-    Send a text reply via the Telegram Bot API (sendMessage).
-
-    Docs: https://core.telegram.org/bots/api#sendmessage
-    Requires TELEGRAM_BOT_TOKEN in the environment.
-    """
     if not _TELEGRAM_BOT_TOKEN:
-        logger.warning(
-            "TELEGRAM_BOT_TOKEN not set – cannot send reply | chat_id=%s", chat_id
-        )
+        logger.warning("TELEGRAM_BOT_TOKEN not set | chat_id=%s", chat_id)
         return
 
     url = f"https://api.telegram.org/bot{_TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown",
-    }
-
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            logger.info(
-                "Telegram reply sent | chat_id=%s | status=%s",
-                chat_id,
-                response.status_code,
-            )
-    except httpx.TimeoutException:
-        logger.warning("Telegram API timed out | chat_id=%s", chat_id)
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            logger.info("Telegram reply sent | chat_id=%s", chat_id)
     except httpx.HTTPStatusError as exc:
-        logger.warning(
-            "Telegram API error | chat_id=%s | status=%s | body=%s",
-            chat_id,
-            exc.response.status_code,
-            exc.response.text[:300],
-        )
-    except httpx.RequestError as exc:
-        logger.warning(
-            "Telegram API unreachable | chat_id=%s | error=%s", chat_id, str(exc)
-        )
+        if exc.response.status_code == 400:
+            # Retry without Markdown on parse error
+            payload.pop("parse_mode", None)
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.post(url, json=payload)
+            except Exception:
+                logger.exception("Telegram plain reply failed | chat_id=%s", chat_id)
+        else:
+            logger.warning("Telegram API error | chat_id=%s | status=%s", chat_id, exc.response.status_code)
     except Exception:
-        logger.exception(
-            "Unexpected error sending Telegram reply | chat_id=%s", chat_id
-        )
+        logger.exception("Telegram reply failed | chat_id=%s", chat_id)
 
 
 # ---------------------------------------------------------------------------
-# 3. Backend logger
+# 3. Backend logger (fire-and-forget)
 # ---------------------------------------------------------------------------
 
-async def log_to_backend(
-    user_id: str,
-    prompt: str,
-    ai_response: str,
-) -> None:
-    """
-    Persist the conversation turn to the Laravel backend (POST /api/ai-logs).
-
-    This is fire-and-forget: any failure is caught, logged, and swallowed so
-    that a downed TALL backend never interrupts the reply path to the user.
-    """
+async def log_to_backend(user_id: str, prompt: str, ai_response: str) -> None:
     if not _LARAVEL_API_KEY:
-        logger.warning(
-            "LARAVEL_API_KEY not set – AI log will be sent without auth | user_id=%s",
-            user_id,
-        )
+        logger.warning("LARAVEL_API_KEY not set — skipping log | user_id=%s", user_id)
+        return
 
-    headers: dict[str, str] = {
+    session_id = f"tg-{user_id}-{uuid.uuid4().hex[:8]}"
+
+    # Log user message
+    await _post_log(session_id, 0, "telegram", "user_message", prompt, user_id)
+    # Log AI response
+    await _post_log(session_id, 1, "telegram", "ai_response", ai_response, user_id)
+
+
+async def _post_log(
+    session_id: str,
+    turn_index: int,
+    channel: str,
+    message_type: str,
+    content: str,
+    user_id: str,
+) -> None:
+    url = f"{_LARAVEL_BACKEND_URL}/api/ai-logs"
+    headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "Authorization": f"Bearer {_LARAVEL_API_KEY}",
     }
-    if _LARAVEL_API_KEY:
-        headers["Authorization"] = f"Bearer {_LARAVEL_API_KEY}"
-
-    payload: dict[str, str] = {
-        "user_id": user_id,
-        "prompt": prompt,
-        "ai_response": ai_response,
+    payload: dict[str, Any] = {
+        "session_id":   session_id,
+        "turn_index":   turn_index,
+        "channel":      channel,
+        "message_type": message_type,
+        "content":      content,
     }
+    if user_id.isdigit():
+        payload["user_id"] = int(user_id)
 
     try:
-        async with httpx.AsyncClient(timeout=_LOG_TIMEOUT_SECONDS) as client:
-            response = await client.post(_LOG_ENDPOINT, json=payload, headers=headers)
-            response.raise_for_status()
-            logger.info(
-                "AI log persisted | user_id=%s | status=%s",
-                user_id,
-                response.status_code,
-            )
-    except httpx.TimeoutException:
-        logger.warning(
-            "Laravel backend timed out after %.1fs | user_id=%s",
-            _LOG_TIMEOUT_SECONDS,
-            user_id,
-        )
-    except httpx.HTTPStatusError as exc:
-        logger.warning(
-            "Laravel backend returned error | user_id=%s | status=%s | body=%s",
-            user_id,
-            exc.response.status_code,
-            exc.response.text[:300],
-        )
-    except httpx.RequestError as exc:
-        logger.warning(
-            "Laravel backend unreachable | user_id=%s | error=%s",
-            user_id,
-            str(exc),
-        )
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if not resp.is_success:
+                logger.warning("Log POST failed | status=%s | body=%s", resp.status_code, resp.text[:200])
     except Exception:
-        logger.exception(
-            "Unexpected error logging to backend | user_id=%s", user_id
-        )
+        logger.exception("log_to_backend failed | user_id=%s", user_id)
 
 
 # ---------------------------------------------------------------------------
-# 4. Orchestrator – single entry point called by webhook background tasks
+# 4. Main pipeline entry point
 # ---------------------------------------------------------------------------
 
 async def process_message(
@@ -313,29 +287,10 @@ async def process_message(
     platform: Platform,
     reply_context: dict[str, Any],
 ) -> None:
-    """
-    Full pipeline: generate reply → send to platform → log to backend.
+    logger.info("Pipeline start | platform=%s | user_id=%s", platform, user_id)
 
-    Designed to run as a FastAPI BackgroundTask so the webhook can return 200
-    to Meta/Telegram immediately without waiting for LLM inference.
-
-    Args:
-        user_id:       Unique identifier for the sender (WA phone number or
-                       Telegram chat ID as string).
-        message:       The plain-text content of the inbound message.
-        platform:      "whatsapp" or "telegram".
-        reply_context: Platform-specific data required to send the reply.
-                       WhatsApp: {"phone_number_id": str, "recipient_wa_id": str}
-                       Telegram: {"chat_id": int}
-    """
-    logger.info(
-        "Message pipeline start | platform=%s | user_id=%s", platform, user_id
-    )
-
-    # Step 1 – Generate AI response (always succeeds; fallback string on error).
     ai_response = await generate_ai_response(user_id, message)
 
-    # Step 2 – Send reply back to the user on the originating platform.
     try:
         if platform == "whatsapp":
             await _send_whatsapp_reply(
@@ -344,20 +299,9 @@ async def process_message(
                 message=ai_response,
             )
         elif platform == "telegram":
-            await _send_telegram_reply(
-                chat_id=reply_context["chat_id"],
-                message=ai_response,
-            )
+            await _send_telegram_reply(chat_id=reply_context["chat_id"], message=ai_response)
     except Exception:
-        # Defensive catch: individual senders already handle their own errors,
-        # but guard against any unforeseen failure in the dispatch logic.
-        logger.exception(
-            "Reply dispatch failed | platform=%s | user_id=%s", platform, user_id
-        )
+        logger.exception("Reply dispatch failed | platform=%s | user_id=%s", platform, user_id)
 
-    # Step 3 – Persist to Laravel (best-effort; never blocks).
     await log_to_backend(user_id, message, ai_response)
-
-    logger.info(
-        "Message pipeline complete | platform=%s | user_id=%s", platform, user_id
-    )
+    logger.info("Pipeline complete | platform=%s | user_id=%s", platform, user_id)

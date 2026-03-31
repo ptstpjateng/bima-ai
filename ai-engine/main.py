@@ -18,7 +18,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from routers import webhooks
+from routers import vectorize, webhooks
 from services.telegram_polling import run_polling
 
 # ---------------------------------------------------------------------------
@@ -167,6 +167,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # Routers
 # ---------------------------------------------------------------------------
 app.include_router(webhooks.router, tags=["Webhooks"])
+app.include_router(vectorize.router, tags=["Vectorize"])
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 use App\Http\Controllers\Api\AiLogController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\PermitController;
+use App\Http\Controllers\Api\UserContextController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -19,6 +20,11 @@ Route::prefix('auth')->group(function () {
 
     // Telegram: find-or-create user by chat_id and return a magic link.
     Route::post('/telegram/identify', [AuthController::class, 'telegramIdentify']);
+});
+
+// ── Internal AI-engine endpoints (X-Internal-Key) ──────────────────────────
+Route::prefix('internal')->group(function () {
+    Route::get('/user-context/{userId}', [UserContextController::class, 'show']);
 });
 
 // ── Magic link generation via Sanctum (admin/staff via dashboard) ─────────────
