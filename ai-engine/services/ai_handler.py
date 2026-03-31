@@ -103,7 +103,7 @@ async def generate_ai_response(user_id: str, message: str) -> str:
 
         return (
             f"[BIMA-AI] Halo! Pesan Anda telah diterima:\n\n"
-            f""{message}"\n\n"
+            f"\"{message}\"\n\n"
             f"Integrasi RAG/LLM sedang disiapkan. Sebentar lagi saya akan "
             f"membantu Anda menavigasi perizinan OSS RBA secara penuh. "
             f"Ada pertanyaan lain yang bisa saya bantu?"
