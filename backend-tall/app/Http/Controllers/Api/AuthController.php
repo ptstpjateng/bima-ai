@@ -75,7 +75,7 @@ class AuthController extends ApiController
 
             // Resolve Sanctum user manually when not going through the middleware.
             $sanctumUser = $request->user('sanctum');
-            $isAdmin = $sanctumUser && in_array($sanctumUser->role, ['admin', 'staff']);
+            $isAdmin = $sanctumUser && in_array($sanctumUser->role, ['admin', 'dpmptsp_staff']);
 
             if (! $isInternal && ! $isAdmin) {
                 return $this->error('Akses ditolak.', 403, 'FORBIDDEN');
@@ -146,7 +146,7 @@ class AuthController extends ApiController
                     'name'               => $fullName,
                     'email'              => "tg_{$chatId}@bima-ai.local",
                     'password'           => Str::random(32),
-                    'role'               => 'user',
+                    'role'               => 'msme',
                     'telegram_chat_id'   => $chatId,
                     'telegram_username'  => $validated['username'] ?? null,
                 ]);
