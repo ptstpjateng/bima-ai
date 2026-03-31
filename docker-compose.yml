@@ -1,0 +1,186 @@
+services:
+
+  # ──────────────────────────────────────────────
+  # Infrastructure
+  # ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-bima_ai}
+      POSTGRES_USER: ${DB_USERNAME:-bima}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bima-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-bima} -d ${DB_DATABASE:-bima_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - bima-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────
+  # AI Engine (FastAPI + ChromaDB)
+  # ──────────────────────────────────────────────
+  ai-engine:
+    build:
+      context: ./ai-engine
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ./ai-engine/.env
+    environment:
+      - CHROMA_HOST=${CHROMA_HOST:-ai-engine}
+    volumes:
+      - chroma_data:/app/chroma_db
+    networks:
+      - bima-internal
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────────
+  # Data Pipeline (Playwright scraper — run on demand)
+  # ──────────────────────────────────────────────
+  data-pipeline:
+    build:
+      context: ./data-pipeline
+      dockerfile: Dockerfile
+    restart: "no"
+    env_file: ./data-pipeline/.env
+    volumes:
+      - ./data-pipeline/data:/app/data
+    networks:
+      - bima-internal
+    depends_on:
+      ai-engine:
+        condition: service_healthy
+
+  # ──────────────────────────────────────────────
+  # TALL Backend (Laravel 13 + FrankenPHP)
+  # ──────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend-tall
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ./backend-tall/.env
+    environment:
+      APP_ENV: production
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-bima_ai}
+      DB_USERNAME: ${DB_USERNAME:-bima}
+      DB_PASSWORD: ${DB_PASSWORD:-secret}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      AI_ENGINE_URL: http://ai-engine:8000
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: redis
+      CACHE_STORE: redis
+    volumes:
+      - backend_storage:/var/www/html/storage/app
+    ports:
+      - "8080:80"
+    networks:
+      - bima-internal
+      - bima-public
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/up || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  # Laravel queue worker (shares the same image)
+  queue:
+    build:
+      context: ./backend-tall
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ./backend-tall/.env
+    environment:
+      APP_ENV: production
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-bima_ai}
+      DB_USERNAME: ${DB_USERNAME:-bima}
+      DB_PASSWORD: ${DB_PASSWORD:-secret}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      AI_ENGINE_URL: http://ai-engine:8000
+      QUEUE_CONNECTION: redis
+    command: ["php", "artisan", "queue:work", "--sleep=3", "--tries=3", "--max-time=3600"]
+    volumes:
+      - backend_storage:/var/www/html/storage/app
+    networks:
+      - bima-internal
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # ──────────────────────────────────────────────
+  # Frontend (Next.js)
+  # ──────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    restart: unless-stopped
+    env_file: ./frontend/.env
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    ports:
+      - "3000:3000"
+    networks:
+      - bima-public
+    depends_on:
+      backend:
+        condition: service_healthy
+
+# ──────────────────────────────────────────────
+# Networks
+# ──────────────────────────────────────────────
+networks:
+  # Internal: backend ↔ ai-engine ↔ postgres ↔ redis ↔ queue
+  bima-internal:
+    driver: bridge
+
+  # Public-facing: frontend ↔ backend (only these two expose ports to host)
+  bima-public:
+    driver: bridge
+
+# ──────────────────────────────────────────────
+# Volumes
+# ──────────────────────────────────────────────
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  backend_storage:

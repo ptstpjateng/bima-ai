@@ -1,0 +1,57 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Models\AiInteraction;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+
+class AiLogController extends ApiController
+{
+    /**
+     * POST /api/ai-logs
+     *
+     * Called by the Python AI engine to push a chat log entry.
+     * Protected by Sanctum token auth.
+     */
+    public function store(Request $request): JsonResponse
+    {
+        try {
+            $validated = $request->validate([
+                'session_id'             => ['required', 'string', 'max:64'],
+                'turn_index'             => ['required', 'integer', 'min:0'],
+                'channel'                => ['required', 'string', 'in:whatsapp,telegram,web,mobile,internal'],
+                'message_type'           => ['required', 'string', 'in:user_message,ai_response,system_event'],
+                'content'                => ['required', 'string'],
+                'content_rendered'       => ['nullable', 'string'],
+                'intent'                 => ['nullable', 'string', 'max:100'],
+                'entities'               => ['nullable', 'array'],
+                'context_snapshot'       => ['nullable', 'array'],
+                'model_used'             => ['nullable', 'string', 'max:80'],
+                'prompt_tokens'          => ['nullable', 'integer', 'min:0'],
+                'completion_tokens'      => ['nullable', 'integer', 'min:0'],
+                'response_time_ms'       => ['nullable', 'integer', 'min:0'],
+                'confidence_score'       => ['nullable', 'numeric', 'min:0', 'max:1'],
+                'external_message_id'    => ['nullable', 'string', 'max:100'],
+                'user_id'                => ['nullable', 'integer', 'exists:users,id'],
+                'permit_application_id'  => ['nullable', 'integer', 'exists:permit_applications,id'],
+                'is_sensitive'           => ['nullable', 'boolean'],
+            ]);
+
+            $interaction = AiInteraction::create($validated);
+
+            return $this->success(
+                ['id' => $interaction->id],
+                201,
+                'Interaction logged.'
+            );
+
+        } catch (ValidationException $e) {
+            return $this->error($e->getMessage(), 422, 'VALIDATION_ERROR');
+        } catch (\Throwable $e) {
+            return $this->serverError($e, 'AiLogController@store');
+        }
+    }
+}

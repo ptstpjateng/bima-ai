@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(composer --version)",
+      "Read(//Users/mac/bima-ai-project/**)",
+      "Bash(composer create-project:*)",
+      "Bash(mv _laravel_tmp/* _laravel_tmp/.[!.]* backend-tall/)",
+      "Bash(rmdir _laravel_tmp)",
+      "Bash(composer require:*)",
+      "Bash(composer show:*)",
+      "Bash(php artisan:*)"
+    ]
+  }
+}

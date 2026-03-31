@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /Users/mac/bima-ai-project/data-pipeline/extractors /Users/mac/bima-ai-project/data-pipeline/data/pdfs)",
+      "Bash(touch /Users/mac/bima-ai-project/data-pipeline/extractors/__init__.py)",
+      "Bash(python3 -m py_compile extractors/web_scraper.py)",
+      "Bash(python3 -m py_compile extractors/pdf_parser.py)",
+      "Bash(python3 -m py_compile pipeline/vectorize.py)",
+      "Bash(python3 -m py_compile /Users/mac/bima-ai-project/data-pipeline/extractors/models.py)",
+      "Bash(python3 -m py_compile /Users/mac/bima-ai-project/data-pipeline/extractors/oss_scraper.py)",
+      "Bash(source venv/bin/activate)",
+      "Bash(python -c \"import playwright; print\\(''playwright OK''\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import playwright; import pydantic; print\\(''playwright:'', playwright.__version__, ''| pydantic:'', pydantic.__version__\\)\")",
+      "Bash(python -c \"import pydantic; print\\(''pydantic'', pydantic.__version__\\)\")",
+      "Bash(python -c \"import langchain; import langchain_community; print\\(''langchain OK''\\)\")",
+      "Bash(python -c \"import chromadb; print\\(''chromadb OK''\\)\")",
+      "Bash(playwright --version)",
+      "Bash(python -m playwright --version)",
+      "Bash(chmod +x /Users/mac/bima-ai-project/data-pipeline/venv/lib/python3.13/site-packages/playwright/driver/node)",
+      "Read(//Applications/Google Chrome.app/Contents/MacOS/**)",
+      "Read(//Applications/Chromium.app/Contents/**)",
+      "Bash(brew list:*)",
+      "Bash(pip cache:*)",
+      "Bash(python -c \"import langchain; import langchain_community; import chromadb; print\\(''all OK''\\)\")",
+      "Bash(python test_kbli_56102.py)",
+      "Bash(python -c \"from langchain_text_splitters import RecursiveCharacterTextSplitter; print\\(''OK''\\)\")",
+      "Bash(python debug_dom.py)",
+      "Bash(python -c \":*)",
+      "Bash(python debug_accordion.py)",
+      "Bash(python -m py_compile extractors/oss_scraper.py)",
+      "Bash(grep -v \"^$\")"
+    ]
+  }
+}
