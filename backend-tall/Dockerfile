@@ -42,8 +42,10 @@ COPY --from=vendor /app/vendor ./vendor
 COPY . .
 
 # Bootstrap the application
+# Note: config:cache is intentionally omitted — env vars are injected at
+# container runtime via docker-compose, so caching at build time would bake
+# in wrong values (e.g. FRONTEND_URL). route:cache and view:cache are safe.
 RUN php artisan storage:link \
-    && php artisan config:cache \
     && php artisan route:cache \
     && php artisan view:cache \
     && chown -R www-data:www-data storage bootstrap/cache
