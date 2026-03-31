@@ -49,6 +49,7 @@ services:
       - chroma_data:/app/chroma_db
     networks:
       - bima-internal
+      - bima-public
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 15s

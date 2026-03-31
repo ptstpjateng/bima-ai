@@ -111,6 +111,81 @@ class AuthController extends ApiController
     }
 
     /**
+     * POST /api/auth/telegram/identify
+     * Find or create a user by Telegram chat_id, then return a magic link.
+     * Called exclusively by the AI engine via X-Internal-Key.
+     */
+    public function telegramIdentify(Request $request): JsonResponse
+    {
+        try {
+            $internalKey = config('app.internal_api_key');
+            $providedKey  = $request->header('X-Internal-Key');
+
+            if (! $internalKey || ! $providedKey || ! hash_equals($internalKey, (string) $providedKey)) {
+                return $this->error('Akses ditolak.', 403, 'FORBIDDEN');
+            }
+
+            $validated = $request->validate([
+                'telegram_chat_id' => ['required', 'integer'],
+                'first_name'       => ['nullable', 'string', 'max:100'],
+                'last_name'        => ['nullable', 'string', 'max:100'],
+                'username'         => ['nullable', 'string', 'max:100'],
+            ]);
+
+            $chatId = $validated['telegram_chat_id'];
+
+            $user = User::where('telegram_chat_id', $chatId)->first();
+            $isNew = false;
+
+            if (! $user) {
+                $firstName = $validated['first_name'] ?? 'Pengguna';
+                $lastName  = $validated['last_name'] ?? '';
+                $fullName  = trim("{$firstName} {$lastName}") ?: 'Pengguna Telegram';
+
+                $user = User::create([
+                    'name'               => $fullName,
+                    'email'              => "tg_{$chatId}@bima-ai.local",
+                    'password'           => Str::random(32),
+                    'role'               => 'user',
+                    'telegram_chat_id'   => $chatId,
+                    'telegram_username'  => $validated['username'] ?? null,
+                ]);
+                $isNew = true;
+            } else {
+                // Keep username in sync.
+                if (isset($validated['username']) && $user->telegram_username !== $validated['username']) {
+                    $user->update(['telegram_username' => $validated['username']]);
+                }
+            }
+
+            $rawToken = Str::random(48);
+
+            $magic = MagicLinkToken::create([
+                'user_id'    => $user->id,
+                'token'      => $rawToken,
+                'channel'    => 'telegram',
+                'expires_at' => now()->addMinutes(30),
+            ]);
+
+            $frontendUrl = config('app.frontend_url', env('FRONTEND_URL', 'http://localhost:3000'));
+            $magicUrl    = "{$frontendUrl}/auth/magic?token={$rawToken}";
+
+            return $this->success([
+                'magic_link'  => $magicUrl,
+                'expires_at'  => $magic->expires_at->toIso8601String(),
+                'user_id'     => $user->id,
+                'user_name'   => $user->name,
+                'is_new_user' => $isNew,
+            ], 201, $isNew ? 'Akun baru dibuat.' : 'Magic link dibuat.');
+
+        } catch (ValidationException $e) {
+            return $this->error($e->getMessage(), 422, 'VALIDATION_ERROR');
+        } catch (\Throwable $e) {
+            return $this->serverError($e, 'AuthController@telegramIdentify');
+        }
+    }
+
+    /**
      * GET /api/auth/magic/{token}
      * Exchange a magic link token for a Sanctum token + user data.
      */

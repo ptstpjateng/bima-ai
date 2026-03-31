@@ -16,6 +16,9 @@ Route::prefix('auth')->group(function () {
 
     // Magic link generation via X-Internal-Key (AI engine / internal services).
     Route::post('/magic-link/generate', [AuthController::class, 'generateMagicLink']);
+
+    // Telegram: find-or-create user by chat_id and return a magic link.
+    Route::post('/telegram/identify', [AuthController::class, 'telegramIdentify']);
 });
 
 // ── Magic link generation via Sanctum (admin/staff via dashboard) ─────────────

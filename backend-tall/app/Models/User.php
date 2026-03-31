@@ -34,6 +34,8 @@ class User extends Authenticatable implements FilamentUser
         'postal_code',
         'profile_photo_path',
         'email_verified_at',
+        'telegram_chat_id',
+        'telegram_username',
     ];
 
     protected $hidden = [
