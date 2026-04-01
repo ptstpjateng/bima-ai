@@ -16,6 +16,16 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 *   **Filament Resources:** After generating or modifying Filament resources, you must run `php artisan filament:check` or attempt to load the admin panel to verify no type errors or property mismatches (like `$navigationGroup`) exist. Use string types, not enums, for `$navigationGroup` unless explicitly configured otherwise.
 *   **Database Migrations:** Always verify database connectivity with `php artisan migrate:status` before proceeding with new migrations or seeders.
 
+## 🖥️ VPS & SSH Configuration
+*   **Server IP:** `116.254.113.81`
+*   **SSH Command:** `ssh bima-vps` (alias configured in `~/.ssh/config`)
+    *   User: `wdnsds` | Port: `2222` | Key: `~/.ssh/id_bima_vps`
+*   **Project directory on VPS:** `~/bima-ai` (i.e. `/home/wdnsds/bima-ai`)
+*   **Backend (Laravel/FrankenPHP):** internal only; also directly accessible at `http://116.254.113.81:8000`
+*   **Nginx proxy:** port `80` — public entry point; routes `/admin`, `/api`, `/livewire`, `/css`, `/js`, `/fonts`, `/storage` → backend; `/webhook/` → ai-engine; `/` redirects to `/admin`
+*   **Filament admin panel:** `http://116.254.113.81/admin` (fully styled, confirmed working)
+*   **Frontend:** decoupled to Vercel — repo `ptstpjateng/bima-ai`, subfolder `frontend/`, env var `NEXT_PUBLIC_API_URL=http://116.254.113.81`
+
 ## ⚛️ Next.js & React Native Conventions
 *   **Strict Typing:** All components must be strictly typed with TypeScript. Do not use `any`.
 *   **UI/UX:** Prioritize a nice, clean, and clear UI/UX. Use whitespace effectively and ensure skeleton loaders or loading states are implemented for any data fetching.
