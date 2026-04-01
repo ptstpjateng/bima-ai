@@ -9,7 +9,7 @@ const nextConfig: NextConfig = {
     const backendUrl =
       process.env.BACKEND_URL ||
       process.env.NEXT_PUBLIC_API_URL ||
-      "http://localhost:8080";
+      "http://116.254.113.81";
     return [
       {
         source: "/api/:path*",
