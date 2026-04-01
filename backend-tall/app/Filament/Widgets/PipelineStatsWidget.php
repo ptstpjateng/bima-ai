@@ -4,12 +4,13 @@ namespace App\Filament\Widgets;
 
 use App\Models\KbliScrapeTarget;
 use App\Models\KnowledgeBaseArticle;
+use App\Models\AiInteraction;
 use Filament\Widgets\StatsOverviewWidget;
 use Filament\Widgets\StatsOverviewWidget\Stat;
 
 class PipelineStatsWidget extends StatsOverviewWidget
 {
-    protected static ?int $sort = -2;
+    protected static ?int $sort = 1;
 
     protected array|string|int $columnSpan = 'full';
 
@@ -18,40 +19,54 @@ class PipelineStatsWidget extends StatsOverviewWidget
         $totalChunks    = (int) KbliScrapeTarget::sum('chroma_chunks');
         $totalTargets   = KbliScrapeTarget::count();
         $doneTargets    = KbliScrapeTarget::where('status', 'done')->count();
-        $pendingTargets = KbliScrapeTarget::whereIn('status', ['pending', 'queued', 'scraping'])->count();
+        $scrapingNow    = KbliScrapeTarget::whereIn('status', ['queued', 'scraping'])->count();
+        $pendingTargets = KbliScrapeTarget::where('status', 'pending')->count();
         $failedTargets  = KbliScrapeTarget::where('status', 'failed')->count();
         $articles       = KnowledgeBaseArticle::whereNotNull('published_at')->count();
+        $todayChats     = AiInteraction::where('message_type', 'ai_response')
+            ->whereDate('created_at', today())
+            ->count();
+
+        $progressPct = $totalTargets > 0 ? round(($doneTargets / $totalTargets) * 100) : 0;
 
         return [
             Stat::make('Chunk di ChromaDB', number_format($totalChunks))
-                ->description('Total potongan regulasi terindeks untuk RAG')
-                ->descriptionIcon('heroicon-o-circle-stack')
-                ->color('success'),
+                ->description('Potongan regulasi terindeks untuk RAG')
+                ->descriptionIcon('heroicon-m-circle-stack')
+                ->color('success')
+                ->chart([$totalChunks > 0 ? max(1, $totalChunks - 20) : 0, $totalChunks]),
 
-            Stat::make('Pipeline KBLI', "{$doneTargets} / {$totalTargets} selesai")
+            Stat::make('Pipeline KBLI', "{$progressPct}% selesai")
                 ->description(
                     match(true) {
-                        $pendingTargets > 0 && $failedTargets > 0 => "{$pendingTargets} menunggu · {$failedTargets} gagal",
-                        $pendingTargets > 0                        => "{$pendingTargets} menunggu diproses",
-                        $failedTargets > 0                         => "{$failedTargets} kode gagal",
-                        default                                    => 'Semua target selesai',
+                        $scrapingNow > 0  => "{$scrapingNow} sedang diproses · {$pendingTargets} antri · {$failedTargets} gagal",
+                        $pendingTargets > 0 => "{$doneTargets}/{$totalTargets} done · {$pendingTargets} menunggu · {$failedTargets} gagal",
+                        $failedTargets > 0  => "{$doneTargets}/{$totalTargets} done · {$failedTargets} gagal",
+                        default             => "{$doneTargets}/{$totalTargets} KBLI berhasil diindeks",
                     }
                 )
                 ->descriptionIcon(match(true) {
-                    $failedTargets > 0   => 'heroicon-o-exclamation-circle',
-                    $pendingTargets > 0  => 'heroicon-o-clock',
-                    default              => 'heroicon-o-check-circle',
+                    $scrapingNow > 0   => 'heroicon-m-arrow-path',
+                    $failedTargets > 0 => 'heroicon-m-exclamation-circle',
+                    $pendingTargets > 0 => 'heroicon-m-clock',
+                    default            => 'heroicon-m-check-circle',
                 })
                 ->color(match(true) {
-                    $failedTargets > 0  => 'danger',
-                    $pendingTargets > 0 => 'warning',
-                    default             => 'success',
+                    $scrapingNow > 0   => 'warning',
+                    $failedTargets > 0 => 'danger',
+                    $pendingTargets > 0 => 'info',
+                    default            => 'success',
                 }),
 
             Stat::make('Artikel Regulasi', (string) $articles)
                 ->description('Regulasi & panduan terpublikasi')
-                ->descriptionIcon('heroicon-o-book-open')
+                ->descriptionIcon('heroicon-m-book-open')
                 ->color('info'),
+
+            Stat::make('Chat AI Hari Ini', (string) $todayChats)
+                ->description('Respons AI yang dikirim hari ini')
+                ->descriptionIcon('heroicon-m-chat-bubble-left-right')
+                ->color('primary'),
         ];
     }
 }

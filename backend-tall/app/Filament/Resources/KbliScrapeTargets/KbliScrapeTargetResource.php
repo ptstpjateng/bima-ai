@@ -2,9 +2,11 @@
 
 namespace App\Filament\Resources\KbliScrapeTargets;
 
+use App\Filament\Resources\KbliScrapeTargets\Infolists\KbliScrapeTargetInfolist;
 use App\Filament\Resources\KbliScrapeTargets\Pages\CreateKbliScrapeTarget;
 use App\Filament\Resources\KbliScrapeTargets\Pages\EditKbliScrapeTarget;
 use App\Filament\Resources\KbliScrapeTargets\Pages\ListKbliScrapeTargets;
+use App\Filament\Resources\KbliScrapeTargets\Pages\ViewKbliScrapeTarget;
 use App\Filament\Resources\KbliScrapeTargets\Schemas\KbliScrapeTargetForm;
 use App\Filament\Resources\KbliScrapeTargets\Tables\KbliScrapeTargetsTable;
 use App\Models\KbliScrapeTarget;
@@ -35,6 +37,11 @@ class KbliScrapeTargetResource extends Resource
         return KbliScrapeTargetForm::configure($schema);
     }
 
+    public static function infolist(Schema $schema): Schema
+    {
+        return KbliScrapeTargetInfolist::configure($schema);
+    }
+
     public static function table(Table $table): Table
     {
         return KbliScrapeTargetsTable::configure($table);
@@ -50,6 +57,7 @@ class KbliScrapeTargetResource extends Resource
         return [
             'index'  => ListKbliScrapeTargets::route('/'),
             'create' => CreateKbliScrapeTarget::route('/create'),
+            'view'   => ViewKbliScrapeTarget::route('/{record}'),
             'edit'   => EditKbliScrapeTarget::route('/{record}/edit'),
         ];
     }

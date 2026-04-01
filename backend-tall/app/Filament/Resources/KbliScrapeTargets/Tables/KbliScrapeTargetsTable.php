@@ -2,11 +2,13 @@
 
 namespace App\Filament\Resources\KbliScrapeTargets\Tables;
 
+use App\Filament\Resources\KbliScrapeTargets\KbliScrapeTargetResource;
 use App\Models\KbliScrapeTarget;
 use Filament\Actions\Action;
 use Filament\Actions\BulkActionGroup;
 use Filament\Actions\DeleteBulkAction;
 use Filament\Actions\EditAction;
+use Filament\Actions\ViewAction;
 use Filament\Tables\Columns\IconColumn;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Filters\SelectFilter;
@@ -14,6 +16,11 @@ use Filament\Tables\Table;
 
 class KbliScrapeTargetsTable
 {
+    public static function viewUrl(KbliScrapeTarget $record): string
+    {
+        return KbliScrapeTargetResource::getUrl('view', ['record' => $record]);
+    }
+
     public static function configure(Table $table): Table
     {
         return $table
@@ -112,18 +119,20 @@ class KbliScrapeTargetsTable
                         'Agriculture'          => 'Pertanian & Perkebunan',
                     ]),
             ])
+            ->recordUrl(fn (KbliScrapeTarget $record) => KbliScrapeTargetsTable::viewUrl($record))
             ->actions([
+                ViewAction::make()->label(''),
                 Action::make('requeue')
-                    ->label('Re-queue')
+                    ->label('')
+                    ->tooltip('Re-queue Scraping')
                     ->icon('heroicon-o-arrow-path')
                     ->color('warning')
                     ->requiresConfirmation()
                     ->modalHeading('Re-queue Scraping?')
-                    ->modalDescription(fn ($record) => "Jadwalkan ulang scraping untuk KBLI {$record->kbli_code}? Status saat ini akan direset ke Menunggu.")
+                    ->modalDescription(fn ($record) => "Reset KBLI {$record->kbli_code} ke Menunggu?")
                     ->action(fn (KbliScrapeTarget $record) => $record->requeue())
                     ->visible(fn (KbliScrapeTarget $record) => in_array($record->status, ['done', 'failed', 'queued'])),
-
-                EditAction::make(),
+                EditAction::make()->label(''),
             ])
             ->bulkActions([
                 BulkActionGroup::make([

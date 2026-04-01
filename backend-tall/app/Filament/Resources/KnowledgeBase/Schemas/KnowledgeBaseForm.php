@@ -4,13 +4,12 @@ namespace App\Filament\Resources\KnowledgeBase\Schemas;
 
 use Filament\Forms\Components\DateTimePicker;
 use Filament\Forms\Components\FileUpload;
-use Filament\Forms\Components\Hidden;
-use Filament\Forms\Components\Section;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TagsInput;
 use Filament\Forms\Components\Textarea;
 use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Toggle;
+use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
 
 class KnowledgeBaseForm
@@ -77,7 +76,7 @@ class KnowledgeBaseForm
                 ->schema([
                     Textarea::make('content')
                         ->label('Isi Regulasi / Panduan')
-                        ->helperText('Teks lengkap yang akan diindeks ke dalam sistem RAG (ChromaDB). Semakin detail, semakin akurat jawaban AI.')
+                        ->helperText('Teks lengkap yang akan diindeks ke dalam sistem RAG (ChromaDB).')
                         ->required()
                         ->rows(15)
                         ->columnSpanFull(),
@@ -95,21 +94,17 @@ class KnowledgeBaseForm
                         ->label('Tag / Label')
                         ->placeholder('e.g. NIB, SIUP, K3, lingkungan'),
 
-                    Toggle::make('is_published_now')
-                        ->label('Publikasikan Sekarang')
-                        ->helperText('Artikel yang dipublikasikan akan tersedia untuk RAG')
-                        ->dehydrated(false)
-                        ->live()
-                        ->afterStateUpdated(
-                            fn (bool $state, callable $set) => $set('published_at', $state ? now()->toDateTimeString() : null)
-                        )
-                        ->formatStateUsing(fn ($state, $record) => $record?->published_at !== null),
-
-                    Hidden::make('published_at'),
+                    DateTimePicker::make('published_at')
+                        ->label('Tanggal Publikasi')
+                        ->helperText('Isi untuk mempublikasikan. Kosongkan untuk menyimpan sebagai draft.')
+                        ->nullable()
+                        ->seconds(false)
+                        ->columnSpanFull(),
                 ]),
 
             Section::make('Status Vektorisasi')
                 ->collapsed()
+                ->columns(2)
                 ->schema([
                     Toggle::make('is_vectorized')
                         ->label('Sudah Divektorisasi')
@@ -121,12 +116,14 @@ class KnowledgeBaseForm
 
                     TextInput::make('chroma_doc_id')
                         ->label('ChromaDB Document ID')
-                        ->disabled(),
+                        ->disabled()
+                        ->columnSpanFull(),
 
                     Textarea::make('vectorize_error')
                         ->label('Error Vektorisasi (jika ada)')
                         ->disabled()
-                        ->rows(3),
+                        ->rows(3)
+                        ->columnSpanFull(),
                 ]),
         ]);
     }
