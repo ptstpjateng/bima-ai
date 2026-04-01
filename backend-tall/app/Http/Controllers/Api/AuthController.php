@@ -95,8 +95,11 @@ class AuthController extends ApiController
                 'expires_at' => now()->addMinutes(30),
             ]);
 
-            $frontendUrl = config('app.frontend_url', env('FRONTEND_URL', 'http://localhost:3000'));
-            $magicUrl    = "{$frontendUrl}/auth/magic?token={$rawToken}";
+            // Magic link points to the backend web route (plain HTTP navigation —
+            // not subject to mixed-content rules). Laravel redeems the token and
+            // redirects the browser to the Vercel frontend with a Sanctum token.
+            $appUrl   = config('app.url', 'http://116.254.113.81');
+            $magicUrl = "{$appUrl}/magic/{$rawToken}";
 
             return $this->success([
                 'magic_link' => $magicUrl,
@@ -167,8 +170,11 @@ class AuthController extends ApiController
                 'expires_at' => now()->addMinutes(30),
             ]);
 
-            $frontendUrl = config('app.frontend_url', env('FRONTEND_URL', 'http://localhost:3000'));
-            $magicUrl    = "{$frontendUrl}/auth/magic?token={$rawToken}";
+            // Magic link points to the backend web route (plain HTTP navigation —
+            // not subject to mixed-content rules). Laravel redeems the token and
+            // redirects the browser to the Vercel frontend with a Sanctum token.
+            $appUrl   = config('app.url', 'http://116.254.113.81');
+            $magicUrl = "{$appUrl}/magic/{$rawToken}";
 
             return $this->success([
                 'magic_link'  => $magicUrl,
