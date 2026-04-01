@@ -9,11 +9,9 @@ class PipelineProgressChartWidget extends ChartWidget
 {
     protected static ?int $sort = 2;
 
-    protected static ?string $heading = 'Progress Pipeline KBLI';
+    protected ?string $heading = 'Progress Pipeline KBLI';
 
-    protected static ?string $description = 'Distribusi status scraping 35 kode KBLI';
-
-    protected array|string|int $columnSpan = 'full';
+    protected ?string $description = 'Distribusi status scraping 35 kode KBLI';
 
     protected function getData(): array
     {

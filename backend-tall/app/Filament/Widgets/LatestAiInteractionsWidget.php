@@ -12,7 +12,7 @@ class LatestAiInteractionsWidget extends BaseWidget
 {
     protected static ?int $sort = 3;
 
-    protected array|string|int $columnSpan = 'full';
+    protected int | string | array $columnSpan = 'full';
 
     protected static ?string $heading = 'Aktivitas AI Terbaru';
 
