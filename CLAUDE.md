@@ -41,7 +41,8 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 ### URLs
 *   **Filament Admin:** `http://116.254.113.81/admin` ✅ styled & confirmed
 *   **Backend direct:** `http://116.254.113.81:8000`
-*   **Frontend:** Vercel (auto-deploy on push to `main`, repo `ptstpjateng/bima-ai`, root dir `frontend/`)
+*   **Frontend:** `https://project-5z22k.vercel.app` — auto-deploy on push to `main`, repo `ptstpjateng/bima-ai`, root dir `frontend/`
+*   **CORS / API links:** always use `https://project-5z22k.vercel.app` as the frontend origin, never the old IP or localhost
 
 ---
 
@@ -68,7 +69,7 @@ DB_PASSWORD=<see VPS>
 | `CACHE_STORE` | `database` | `redis` |
 | `QUEUE_CONNECTION` | `database` | `redis` |
 | `REDIS_HOST` | `127.0.0.1` | `redis` (Docker DNS) |
-| `FRONTEND_URL` | — | Vercel URL (update after deploy) |
+| `FRONTEND_URL` | — | `https://project-5z22k.vercel.app` |
 | `INTERNAL_API_KEY` | — | `<see VPS>` |
 | `AI_ENGINE_URL` | — | `http://ai-engine:8000` |
 

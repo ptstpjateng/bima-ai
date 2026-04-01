@@ -62,6 +62,18 @@ Aturan utama:
 - Jawaban singkat — muat dalam layar HP (≤ 5 paragraf pendek atau daftar singkat).
 """.strip()
 
+# Appended to system prompt when ChromaDB has no data yet (data pipeline still running).
+_FALLBACK_SYSTEM_ADDITION = """
+
+Basis data regulasi OSS spesifik BIMA-AI saat ini belum tersedia karena pipeline \
+pengambilan data masih berjalan. Jawab pertanyaan pengguna menggunakan pengetahuan \
+umummu tentang OSS RBA dan perizinan usaha Indonesia, TETAPI tambahkan catatan \
+berikut di akhir jawabanmu (persis seperti ini, tanpa modifikasi):
+
+"Catatan: Basis data regulasi OSS spesifik BIMA-AI saat ini sedang dalam proses \
+pembaruan. Jawaban ini menggunakan basis pengetahuan AI umum."
+""".strip()
+
 
 # ---------------------------------------------------------------------------
 # 1. LLM call (Gemini 1.5 Flash) with graceful fallback
@@ -88,9 +100,16 @@ async def generate_ai_response(user_id: str, message: str) -> str:
 
         user_ctx_str = format_user_context(user_ctx)
         rag_ctx_str  = format_rag_context(rag_chunks)
+        has_rag      = bool(rag_ctx_str)
+
+        if not has_rag:
+            logger.info(
+                "RAG returned 0 usable chunks — activating fallback prompt | user_id=%s", user_id
+            )
 
         # --- Step 2: Build full prompt ---
-        parts = [_SYSTEM_PROMPT]
+        system = _SYSTEM_PROMPT if has_rag else f"{_SYSTEM_PROMPT}\n\n{_FALLBACK_SYSTEM_ADDITION}"
+        parts = [system]
         if user_ctx_str:
             parts.append("\n" + user_ctx_str)
         if rag_ctx_str:
