@@ -3,6 +3,7 @@
 use App\Http\Controllers\Api\AiLogController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\PermitController;
+use App\Http\Controllers\Api\PipelineController;
 use App\Http\Controllers\Api\UserContextController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -26,6 +27,10 @@ Route::prefix('auth')->group(function () {
 Route::prefix('internal')->group(function () {
     Route::get('/user-context/{userId}', [UserContextController::class, 'show']);
     Route::post('/ai-logs', [AiLogController::class, 'storeInternal']);
+
+    // Data pipeline: queue management and status reporting
+    Route::get('/pipeline/queue', [PipelineController::class, 'queue']);
+    Route::post('/pipeline/status', [PipelineController::class, 'updateStatus']);
 });
 
 // ── Magic link generation via Sanctum (admin/staff via dashboard) ─────────────

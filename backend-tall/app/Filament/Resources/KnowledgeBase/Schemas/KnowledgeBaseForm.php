@@ -4,6 +4,7 @@ namespace App\Filament\Resources\KnowledgeBase\Schemas;
 
 use Filament\Forms\Components\DateTimePicker;
 use Filament\Forms\Components\FileUpload;
+use Filament\Forms\Components\Hidden;
 use Filament\Forms\Components\Section;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TagsInput;
@@ -94,18 +95,17 @@ class KnowledgeBaseForm
                         ->label('Tag / Label')
                         ->placeholder('e.g. NIB, SIUP, K3, lingkungan'),
 
-                    Toggle::make('published_at')
+                    Toggle::make('is_published_now')
                         ->label('Publikasikan Sekarang')
-                        ->helperText('Artikel yang dipublikasikan akan segera divektorisasi ke ChromaDB')
+                        ->helperText('Artikel yang dipublikasikan akan tersedia untuk RAG')
+                        ->dehydrated(false)
                         ->live()
-                        ->afterStateUpdated(function ($state, callable $set) {
-                            if ($state) {
-                                $set('published_at', now()->toIso8601String());
-                            } else {
-                                $set('published_at', null);
-                            }
-                        })
-                        ->formatStateUsing(fn ($state) => $state !== null),
+                        ->afterStateUpdated(
+                            fn (bool $state, callable $set) => $set('published_at', $state ? now()->toDateTimeString() : null)
+                        )
+                        ->formatStateUsing(fn ($state, $record) => $record?->published_at !== null),
+
+                    Hidden::make('published_at'),
                 ]),
 
             Section::make('Status Vektorisasi')
