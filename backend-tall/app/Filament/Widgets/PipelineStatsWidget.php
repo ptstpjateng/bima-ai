@@ -11,7 +11,7 @@ class PipelineStatsWidget extends StatsOverviewWidget
 {
     protected static ?int $sort = -2;
 
-    protected int|string $columnSpan = 'full';
+    protected array|string|int $columnSpan = 'full';
 
     protected function getStats(): array
     {
