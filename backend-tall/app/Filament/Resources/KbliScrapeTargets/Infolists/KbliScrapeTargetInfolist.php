@@ -2,7 +2,8 @@
 
 namespace App\Filament\Resources\KbliScrapeTargets\Infolists;
 
-use Filament\Infolists\Components\IconEntry;
+use App\Models\KbliScrapeTarget;
+use App\Services\PipelineService;
 use Filament\Infolists\Components\TextEntry;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
@@ -108,6 +109,44 @@ class KbliScrapeTargetInfolist
                         ->columnSpanFull()
                         ->color('danger')
                         ->markdown(),
+                ]),
+
+            Section::make('Konten ChromaDB')
+                ->description(fn (KbliScrapeTarget $record) =>
+                    "Data mentah yang diindeks untuk RAG — {$record->chroma_chunks} chunk tersimpan")
+                ->icon('heroicon-o-circle-stack')
+                ->collapsed()
+                ->visible(fn (KbliScrapeTarget $record) => $record->chroma_chunks > 0)
+                ->schema([
+                    TextEntry::make('chroma_content')
+                        ->label('')
+                        ->columnSpanFull()
+                        ->getStateUsing(function (KbliScrapeTarget $record): string {
+                            $chunks = (new PipelineService())->getChunks($record->kbli_code);
+                            if (empty($chunks)) {
+                                return '_Tidak ada chunk ditemukan di ChromaDB._';
+                            }
+                            $lines = [];
+                            foreach ($chunks as $i => $chunk) {
+                                $header = '### Chunk ' . ($i + 1);
+                                if ($chunk['section']) {
+                                    $header .= ' — ' . strtoupper($chunk['section']);
+                                }
+                                if ($chunk['skala']) {
+                                    $header .= ' (' . $chunk['skala'] . ')';
+                                }
+                                $lines[] = $header;
+                                $lines[] = $chunk['content'];
+                                $lines[] = '';
+                                $lines[] = '---';
+                                $lines[] = '';
+                            }
+                            return implode("\n", $lines);
+                        })
+                        ->markdown()
+                        ->extraAttributes([
+                            'class' => 'max-h-[75vh] overflow-y-auto text-sm font-mono',
+                        ]),
                 ]),
 
         ]);

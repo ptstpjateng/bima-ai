@@ -4,11 +4,13 @@ namespace App\Filament\Resources\KbliScrapeTargets\Tables;
 
 use App\Filament\Resources\KbliScrapeTargets\KbliScrapeTargetResource;
 use App\Models\KbliScrapeTarget;
+use App\Services\PipelineService;
 use Filament\Actions\Action;
 use Filament\Actions\BulkActionGroup;
 use Filament\Actions\DeleteBulkAction;
 use Filament\Actions\EditAction;
 use Filament\Actions\ViewAction;
+use Filament\Notifications\Notification;
 use Filament\Tables\Columns\IconColumn;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Filters\SelectFilter;
@@ -124,14 +126,27 @@ class KbliScrapeTargetsTable
                 ViewAction::make()->label(''),
                 Action::make('requeue')
                     ->label('')
-                    ->tooltip('Re-queue Scraping')
+                    ->tooltip('Re-queue & Mulai Scraping')
                     ->icon('heroicon-o-arrow-path')
                     ->color('warning')
                     ->requiresConfirmation()
-                    ->modalHeading('Re-queue Scraping?')
-                    ->modalDescription(fn ($record) => "Reset KBLI {$record->kbli_code} ke Menunggu?")
-                    ->action(fn (KbliScrapeTarget $record) => $record->requeue())
-                    ->visible(fn (KbliScrapeTarget $record) => in_array($record->status, ['done', 'failed', 'queued'])),
+                    ->modalHeading('Re-queue & Jalankan Pipeline?')
+                    ->modalDescription(fn (KbliScrapeTarget $record) =>
+                        'Reset KBLI ' . $record->kbli_code . ' ke Menunggu dan mulai pipeline scraping.')
+                    ->action(function (KbliScrapeTarget $record) {
+                        $record->requeue();
+                        $result = (new PipelineService())->trigger(1);
+                        if ($result['success']) {
+                            $msg = $result['already_running'] ?? false
+                                ? 'Di-requeue. Pipeline sudah berjalan, target akan diproses.'
+                                : 'Di-requeue. Pipeline dimulai untuk KBLI ' . $record->kbli_code . '.';
+                            Notification::make()->success()->title('Berhasil')->body($msg)->send();
+                        } else {
+                            Notification::make()->warning()->title('Di-requeue, pipeline gagal dimulai')
+                                ->body($result['message'])->send();
+                        }
+                    })
+                    ->visible(fn (KbliScrapeTarget $record) => in_array($record->status, ['done', 'failed', 'queued', 'scraping'])),
                 EditAction::make()->label(''),
             ])
             ->bulkActions([
@@ -141,7 +156,19 @@ class KbliScrapeTargetsTable
                         ->icon('heroicon-o-arrow-path')
                         ->color('warning')
                         ->requiresConfirmation()
-                        ->action(fn ($records) => $records->each->requeue()),
+                        ->action(function ($records) {
+                            $count = $records->count();
+                            $records->each->requeue();
+                            $result = (new PipelineService())->trigger($count);
+                            $msg = $result['success']
+                                ? "{$count} target di-requeue. " . ($result['message'] ?? '')
+                                : "{$count} target di-requeue. Pipeline gagal dimulai: " . ($result['message'] ?? '');
+                            Notification::make()
+                                ->success()
+                                ->title("{$count} KBLI di-requeue")
+                                ->body($msg)
+                                ->send();
+                        }),
 
                     DeleteBulkAction::make(),
                 ]),

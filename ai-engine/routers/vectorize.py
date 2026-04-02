@@ -14,7 +14,8 @@ import os
 from typing import Any
 
 import chromadb
-from fastapi import APIRouter, status
+import httpx
+from fastapi import APIRouter, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -95,3 +96,86 @@ async def vectorize_article(body: VectorizeRequest) -> JSONResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"status": "error", "message": "Vectorization failed."},
         )
+
+
+# ── GET /chunks ───────────────────────────────────────────────────────────────
+
+_PIPELINE_URL = os.getenv("PIPELINE_URL", "http://data-pipeline:9000")
+
+
+@router.get("/chunks", status_code=status.HTTP_200_OK)
+async def get_chunks(
+    kbli_code: str = Query(..., description="KBLI code to fetch chunks for"),
+) -> JSONResponse:
+    """
+    Return all ChromaDB chunks stored for a specific KBLI code.
+    Used by the Filament admin panel to display scraped content.
+    """
+    try:
+        collection = _get_collection()
+        results = collection.get(
+            where={"kbli_code": kbli_code},
+            include=["documents", "metadatas"],
+        )
+        chunks = [
+            {
+                "id":       doc_id,
+                "content":  doc,
+                "section":  meta.get("section", ""),
+                "skala":    meta.get("skala", ""),
+                "source_url": meta.get("source_url", ""),
+                "sub_chunk_index": meta.get("sub_chunk_index", 0),
+            }
+            for doc_id, doc, meta in zip(
+                results.get("ids", []),
+                results.get("documents", []),
+                results.get("metadatas", []),
+            )
+        ]
+        # Sort by section then sub_chunk_index
+        chunks.sort(key=lambda c: (c["section"], c["sub_chunk_index"]))
+        logger.info("Chunks fetched | kbli_code=%s | count=%d", kbli_code, len(chunks))
+        return JSONResponse(content={"kbli_code": kbli_code, "count": len(chunks), "chunks": chunks})
+
+    except Exception:
+        logger.exception("get_chunks failed | kbli_code=%s", kbli_code)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": "Failed to fetch chunks."},
+        )
+
+
+# ── POST /pipeline/trigger (proxy to data-pipeline service) ──────────────────
+
+@router.post("/pipeline/trigger", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_pipeline(limit: int = 35) -> JSONResponse:
+    """
+    Proxy trigger request to the data-pipeline service.
+    Called by the Laravel backend when admin clicks 'Run Pipeline'.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(f"{_PIPELINE_URL}/pipeline/trigger", params={"limit": limit})
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+    except httpx.ConnectError:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "error", "message": "data-pipeline service is not reachable."},
+        )
+    except Exception:
+        logger.exception("pipeline/trigger proxy failed")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": "Failed to trigger pipeline."},
+        )
+
+
+@router.get("/pipeline/status")
+async def get_pipeline_status() -> JSONResponse:
+    """Get the current pipeline run status from the data-pipeline service."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{_PIPELINE_URL}/pipeline/status")
+            return JSONResponse(content=resp.json())
+    except Exception:
+        return JSONResponse(content={"status": "unreachable", "running": False})
