@@ -196,7 +196,13 @@ async def _call_gemini(prompt: str) -> str:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.7,
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 8192,
+        },
+        # Cap thinking tokens so the response always has ample budget.
+        # gemini-2.5-flash can burn 900+ thinking tokens on complex prompts,
+        # leaving almost nothing for the visible answer (finishReason: MAX_TOKENS).
+        "thinkingConfig": {
+            "thinkingBudget": 1024,
         },
     }
     try:
@@ -204,10 +210,24 @@ async def _call_gemini(prompt: str) -> str:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return (
-                data["candidates"][0]["content"]["parts"][0]["text"]
-                .strip()
+            candidate = data["candidates"][0]
+            finish_reason = candidate.get("finishReason", "UNKNOWN")
+            if finish_reason not in ("STOP", "MAX_TOKENS"):
+                logger.warning("Gemini unexpected finishReason=%s", finish_reason)
+            parts = candidate["content"]["parts"]
+            # Filter out internal thought parts (gemini-2.5-flash thinking model)
+            visible_text = "".join(
+                p["text"] for p in parts if not p.get("thought", False)
+            ).strip()
+            usage = data.get("usageMetadata", {})
+            logger.info(
+                "Gemini response | finish=%s | thinking_tokens=%d | output_tokens=%d | chars=%d",
+                finish_reason,
+                usage.get("thoughtsTokenCount", 0),
+                usage.get("candidatesTokenCount", 0),
+                len(visible_text),
             )
+            return visible_text
     except httpx.HTTPStatusError as exc:
         logger.error(
             "Gemini HTTP error | status=%s | body=%s",
