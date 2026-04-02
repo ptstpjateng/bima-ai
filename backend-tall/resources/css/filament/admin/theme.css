@@ -1,4 +1,5 @@
 @import '../../../../vendor/filament/filament/resources/css/theme.css';
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&display=swap');
 
 @source '../../../../app/Filament/**/*';
 @source '../../../../resources/views/filament/**/*';
@@ -7,9 +8,6 @@
    THE ETHEREAL SLATE — "Digital Observatory"
    BIMA-AI Admin Panel Design System v2
    ═══════════════════════════════════════════════════════════════ */
-
-/* ── 0. FONTS ──────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&display=swap');
 
 /* ── 1. DESIGN TOKENS ──────────────────────────────────────── */
 :root {
