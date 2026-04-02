@@ -3,68 +3,483 @@
 @source '../../../../app/Filament/**/*';
 @source '../../../../resources/views/filament/**/*';
 
-/* ─────────────────────────────────────────────
-   BIMA-AI Custom Filament Theme
-   Modern tech-brand styling on top of Filament v4
-   ───────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   THE ETHEREAL SLATE — "Digital Observatory"
+   BIMA-AI Admin Panel Design System v2
+   ═══════════════════════════════════════════════════════════════ */
 
-/* Sidebar — darker navy for stronger branding */
+/* ── 0. FONTS ──────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&display=swap');
+
+/* ── 1. DESIGN TOKENS ──────────────────────────────────────── */
+:root {
+    --obs-surface:              #0b1326;
+    --obs-surface-low:          #131b2e;
+    --obs-surface-container:    #1a2438;
+    --obs-surface-high:         #212d42;
+    --obs-surface-highest:      #2d3449;
+    --obs-surface-lowest:       #060e20;
+
+    --obs-primary:              #c3c0ff;
+    --obs-primary-container:    #4f46e5;
+    --obs-outline-variant:      #464555;
+
+    --obs-glass-bg:             rgba(45, 52, 73, 0.60);
+    --obs-glass-border:         rgba(70, 69, 85, 0.15);
+    --obs-glass-blur:           20px;
+
+    --obs-ambient-shadow:       0px 20px 40px rgba(0, 0, 0, 0.4);
+    --obs-inner-stroke:         inset 0 1px 0 rgba(195, 192, 255, 0.08);
+
+    --obs-gradient:             linear-gradient(135deg, #4f46e5 0%, #c3c0ff 100%);
+    --obs-gradient-subtle:      linear-gradient(135deg, rgba(79,70,229,0.15) 0%, rgba(195,192,255,0.08) 100%);
+
+    font-family: 'Manrope', system-ui, sans-serif !important;
+}
+
+/* ── 2. BASE LAYER ─────────────────────────────────────────── */
+html,
+body,
+.fi-body {
+    background-color: var(--obs-surface) !important;
+    font-family: 'Manrope', system-ui, sans-serif !important;
+}
+
+/* ── 3. SIDEBAR ────────────────────────────────────────────── */
 .fi-sidebar {
-    @apply bg-slate-900 border-r border-slate-800;
+    background-color: var(--obs-surface-low) !important;
+    border-right: none !important;
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.25) !important;
 }
 
-.fi-sidebar-nav-item-label {
-    @apply font-medium;
+.fi-sidebar-nav-groups {
+    padding: 0.5rem 0.75rem !important;
 }
 
-/* Active sidebar item */
+.fi-sidebar-item-button {
+    border-radius: 0.625rem !important;
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 500 !important;
+    transition: background 0.15s ease, color 0.15s ease !important;
+}
+
+.fi-sidebar-item-button:hover {
+    background-color: rgba(79, 70, 229, 0.12) !important;
+    color: var(--obs-primary) !important;
+}
+
 .fi-sidebar-item-active .fi-sidebar-item-button {
-    @apply bg-primary-600/20 text-primary-400;
+    background: linear-gradient(135deg, rgba(79,70,229,0.25) 0%, rgba(195,192,255,0.12) 100%) !important;
+    color: var(--obs-primary) !important;
+    box-shadow: var(--obs-inner-stroke) !important;
 }
 
-/* Top topbar */
+.fi-sidebar-group-label {
+    font-family: 'Manrope', sans-serif !important;
+    font-size: 0.6875rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.08em !important;
+    text-transform: uppercase !important;
+    color: rgba(195, 192, 255, 0.45) !important;
+    padding: 1.25rem 0.75rem 0.375rem !important;
+}
+
+/* ── 4. TOPBAR ─────────────────────────────────────────────── */
 .fi-topbar {
-    @apply border-b border-slate-200 dark:border-slate-800;
+    background-color: rgba(19, 27, 46, 0.80) !important;
+    backdrop-filter: blur(16px) !important;
+    -webkit-backdrop-filter: blur(16px) !important;
+    border-bottom: none !important;
+    box-shadow: 0 1px 0 rgba(70, 69, 85, 0.20), 0 4px 16px rgba(0,0,0,0.2) !important;
 }
 
-/* Card / panel surfaces — subtle shadow */
+/* ── 5. MAIN CONTENT AREA ──────────────────────────────────── */
+.fi-main {
+    background-color: var(--obs-surface) !important;
+}
+
+.fi-main-ctn {
+    background-color: var(--obs-surface) !important;
+}
+
+/* ── 6. GLASS CARDS & SECTIONS ─────────────────────────────── */
 .fi-section,
+.fi-wi-stats-overview-stat,
+.fi-wi,
 .fi-card {
-    @apply shadow-sm ring-1 ring-slate-200 dark:ring-slate-700;
+    background: var(--obs-glass-bg) !important;
+    backdrop-filter: blur(var(--obs-glass-blur)) !important;
+    -webkit-backdrop-filter: blur(var(--obs-glass-blur)) !important;
+    border: 1px solid var(--obs-glass-border) !important;
+    border-radius: 1rem !important;
+    box-shadow: var(--obs-ambient-shadow), var(--obs-inner-stroke) !important;
 }
 
-/* Tables — tighter, cleaner row borders */
+.fi-section-header {
+    border-bottom: 1px solid rgba(70, 69, 85, 0.12) !important;
+}
+
+.fi-section-header-heading {
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.01em !important;
+    color: #e8e6ff !important;
+}
+
+.fi-section-header-description {
+    color: rgba(195, 192, 255, 0.55) !important;
+}
+
+/* ── 7. STAT WIDGETS ───────────────────────────────────────── */
+.fi-wi-stats-overview-stat-value {
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 800 !important;
+    font-size: 1.875rem !important;
+    letter-spacing: -0.02em !important;
+    background: var(--obs-gradient) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    background-clip: text !important;
+}
+
+.fi-wi-stats-overview-stat-label {
+    font-family: 'Manrope', sans-serif !important;
+    font-size: 0.6875rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+    color: rgba(195, 192, 255, 0.55) !important;
+}
+
+.fi-wi-stats-overview-stat-description {
+    color: rgba(195, 192, 255, 0.40) !important;
+    font-size: 0.75rem !important;
+}
+
+/* ── 8. TABLES ─────────────────────────────────────────────── */
 .fi-ta-header-cell {
-    @apply text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400;
+    background-color: var(--obs-surface-low) !important;
+    font-family: 'Manrope', sans-serif !important;
+    font-size: 0.6875rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+    color: rgba(195, 192, 255, 0.50) !important;
+    border-bottom: none !important;
+    padding-top: 0.875rem !important;
+    padding-bottom: 0.875rem !important;
 }
 
-/* Badges — slightly more rounded */
-.fi-badge {
-    @apply rounded-full px-2.5 font-medium text-xs;
+.fi-ta-row {
+    border-bottom: 1px solid rgba(70, 69, 85, 0.07) !important;
+    transition: background 0.12s ease !important;
 }
 
-/* Stat cards on dashboard */
-.fi-wi-stats-overview-stat {
-    @apply rounded-xl;
+.fi-ta-row:hover {
+    background-color: var(--obs-surface-high) !important;
+    box-shadow: inset 2px 0 0 var(--obs-primary-container) !important;
 }
 
-/* Buttons — slightly more rounded */
+.fi-ta-cell {
+    font-family: 'Manrope', sans-serif !important;
+    color: rgba(232, 230, 255, 0.85) !important;
+    border: none !important;
+}
+
+.fi-ta-header-row {
+    border-bottom: none !important;
+}
+
+.fi-ta-filters-form,
+.fi-ta-header {
+    background-color: var(--obs-surface-low) !important;
+    border-bottom: 1px solid rgba(70, 69, 85, 0.12) !important;
+}
+
+.fi-ta-content {
+    background-color: var(--obs-surface-container) !important;
+}
+
+/* ── 9. BUTTONS ────────────────────────────────────────────── */
+.fi-btn-color-primary {
+    background: var(--obs-gradient) !important;
+    border: none !important;
+    color: #ffffff !important;
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 600 !important;
+    box-shadow: 0 4px 14px rgba(79, 70, 229, 0.35) !important;
+    border-radius: 0.5rem !important;
+}
+
+.fi-btn-color-primary:hover {
+    box-shadow: 0 6px 20px rgba(79, 70, 229, 0.50) !important;
+    opacity: 0.92 !important;
+}
+
+.fi-btn-color-gray {
+    background: rgba(45, 52, 73, 0.40) !important;
+    backdrop-filter: blur(10px) !important;
+    border: 1px solid rgba(70, 69, 85, 0.25) !important;
+    color: rgba(232, 230, 255, 0.80) !important;
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 500 !important;
+    border-radius: 0.5rem !important;
+}
+
+.fi-btn-color-gray:hover {
+    background: rgba(45, 52, 73, 0.65) !important;
+    color: var(--obs-primary) !important;
+}
+
+.fi-btn-color-warning {
+    background: rgba(251, 146, 60, 0.15) !important;
+    border: 1px solid rgba(251, 146, 60, 0.30) !important;
+    color: #fb923c !important;
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 600 !important;
+    border-radius: 0.5rem !important;
+}
+
+.fi-btn-color-danger {
+    background: rgba(239, 68, 68, 0.15) !important;
+    border: 1px solid rgba(239, 68, 68, 0.30) !important;
+    color: #ef4444 !important;
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 600 !important;
+    border-radius: 0.5rem !important;
+}
+
+.fi-btn-color-success {
+    background: rgba(34, 197, 94, 0.15) !important;
+    border: 1px solid rgba(34, 197, 94, 0.30) !important;
+    color: #22c55e !important;
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 600 !important;
+    border-radius: 0.5rem !important;
+}
+
 .fi-btn {
-    @apply rounded-lg font-medium;
+    border-radius: 0.5rem !important;
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 500 !important;
+    transition: all 0.15s ease !important;
 }
 
-/* Widget headings */
-.fi-wi-header {
-    @apply font-semibold text-slate-800 dark:text-slate-100;
+/* ── 10. INPUT FIELDS ──────────────────────────────────────── */
+.fi-input,
+.fi-select-input,
+.fi-textarea {
+    background-color: var(--obs-surface-lowest) !important;
+    border-color: rgba(70, 69, 85, 0.30) !important;
+    color: rgba(232, 230, 255, 0.90) !important;
+    font-family: 'Manrope', sans-serif !important;
+    border-radius: 0.5rem !important;
 }
 
-/* Infolist entries — comfortable padding */
-.fi-in-entry-wrapper {
-    @apply py-1;
+.fi-input:focus,
+.fi-select-input:focus,
+.fi-textarea:focus {
+    border-color: var(--obs-primary) !important;
+    box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.20) !important;
+    outline: none !important;
 }
 
-/* Scrollable pre-formatted content (scraped_content blocks) */
+.fi-fo-field-wrp-label {
+    font-family: 'Manrope', sans-serif !important;
+    font-size: 0.75rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.02em !important;
+    color: rgba(195, 192, 255, 0.70) !important;
+}
+
+/* ── 11. MODALS & POPOVERS ─────────────────────────────────── */
+.fi-modal-window,
+.fi-ac-modal {
+    background: rgba(26, 36, 56, 0.90) !important;
+    backdrop-filter: blur(24px) !important;
+    -webkit-backdrop-filter: blur(24px) !important;
+    border: 1px solid rgba(70, 69, 85, 0.20) !important;
+    border-radius: 1.25rem !important;
+    box-shadow: var(--obs-ambient-shadow), var(--obs-inner-stroke) !important;
+}
+
+.fi-modal-header {
+    border-bottom: 1px solid rgba(70, 69, 85, 0.15) !important;
+}
+
+.fi-modal-heading {
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.01em !important;
+    color: #e8e6ff !important;
+}
+
+/* ── 12. BADGES ────────────────────────────────────────────── */
+.fi-badge {
+    font-family: 'Manrope', sans-serif !important;
+    font-size: 0.6875rem !important;
+    font-weight: 600 !important;
+    border-radius: 9999px !important;
+    padding: 0.2rem 0.6rem !important;
+    letter-spacing: 0.02em !important;
+}
+
+/* ── 13. NOTIFICATIONS ─────────────────────────────────────── */
+.fi-no-notification {
+    background: rgba(26, 36, 56, 0.92) !important;
+    backdrop-filter: blur(20px) !important;
+    border: 1px solid rgba(70, 69, 85, 0.20) !important;
+    border-radius: 1rem !important;
+    box-shadow: var(--obs-ambient-shadow) !important;
+}
+
+/* ── 14. PAGE HEADERS ──────────────────────────────────────── */
+.fi-header-heading {
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 800 !important;
+    font-size: 1.75rem !important;
+    letter-spacing: -0.02em !important;
+    color: #e8e6ff !important;
+}
+
+.fi-header-subheading {
+    font-family: 'Manrope', sans-serif !important;
+    color: rgba(195, 192, 255, 0.55) !important;
+}
+
+.fi-breadcrumbs-item {
+    font-family: 'Manrope', sans-serif !important;
+    font-size: 0.8125rem !important;
+}
+
+/* ── 15. PAGINATION ────────────────────────────────────────── */
+.fi-pagination-item-btn {
+    font-family: 'Manrope', sans-serif !important;
+    background: transparent !important;
+    border: 1px solid rgba(70, 69, 85, 0.20) !important;
+    color: rgba(195, 192, 255, 0.70) !important;
+    border-radius: 0.5rem !important;
+}
+
+.fi-pagination-item-btn[aria-current="page"] {
+    background: var(--obs-gradient) !important;
+    border-color: transparent !important;
+    color: #ffffff !important;
+}
+
+/* ── 16. LOGIN PAGE ────────────────────────────────────────── */
+.fi-simple-layout {
+    background: var(--obs-surface) !important;
+    background-image:
+        radial-gradient(ellipse at 20% 30%, rgba(79,70,229,0.12) 0%, transparent 60%),
+        radial-gradient(ellipse at 80% 70%, rgba(195,192,255,0.06) 0%, transparent 60%) !important;
+}
+
+.fi-simple-page {
+    background: var(--obs-glass-bg) !important;
+    backdrop-filter: blur(24px) !important;
+    -webkit-backdrop-filter: blur(24px) !important;
+    border: 1px solid rgba(70, 69, 85, 0.20) !important;
+    border-radius: 1.5rem !important;
+    box-shadow: var(--obs-ambient-shadow), var(--obs-inner-stroke) !important;
+}
+
+/* ── 17. SCROLLBARS ────────────────────────────────────────── */
+* {
+    scrollbar-width: thin !important;
+    scrollbar-color: rgba(70, 69, 85, 0.50) transparent !important;
+}
+
+*::-webkit-scrollbar {
+    width: 5px !important;
+    height: 5px !important;
+}
+
+*::-webkit-scrollbar-track {
+    background: transparent !important;
+}
+
+*::-webkit-scrollbar-thumb {
+    background-color: rgba(70, 69, 85, 0.50) !important;
+    border-radius: 9999px !important;
+}
+
+/* ── 18. INFOLIST ENTRIES ──────────────────────────────────── */
+.fi-in-entry-wrp-label {
+    font-family: 'Manrope', sans-serif !important;
+    font-size: 0.6875rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+    color: rgba(195, 192, 255, 0.50) !important;
+}
+
+.fi-in-text {
+    font-family: 'Manrope', sans-serif !important;
+    color: rgba(232, 230, 255, 0.85) !important;
+}
+
+/* Scrollable scraped content blocks */
 .fi-in-text .prose,
 .fi-in-text pre {
-    @apply max-h-[70vh] overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed;
+    max-height: 70vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    font-size: 0.8125rem;
+    line-height: 1.7;
+}
+
+/* ── 19. WIDGET CONTAINER ──────────────────────────────────── */
+.fi-wi-header-heading {
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 700 !important;
+    color: rgba(232, 230, 255, 0.90) !important;
+    letter-spacing: -0.01em !important;
+}
+
+/* ── 20. DROPDOWN MENUS ────────────────────────────────────── */
+.fi-dropdown-panel {
+    background: rgba(26, 36, 56, 0.95) !important;
+    backdrop-filter: blur(20px) !important;
+    border: 1px solid rgba(70, 69, 85, 0.20) !important;
+    border-radius: 0.75rem !important;
+    box-shadow: var(--obs-ambient-shadow) !important;
+}
+
+.fi-dropdown-list-item-label {
+    font-family: 'Manrope', sans-serif !important;
+    color: rgba(232, 230, 255, 0.80) !important;
+}
+
+.fi-dropdown-list-item:hover {
+    background-color: rgba(79, 70, 229, 0.12) !important;
+}
+
+/* ── 21. TABS ──────────────────────────────────────────────── */
+.fi-tabs-tab {
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 600 !important;
+    color: rgba(195, 192, 255, 0.55) !important;
+}
+
+.fi-tabs-tab-active,
+.fi-tabs-tab[aria-selected="true"] {
+    color: var(--obs-primary) !important;
+    border-color: var(--obs-primary-container) !important;
+}
+
+/* ── 22. TENANT/BRAND AREA ─────────────────────────────────── */
+.fi-sidebar-header {
+    border-bottom: 1px solid rgba(70, 69, 85, 0.12) !important;
+    padding: 1rem 1.25rem !important;
+}
+
+.fi-logo-text {
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.02em !important;
+    background: var(--obs-gradient) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    background-clip: text !important;
 }

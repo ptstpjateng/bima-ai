@@ -30,21 +30,21 @@ class AdminPanelProvider extends PanelProvider
             ->login()
             ->colors([
                 'primary' => [
-                    50  => '239 246 255',
-                    100 => '219 234 254',
-                    200 => '191 219 254',
-                    300 => '147 197 253',
-                    400 => '96 165 250',
-                    500 => '59 130 246',
-                    600 => '37 99 235',
-                    700 => '29 78 216',
-                    800 => '30 58 138',
-                    900 => '30 58 95',
-                    950 => '23 37 84',
+                    50  => '237 233 254',
+                    100 => '221 214 254',
+                    200 => '196 181 253',
+                    300 => '167 139 250',
+                    400 => '139 92 246',
+                    500 => '109 40 217',
+                    600 => '79 70 229',
+                    700 => '67 56 202',
+                    800 => '55 48 163',
+                    900 => '46 16 101',
+                    950 => '29 10 64',
                 ],
             ])
             ->brandName('BIMA-AI Admin')
-            ->font('Inter', provider: \Filament\FontProviders\GoogleFontProvider::class)
+            ->font('Manrope', provider: \Filament\FontProviders\GoogleFontProvider::class)
             ->discoverResources(in: app_path('Filament/Resources'), for: 'App\Filament\Resources')
             ->discoverPages(in: app_path('Filament/Pages'), for: 'App\Filament\Pages')
             ->pages([
