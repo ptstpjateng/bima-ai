@@ -6,6 +6,7 @@ use Filament\Infolists\Components\IconEntry;
 use Filament\Infolists\Components\TextEntry;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
+use Filament\Support\Enums\TextSize;
 
 class KbliScrapeTargetInfolist
 {
@@ -21,7 +22,7 @@ class KbliScrapeTargetInfolist
                     TextEntry::make('kbli_code')
                         ->label('Kode KBLI')
                         ->weight('bold')
-                        ->size(TextEntry\TextEntrySize::Large)
+                        ->size(TextSize::Large)
                         ->copyable()
                         ->copyMessage('Kode disalin!')
                         ->badge()
@@ -60,7 +61,7 @@ class KbliScrapeTargetInfolist
                     TextEntry::make('status')
                         ->label('Status')
                         ->badge()
-                        ->size(TextEntry\TextEntrySize::Large)
+                        ->size(TextSize::Large)
                         ->color(fn (string $state): string => match ($state) {
                             'pending'  => 'gray',
                             'queued'   => 'info',

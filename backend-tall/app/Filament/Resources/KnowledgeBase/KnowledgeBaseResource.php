@@ -5,6 +5,7 @@ namespace App\Filament\Resources\KnowledgeBase;
 use App\Filament\Resources\KnowledgeBase\Pages\CreateKnowledgeBaseArticle;
 use App\Filament\Resources\KnowledgeBase\Pages\EditKnowledgeBaseArticle;
 use App\Filament\Resources\KnowledgeBase\Pages\ListKnowledgeBaseArticles;
+use App\Filament\Resources\KnowledgeBase\Pages\ViewKnowledgeBaseArticle;
 use App\Filament\Resources\KnowledgeBase\Schemas\KnowledgeBaseForm;
 use App\Filament\Resources\KnowledgeBase\Tables\KnowledgeBaseTable;
 use App\Models\KnowledgeBaseArticle;
@@ -48,6 +49,7 @@ class KnowledgeBaseResource extends Resource
         return [
             'index'  => ListKnowledgeBaseArticles::route('/'),
             'create' => CreateKnowledgeBaseArticle::route('/create'),
+            'view'   => ViewKnowledgeBaseArticle::route('/{record}'),
             'edit'   => EditKnowledgeBaseArticle::route('/{record}/edit'),
         ];
     }

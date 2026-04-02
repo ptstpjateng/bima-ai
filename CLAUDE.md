@@ -14,6 +14,7 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 ## 🐘 Laravel & Filament Strict Conventions
 *   **Authentication & Seeders:** When creating Laravel authentication or user seeders, **never hash passwords that are already being hashed** by model casts or mutators. Always check the `User` model for `$casts` with 'hashed' or `setPasswordAttribute` mutators before writing password logic. (This prevents the double-hashing bug).
 *   **Filament Resources:** After generating or modifying Filament resources, you must run `php artisan filament:check` or attempt to load the admin panel to verify no type errors or property mismatches (like `$navigationGroup`) exist. Use string types, not enums, for `$navigationGroup` unless explicitly configured otherwise.
+*   **Filament v4 Documentation:** When building or modifying the admin panel, you MUST strictly reference the Filament v4.x documentation (https://filamentphp.com/docs/4.x/). Do not use v3 syntax (e.g., `Filament\Forms\Components\Section` is now `Filament\Schemas\Components\Section`; `Form`/`Infolist` containers are now `Schema`).
 *   **Database Migrations:** Always verify database connectivity with `php artisan migrate:status` before proceeding with new migrations or seeders.
 
 ## 🖥️ VPS & Infrastructure
