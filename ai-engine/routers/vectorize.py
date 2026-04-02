@@ -23,7 +23,7 @@ logger = logging.getLogger("bima_ai.vectorize")
 router = APIRouter()
 
 _CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "/app/chroma_db")
-_COLLECTION_NAME = "bima_regulations"
+_COLLECTION_NAME = "oss_regulations"  # unified with rag_service.py
 
 
 def _get_collection() -> chromadb.Collection:

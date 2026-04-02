@@ -4,10 +4,13 @@ namespace App\Filament\Resources\KnowledgeBase\Tables;
 
 use App\Filament\Resources\KnowledgeBase\KnowledgeBaseResource;
 use App\Models\KnowledgeBaseArticle;
+use App\Services\VectorizeService;
+use Filament\Actions\Action;
 use Filament\Actions\BulkActionGroup;
 use Filament\Actions\DeleteBulkAction;
 use Filament\Actions\EditAction;
 use Filament\Actions\ViewAction;
+use Filament\Notifications\Notification;
 use Filament\Tables\Columns\IconColumn;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Filters\SelectFilter;
@@ -90,6 +93,31 @@ class KnowledgeBaseTable
             ->actions([
                 ViewAction::make()->label(''),
                 EditAction::make()->label(''),
+                Action::make('sync_to_ai')
+                    ->label('')
+                    ->tooltip('Sync ke AI Brain (ChromaDB)')
+                    ->icon('heroicon-o-cpu-chip')
+                    ->color('success')
+                    ->requiresConfirmation()
+                    ->modalHeading('Sync Konten ke AI Brain?')
+                    ->modalDescription(fn (KnowledgeBaseArticle $record) =>
+                        "Ini akan menghapus embedding lama dan mengirim ulang konten "{$record->title}" ke ChromaDB.")
+                    ->action(function (KnowledgeBaseArticle $record) {
+                        $result = (new VectorizeService())->sync($record);
+                        if ($result['success']) {
+                            Notification::make()
+                                ->success()
+                                ->title('Berhasil disinkronkan!')
+                                ->body("Doc ID: {$result['doc_id']}")
+                                ->send();
+                        } else {
+                            Notification::make()
+                                ->danger()
+                                ->title('Sinkronisasi gagal')
+                                ->body($result['error'] ?? 'Unknown error')
+                                ->send();
+                        }
+                    }),
             ])
             ->bulkActions([
                 BulkActionGroup::make([

@@ -6,6 +6,12 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 *   **Pillar 2 & 3:** Next.js + React Native (Licensing Wizard & Super App UI)
 *   **Core Backend:** Laravel 13 + Filament v.4 + PostgreSQL (TALL Stack)
 
+## 🤖 BIMA-AI Persona
+The AI persona, 3-phase lifecycle (Pre-License → Execution → Post-License), tone rules, and
+portal link directives are fully documented in **[BIMA_PERSONA.md](./BIMA_PERSONA.md)**.
+All AI prompt tuning, system instruction changes, or new conversation flows MUST reference
+that file first before modifying `ai-engine/services/ai_handler.py`.
+
 ## 🛠️ Core Operating Principles
 1.  **Verify Before Moving On:** Never write massive blocks of code without testing. After creating or modifying any component (frontend or backend), you MUST run the appropriate build, lint, or test command to verify it works before proceeding to the next step.
 2.  **Batch Full-Stack Scaffolding:** When asked to build a feature, consider the entire stack. For example, if building a CRUD feature, handle the migration, model, API controller, and admin resource simultaneously to ensure data consistency.
