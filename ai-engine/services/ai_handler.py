@@ -197,12 +197,12 @@ async def _call_gemini(prompt: str) -> str:
         "generationConfig": {
             "temperature": 0.7,
             "maxOutputTokens": 8192,
-        },
-        # Cap thinking tokens so the response always has ample budget.
-        # gemini-2.5-flash can burn 900+ thinking tokens on complex prompts,
-        # leaving almost nothing for the visible answer (finishReason: MAX_TOKENS).
-        "thinkingConfig": {
-            "thinkingBudget": 1024,
+            # Cap thinking tokens so the response always has room to complete.
+            # gemini-2.5-flash consumed 979/1024 tokens for reasoning on complex
+            # prompts, leaving only 41 tokens for the visible answer (MAX_TOKENS).
+            "thinkingConfig": {
+                "thinkingBudget": 1024,
+            },
         },
     }
     try:
