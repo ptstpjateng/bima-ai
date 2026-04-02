@@ -101,7 +101,7 @@ class KnowledgeBaseTable
                     ->requiresConfirmation()
                     ->modalHeading('Sync Konten ke AI Brain?')
                     ->modalDescription(fn (KnowledgeBaseArticle $record) =>
-                        "Ini akan menghapus embedding lama dan mengirim ulang konten "{$record->title}" ke ChromaDB.")
+                        'Ini akan menghapus embedding lama dan mengirim ulang konten "' . $record->title . '" ke ChromaDB.')
                     ->action(function (KnowledgeBaseArticle $record) {
                         $result = (new VectorizeService())->sync($record);
                         if ($result['success']) {
