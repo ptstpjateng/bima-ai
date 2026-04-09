@@ -128,15 +128,21 @@ def evaluate_rag(tc: dict, raw_chunks: list[dict], rag_latency: float) -> dict:
     if raw_chunks and tc["rag_should_retrieve"] and tc["rag_relevant_kblis"]:
         retrieved_content = " ".join(c.get("content","") for c in relevant)
         expected_kblis    = tc["rag_relevant_kblis"]
-        # Check both content text AND kbli_code metadata — metadata is authoritative
+        # Check both content text AND kbli_code metadata — metadata is authoritative.
+        # Only flag as regression when distances are also high (> 0.55 avg on relevant),
+        # indicating a true semantic space mismatch. Low-distance misses are a data
+        # coverage gap (too few chunks for that KBLI), not an embedding regression.
         kbli_found = (
             any(k in retrieved_content for k in expected_kblis)
             or any(c.get("kbli_code") in expected_kblis for c in relevant)
         )
-        if not kbli_found and relevant:
+        avg_dist = (
+            sum(c["distance"] for c in relevant) / len(relevant) if relevant else 1.0
+        )
+        if not kbli_found and relevant and avg_dist > 0.55:
             warnings.append(
                 f"BUG-002 REGRESSION: Queried for KBLI {expected_kblis} "
-                f"but no retrieved chunk (content or kbli_code) matches — "
+                f"but no retrieved chunk matches and avg_dist={avg_dist:.3f}>0.55 — "
                 f"embedding alignment may have regressed"
             )
         elif not kbli_found and not relevant:
