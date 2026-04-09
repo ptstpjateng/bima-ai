@@ -6,6 +6,14 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 *   **Pillar 2 & 3:** Next.js + React Native (Licensing Wizard & Super App UI)
 *   **Core Backend:** Laravel 13 + Filament v.4 + PostgreSQL (TALL Stack)
 
+## 🎨 UI & Design System
+
+For ANY frontend changes in Filament or Next.js, you MUST first read design.md and strictly apply its color codes, typography (Manrope), and glassmorphism rules. Do not use default Tailwind borders or pure black/white backgrounds.
+
+The canonical design system is **The Ethereal Slate / Digital Observatory** — deep slate palette (`surface` #0b1326, `surface_container_low` #131b2e, `surface_container_highest` #2d3449), Manrope typeface, frosted glass cards with `backdrop-blur` 12–25px, indigo-to-lavender primary gradient (#4f46e5 → #c3c0ff), and the strict "No-Line Rule" (no solid borders for layout separation).
+
+Reference file: **[design.md](./design.md)**
+
 ## 🤖 BIMA-AI Persona
 The AI persona, 3-phase lifecycle (Pre-License → Execution → Post-License), tone rules, and
 portal link directives are fully documented in **[BIMA_PERSONA.md](./BIMA_PERSONA.md)**.
@@ -92,6 +100,25 @@ DB_PASSWORD=<see VPS>
 | `LARAVEL_BACKEND_URL` | `http://backend:80` |
 | `LARAVEL_API_KEY` | Must match backend `INTERNAL_API_KEY` |
 | `CHROMA_HOST` | `ai-engine` |
+
+### Data Pipeline — `data-pipeline/.env` (VPS only)
+| Key | Value | Notes |
+|---|---|---|
+| `GEMINI_API_KEY` | `<see VPS>` | Primary LLM — Google AI Studio key |
+| `GEMINI_MODEL` | `models/gemini-2.5-flash` | Primary model (~5–10s per KBLI) |
+| `OLLAMA_HOST` | `http://172.19.0.1:11435` | Fallback LLM — Docker gateway → host proxy on port 11435 |
+| `OLLAMA_MODEL` | `gemma4` | Fallback model (CPU-only, ~15 min per KBLI — only used if Gemini fails) |
+| `DB_HOST` | `postgres` | Docker DNS |
+| `DB_DATABASE` | `bima_ai` | |
+| `DB_USERNAME` | `bima` | |
+| `DB_PASSWORD` | `<see VPS>` | |
+| `CHROMA_DB_PATH` | `/app/chroma_db` | Matches `chroma_data` Docker volume |
+
+> **Ollama proxy:** The pipeline container cannot reach `127.0.0.1:11434` directly. A Python TCP proxy (`~/ollama-proxy.py`) runs in a `screen` session named `ollama-proxy`, forwarding `0.0.0.0:11435 → 127.0.0.1:11434`. If the proxy dies, restart with: `screen -dmS ollama-proxy python3 ~/ollama-proxy.py`
+
+> **Pipeline worker:** `data-pipeline/run_pipeline_ollama.py` — called by `server.py` via `POST /pipeline/trigger?limit=N`. Reads `kbli_scrape_targets` for `status='pending'`, marks as `scraping`, scrapes OSS with Playwright (tabs + accordions), extracts with Gemini (falls back to Ollama), converts JSON to semantic Markdown chunks in ChromaDB, saves raw JSON to `scraped_content` column, sets `status='done'`.
+
+> **Note on table name:** The scrape queue is `kbli_scrape_targets` (not `knowledge_bases`). The `scraped_content TEXT` column was added manually via `ALTER TABLE`.
 
 ### Frontend — `frontend/.env.local` (local) / Vercel dashboard (production)
 | Key | Local | Production |
