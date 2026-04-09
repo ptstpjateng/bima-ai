@@ -173,7 +173,16 @@ async def generate_ai_response(user_id: str, message: str) -> str:
         full_prompt = "\n".join(parts)
 
         if _GEMINI_API_KEY:
-            return await _call_gemini(full_prompt)
+            try:
+                return await _call_gemini_with_retry(full_prompt)
+            except Exception:
+                # BUG-003 FIX — all retries exhausted; fall through to structured
+                # placeholder instead of returning a dead-end error string.
+                logger.warning(
+                    "Gemini unavailable after retries — falling back to smart placeholder | user_id=%s",
+                    user_id,
+                )
+                return _smart_placeholder(message, user_ctx, rag_chunks)
         else:
             return _smart_placeholder(message, user_ctx, rag_chunks)
 
@@ -183,6 +192,40 @@ async def generate_ai_response(user_id: str, message: str) -> str:
             "Maaf, terjadi gangguan teknis sementara. "
             "Silakan coba lagi dalam beberapa saat. Terima kasih atas kesabaran Anda."
         )
+
+
+async def _call_gemini_with_retry(prompt: str, max_attempts: int = 3) -> str:
+    """BUG-003 FIX — call Gemini with exponential backoff for transient errors.
+
+    Retries on HTTP 429 (rate limit) and 503 (service unavailable) up to
+    max_attempts times, sleeping 1s then 2s between retries.
+    Raises the final exception if all attempts fail so the caller can fall back.
+    """
+    import asyncio
+
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await _call_gemini(prompt)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in (429, 503) and attempt < max_attempts - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                logger.warning(
+                    "Gemini %s on attempt %d/%d — retrying in %ds",
+                    status, attempt + 1, max_attempts, delay,
+                )
+                await asyncio.sleep(delay)
+                last_exc = exc
+                continue
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
 
 
 async def _call_gemini(prompt: str) -> str:
