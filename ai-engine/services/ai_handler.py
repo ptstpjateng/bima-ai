@@ -184,18 +184,18 @@ async def generate_ai_response(user_id: str, message: str) -> str:
                 "RAG returned 0 usable chunks — activating fallback prompt | user_id=%s", user_id
             )
 
+        # Build system instruction: base prompt + user profile + RAG context
         system = _SYSTEM_PROMPT if has_rag else f"{_SYSTEM_PROMPT}\n\n{_FALLBACK_SYSTEM_ADDITION}"
-        parts = [system]
+        system_parts = [system]
         if user_ctx_str:
-            parts.append("\n" + user_ctx_str)
+            system_parts.append(user_ctx_str)
         if rag_ctx_str:
-            parts.append("\n" + rag_ctx_str)
-        parts.append(f"\nPertanyaan pengguna: {message}")
-        full_prompt = "\n".join(parts)
+            system_parts.append(rag_ctx_str)
+        system_instruction = "\n\n".join(system_parts)
 
         if _GEMINI_API_KEY:
             try:
-                return await _call_gemma_with_retry(full_prompt)
+                return await _call_gemma_with_retry(system_instruction, message)
             except Exception:
                 logger.warning(
                     "Gemma unavailable after retries — using RAG-based fallback | user_id=%s",
@@ -246,9 +246,8 @@ async def analyze_user_intent(message: str) -> dict:
     if not _GEMINI_API_KEY:
         return {"phase": 1, "kbli_code": None, "detected_scale": None}
 
-    prompt = f"{_INTENT_SYSTEM}\n\nUser message: {message}"
     try:
-        raw = await _call_gemma(prompt, max_tokens=128, temperature=0.0)
+        raw = await _call_gemma(_INTENT_SYSTEM, message, max_tokens=128, temperature=0.0)
         cleaned = _strip_json_fences(raw)
         intent = json.loads(cleaned)
         # Normalise — ensure required keys exist
@@ -262,7 +261,9 @@ async def analyze_user_intent(message: str) -> dict:
         return {"phase": 1, "kbli_code": None, "detected_scale": None}
 
 
-async def _call_gemma_with_retry(prompt: str, max_attempts: int = 3, **kwargs) -> str:
+async def _call_gemma_with_retry(
+    system_prompt: str, user_message: str, max_attempts: int = 3, **kwargs
+) -> str:
     """Call Gemma with exponential backoff for transient 429/503 errors.
 
     Raises the final exception if all attempts fail so the caller can fall back
@@ -273,7 +274,7 @@ async def _call_gemma_with_retry(prompt: str, max_attempts: int = 3, **kwargs) -
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            return await _call_gemma(prompt, **kwargs)
+            return await _call_gemma(system_prompt, user_message, **kwargs)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status in (429, 503) and attempt < max_attempts - 1:
@@ -295,13 +296,23 @@ async def _call_gemma_with_retry(prompt: str, max_attempts: int = 3, **kwargs) -
     raise last_exc  # type: ignore[misc]
 
 
-async def _call_gemma(prompt: str, *, max_tokens: int = 8192, temperature: float = 0.7) -> str:
+async def _call_gemma(
+    system_prompt: str,
+    user_message: str,
+    *,
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+) -> str:
     """
     Call hosted Gemma (or any model on the Generative Language API) via REST.
 
+    Uses systemInstruction for the system prompt so the model treats it as
+    directives, not as content to summarise or continue.  The user_message
+    goes in contents[].  This fixes the "Gemma echoes the system prompt"
+    regression caused by passing everything as a single flat text blob.
+
     Notable differences from the old Gemini call:
     - No thinkingConfig (Gemma models don't support it)
-    - No thought-part filtering needed (Gemma has no internal reasoning parts)
     - Response text may contain Markdown code fences around JSON; callers that
       need JSON should use _strip_json_fences() before parsing.
     """
@@ -311,14 +322,15 @@ async def _call_gemma(prompt: str, *, max_tokens: int = 8192, temperature: float
         f"{model_name}:generateContent?key={_GEMINI_API_KEY}"
     )
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
         },
     }
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -326,7 +338,12 @@ async def _call_gemma(prompt: str, *, max_tokens: int = 8192, temperature: float
             finish_reason = candidate.get("finishReason", "UNKNOWN")
             if finish_reason not in ("STOP", "MAX_TOKENS"):
                 logger.warning("Gemma unexpected finishReason=%s", finish_reason)
-            text = "".join(p["text"] for p in candidate["content"]["parts"]).strip()
+            # Filter out thought parts (thinking/reasoning — gemma-4 returns these
+            # as parts with thought=True which must not be shown to the user).
+            text = "".join(
+                p["text"] for p in candidate["content"]["parts"]
+                if not p.get("thought", False)
+            ).strip()
             usage = data.get("usageMetadata", {})
             logger.info(
                 "Gemma response | model=%s | finish=%s | output_tokens=%d | chars=%d",
