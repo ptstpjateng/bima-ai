@@ -2,12 +2,14 @@
 BIMA-AI – AI Handler Service
 
 Full pipeline for every inbound message:
-  1. fetch_user_context  – pull user's business profile + license vault from Laravel
-  2. query_regulations   – semantic RAG search in ChromaDB
-  3. generate_ai_response – call Gemini LLM (falls back to smart placeholder)
-  4. send_platform_reply – send reply to WhatsApp or Telegram
-  5. log_to_backend      – async POST to Laravel /api/ai-logs (fire-and-forget)
+  1. analyze_user_intent – lightweight JSON call to classify phase (1/2/3) + extract KBLI
+  2. fetch_user_context  – pull user's business profile + license vault from Laravel
+  3. query_regulations   – semantic RAG search in ChromaDB (KBLI-targeted when detected)
+  4. generate_ai_response – call hosted Gemma LLM (falls back to RAG-based response)
+  5. send_platform_reply – send reply to WhatsApp or Telegram
+  6. log_to_backend      – async POST to Laravel /api/ai-logs (fire-and-forget)
 
+Primary LLM: gemma-3-27b-it via Google Generative Language API (open-weights, no VPS GPU).
 Persona & lifecycle model: see BIMA_PERSONA.md in the project root.
 """
 
@@ -30,7 +32,9 @@ logger = logging.getLogger("bima_ai.ai_handler")
 _LARAVEL_BACKEND_URL: str = os.getenv("LARAVEL_BACKEND_URL", "http://backend:80")
 _LARAVEL_API_KEY: str     = os.getenv("LARAVEL_API_KEY", "")
 _GEMINI_API_KEY: str      = os.getenv("GEMINI_API_KEY", "")
-_GEMINI_MODEL: str        = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Primary model: gemma-3-27b-it (open-weights hosted on Google AI Studio infra).
+# Override via GEMINI_MODEL env var — e.g. models/gemma-3-12b-it for lighter load.
+_GEMINI_MODEL: str        = os.getenv("GEMINI_MODEL", "models/gemma-3-27b-it")
 
 _WHATSAPP_API_TOKEN: str   = os.getenv("WHATSAPP_API_TOKEN", "")
 _WHATSAPP_API_VERSION: str = os.getenv("WHATSAPP_API_VERSION", "v19.0")
@@ -133,31 +137,48 @@ Jawaban ini menggunakan basis pengetahuan AI umum."
 
 
 # ---------------------------------------------------------------------------
-# 1. LLM call (Gemini) with graceful fallback
+# 1. Intent classification + LLM call (hosted Gemma) with graceful fallback
 # ---------------------------------------------------------------------------
 
 async def generate_ai_response(user_id: str, message: str) -> str:
     """
     Generate a personalized AI reply:
-    1. Fetch user context from Laravel (business profile + licenses)
-    2. Retrieve relevant regulations from ChromaDB (RAG)
-    3. Call Gemini — falls back to structured placeholder if no key
+    1. analyze_user_intent — classify phase + extract KBLI code (lightweight JSON call)
+    2. Fetch user context from Laravel (business profile + licenses)
+    3. Retrieve relevant regulations from ChromaDB (KBLI-targeted RAG)
+    4. Call Gemma — falls back to RAG-based response if API unavailable
     """
     from services.rag_service import format_rag_context, query_regulations
     from services.user_context import fetch_user_context, format_user_context
 
     try:
         import asyncio
+
+        # Step 1 — lightweight intent classification (runs concurrently with user context fetch)
+        intent_task   = asyncio.create_task(analyze_user_intent(message))
         user_ctx_task = asyncio.create_task(fetch_user_context(user_id))
-        rag_chunks    = await asyncio.get_event_loop().run_in_executor(
-            None, query_regulations, message
-        )
+
+        intent   = await intent_task
         user_ctx = await user_ctx_task
+
+        # Use detected KBLI to run a tighter RAG query (more results for known KBLI)
+        detected_kbli = intent.get("kbli_code")
+        rag_query     = f"KBLI {detected_kbli} {message}" if detected_kbli else message
+        n_results     = 8 if detected_kbli else 4
+
+        rag_chunks = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: query_regulations(rag_query, n_results=n_results)
+        )
 
         user_ctx_str = format_user_context(user_ctx)
         rag_ctx_str  = format_rag_context(rag_chunks)
         has_rag      = bool(rag_ctx_str)
 
+        logger.info(
+            "Intent | phase=%s kbli=%s scale=%s | rag_chunks=%d | user_id=%s",
+            intent.get("phase"), detected_kbli, intent.get("detected_scale"),
+            len(rag_chunks), user_id,
+        )
         if not has_rag:
             logger.info(
                 "RAG returned 0 usable chunks — activating fallback prompt | user_id=%s", user_id
@@ -174,13 +195,10 @@ async def generate_ai_response(user_id: str, message: str) -> str:
 
         if _GEMINI_API_KEY:
             try:
-                return await _call_gemini_with_retry(full_prompt)
+                return await _call_gemma_with_retry(full_prompt)
             except Exception:
-                # BUG-003 FIX — all retries exhausted; build a user-friendly response
-                # from the RAG context that was already retrieved, rather than returning
-                # a dead-end error or a confusing "key not configured" demo message.
                 logger.warning(
-                    "Gemini unavailable after retries — using RAG-based fallback | user_id=%s",
+                    "Gemma unavailable after retries — using RAG-based fallback | user_id=%s",
                     user_id,
                 )
                 return _rag_fallback_response(message, rag_chunks)
@@ -195,25 +213,73 @@ async def generate_ai_response(user_id: str, message: str) -> str:
         )
 
 
-async def _call_gemini_with_retry(prompt: str, max_attempts: int = 3) -> str:
-    """BUG-003 FIX — call Gemini with exponential backoff for transient errors.
+_INTENT_SCHEMA = """{
+  "phase": <integer 1, 2, or 3>,
+  "kbli_code": <string like "56102" or null if not mentioned>,
+  "detected_scale": <string like "Mikro", "Kecil", "Menengah", "Besar" or null>
+}"""
 
-    Retries on HTTP 429 (rate limit) and 503 (service unavailable) up to
-    max_attempts times, sleeping 1s then 2s between retries.
-    Raises the final exception if all attempts fail so the caller can fall back.
+_INTENT_SYSTEM = (
+    "You are a JSON-only API. You must output valid JSON and absolutely nothing else. "
+    "Do not use Markdown code blocks, backticks, or any surrounding text. "
+    "Classify the user message into one of three business licensing phases:\n"
+    "  Phase 1 (Pra-Perizinan): exploring, planning, asking what permits are needed\n"
+    "  Phase 2 (Eksekusi): ready to apply, asking for step-by-step, mentions a KBLI code\n"
+    "  Phase 3 (Pasca-Perizinan): already has permit, asking about obligations or growth\n"
+    "Also extract the KBLI code (5-digit number like 56102) and business scale if mentioned.\n"
+    f"Output ONLY this JSON schema, nothing else:\n{_INTENT_SCHEMA}"
+)
+
+
+async def analyze_user_intent(message: str) -> dict:
+    """
+    Phase 3 JSON hardening — lightweight pre-call to Gemma that classifies the
+    user's lifecycle phase and extracts any KBLI code/scale from the message.
+
+    Uses a strict JSON-only system prompt. Falls back to safe defaults on any
+    error so it never blocks the main generation pipeline.
+
+    Returns: {"phase": 1|2|3, "kbli_code": str|None, "detected_scale": str|None}
+    """
+    import json
+
+    if not _GEMINI_API_KEY:
+        return {"phase": 1, "kbli_code": None, "detected_scale": None}
+
+    prompt = f"{_INTENT_SYSTEM}\n\nUser message: {message}"
+    try:
+        raw = await _call_gemma(prompt, max_tokens=128, temperature=0.0)
+        cleaned = _strip_json_fences(raw)
+        intent = json.loads(cleaned)
+        # Normalise — ensure required keys exist
+        return {
+            "phase":          int(intent.get("phase", 1)),
+            "kbli_code":      intent.get("kbli_code") or None,
+            "detected_scale": intent.get("detected_scale") or None,
+        }
+    except Exception:
+        logger.warning("analyze_user_intent failed — using defaults | msg_len=%d", len(message))
+        return {"phase": 1, "kbli_code": None, "detected_scale": None}
+
+
+async def _call_gemma_with_retry(prompt: str, max_attempts: int = 3, **kwargs) -> str:
+    """Call Gemma with exponential backoff for transient 429/503 errors.
+
+    Raises the final exception if all attempts fail so the caller can fall back
+    to the RAG-based response.
     """
     import asyncio
 
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            return await _call_gemini(prompt)
+            return await _call_gemma(prompt, **kwargs)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status in (429, 503) and attempt < max_attempts - 1:
                 delay = 2 ** attempt  # 1s, 2s
                 logger.warning(
-                    "Gemini %s on attempt %d/%d — retrying in %ds",
+                    "Gemma %s on attempt %d/%d — retrying in %ds",
                     status, attempt + 1, max_attempts, delay,
                 )
                 await asyncio.sleep(delay)
@@ -229,8 +295,16 @@ async def _call_gemini_with_retry(prompt: str, max_attempts: int = 3) -> str:
     raise last_exc  # type: ignore[misc]
 
 
-async def _call_gemini(prompt: str) -> str:
-    """Call Gemini via REST API."""
+async def _call_gemma(prompt: str, *, max_tokens: int = 8192, temperature: float = 0.7) -> str:
+    """
+    Call hosted Gemma (or any model on the Generative Language API) via REST.
+
+    Notable differences from the old Gemini call:
+    - No thinkingConfig (Gemma models don't support it)
+    - No thought-part filtering needed (Gemma has no internal reasoning parts)
+    - Response text may contain Markdown code fences around JSON; callers that
+      need JSON should use _strip_json_fences() before parsing.
+    """
     model_name = _GEMINI_MODEL.removeprefix("models/")
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -239,48 +313,50 @@ async def _call_gemini(prompt: str) -> str:
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 8192,
-            # Cap thinking tokens so the response always has room to complete.
-            # gemini-2.5-flash consumed 979/1024 tokens for reasoning on complex
-            # prompts, leaving only 41 tokens for the visible answer (MAX_TOKENS).
-            "thinkingConfig": {
-                "thinkingBudget": 1024,
-            },
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
         },
     }
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
             candidate = data["candidates"][0]
             finish_reason = candidate.get("finishReason", "UNKNOWN")
             if finish_reason not in ("STOP", "MAX_TOKENS"):
-                logger.warning("Gemini unexpected finishReason=%s", finish_reason)
-            parts = candidate["content"]["parts"]
-            # Filter out internal thought parts (gemini-2.5-flash thinking model)
-            visible_text = "".join(
-                p["text"] for p in parts if not p.get("thought", False)
-            ).strip()
+                logger.warning("Gemma unexpected finishReason=%s", finish_reason)
+            text = "".join(p["text"] for p in candidate["content"]["parts"]).strip()
             usage = data.get("usageMetadata", {})
             logger.info(
-                "Gemini response | finish=%s | thinking_tokens=%d | output_tokens=%d | chars=%d",
+                "Gemma response | model=%s | finish=%s | output_tokens=%d | chars=%d",
+                model_name,
                 finish_reason,
-                usage.get("thoughtsTokenCount", 0),
                 usage.get("candidatesTokenCount", 0),
-                len(visible_text),
+                len(text),
             )
-            return visible_text
+            return text
     except httpx.HTTPStatusError as exc:
         logger.error(
-            "Gemini HTTP error | status=%s | body=%s",
+            "Gemma HTTP error | status=%s | body=%s",
             exc.response.status_code, exc.response.text[:300],
         )
         raise
     except Exception:
-        logger.exception("Gemini call failed")
+        logger.exception("Gemma call failed")
         raise
+
+
+def _strip_json_fences(text: str) -> str:
+    """
+    Remove Markdown code fences that Gemma sometimes wraps around JSON output
+    even when instructed not to.  Handles both ```json ... ``` and ``` ... ```.
+    """
+    import re
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
 
 
 def _rag_fallback_response(message: str, rag_chunks: list) -> str:

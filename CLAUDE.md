@@ -6,6 +6,18 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 *   **Pillar 2 & 3:** Next.js + React Native (Licensing Wizard & Super App UI)
 *   **Core Backend:** Laravel 13 + Filament v.4 + PostgreSQL (TALL Stack)
 
+### 🧠 Primary LLM: Hosted Gemma via Google AI Studio
+*   **Model:** `gemma-3-27b-it` accessed via the Google Generative Language REST API
+    (`generativelanguage.googleapis.com/v1beta/models/gemma-3-27b-it:generateContent`)
+*   **Why Gemma:** Open-weights model hosted by Google — no VPS GPU needed, same API key/infra as Gemini, no vendor lock-in on weights.
+*   **Key differences from Gemini:**
+    - No `thinkingConfig` support — remove that field from all payloads
+    - No API-level `response_mime_type: application/json` — enforce JSON via prompt only
+    - Response parsing: strip Markdown code fences (` ```json ... ``` `) before `json.loads()` — Gemma sometimes wraps JSON in fences even when instructed not to
+    - `finishReason` values: `STOP` / `MAX_TOKENS` (same as Gemini, no `thought` parts)
+*   **Intent classification:** `analyze_user_intent()` in `ai_handler.py` does a lightweight JSON-mode pre-call to extract phase (1/2/3) and KBLI code before the main generation call. This tightens RAG queries for KBLI-specific questions.
+*   **Env var:** `GEMINI_MODEL=models/gemma-3-27b-it` in `ai-engine/.env`
+
 ## 🎨 UI & Design System
 
 For ANY frontend changes in Filament or Next.js, you MUST first read design.md and strictly apply its color codes, typography (Manrope), and glassmorphism rules. Do not use default Tailwind borders or pure black/white backgrounds.
