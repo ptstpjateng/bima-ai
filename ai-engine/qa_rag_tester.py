@@ -177,13 +177,14 @@ def evaluate_llm(tc: dict, response: str, latency: float, gemini_ok: bool) -> di
     """Score LLM response. If Gemini was unavailable, most checks are skipped."""
     issues, warnings = [], []
 
-    # Detect fallback placeholder (pre-flight unavailable OR per-test rate-limit fallback)
-    is_fallback = not gemini_ok or "[BIMA-AI Demo" in response
+    # Detect fallback responses (pre-flight unavailable OR per-test rate-limit fallback)
+    is_rag_fallback = "Layanan AI sedang mengalami gangguan" in response or "Demo Mode" in response
+    is_fallback = not gemini_ok or is_rag_fallback
     if is_fallback:
         reason = (
             "Gemini API returned 503 — LLM layer skipped (pre-flight)"
             if not gemini_ok
-            else "Gemini rate-limited during test — BUG-003 fallback triggered (smart placeholder)"
+            else "Gemini rate-limited during test — BUG-003 RAG fallback triggered"
         )
         return {
             "status":   SKIP,

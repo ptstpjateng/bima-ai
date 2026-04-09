@@ -176,13 +176,14 @@ async def generate_ai_response(user_id: str, message: str) -> str:
             try:
                 return await _call_gemini_with_retry(full_prompt)
             except Exception:
-                # BUG-003 FIX — all retries exhausted; fall through to structured
-                # placeholder instead of returning a dead-end error string.
+                # BUG-003 FIX — all retries exhausted; build a user-friendly response
+                # from the RAG context that was already retrieved, rather than returning
+                # a dead-end error or a confusing "key not configured" demo message.
                 logger.warning(
-                    "Gemini unavailable after retries — falling back to smart placeholder | user_id=%s",
+                    "Gemini unavailable after retries — using RAG-based fallback | user_id=%s",
                     user_id,
                 )
-                return _smart_placeholder(message, user_ctx, rag_chunks)
+                return _rag_fallback_response(message, rag_chunks)
         else:
             return _smart_placeholder(message, user_ctx, rag_chunks)
 
@@ -282,18 +283,67 @@ async def _call_gemini(prompt: str) -> str:
         raise
 
 
+def _rag_fallback_response(message: str, rag_chunks: list) -> str:
+    """
+    User-friendly fallback when Gemini is temporarily unavailable after retries.
+    Uses already-retrieved RAG chunks to give a useful answer without the AI model.
+    Never exposes internal terms (RAG, ChromaDB, chunks) to the end user.
+    """
+    relevant = [c for c in rag_chunks if c.get("distance", 1.0) < 0.7]
+
+    if relevant:
+        lines = [
+            "Halo! Saya BIMA-AI. Layanan AI utama sedang mengalami gangguan sementara, "
+            "tapi saya sudah menemukan informasi regulasi OSS yang relevan untuk pertanyaan Anda:\n"
+        ]
+        for chunk in relevant[:3]:
+            kbli = chunk.get("kbli_code", "")
+            section = chunk.get("section", "")
+            skala = chunk.get("skala", "")
+            content = chunk["content"][:700].strip()
+
+            label_parts = []
+            if kbli:
+                label_parts.append(f"KBLI {kbli}")
+            if section:
+                label_parts.append(section.replace("_", " ").title())
+            if skala:
+                label_parts.append(skala)
+            label = " · ".join(label_parts) if label_parts else "Regulasi OSS"
+
+            lines.append(f"📋 *{label}*\n{content}\n")
+
+        lines.append(
+            "_⚠️ Jawaban ini diambil langsung dari basis data regulasi tanpa analisis AI penuh. "
+            "Silakan coba lagi dalam beberapa menit untuk jawaban yang lebih lengkap._\n"
+        )
+        lines.append(f"[Buka Portal BIMA-AI →]({_PORTAL_URL})")
+        return "\n".join(lines)
+
+    # No relevant RAG context — give a helpful generic response
+    return (
+        "Halo! Saya BIMA-AI, asisten perizinan usaha DPMPTSP Jawa Tengah. 🙏\n\n"
+        "Layanan AI sedang mengalami gangguan teknis sementara. "
+        "Untuk bantuan segera:\n"
+        "1. Coba kirim pertanyaan Anda lagi dalam beberapa menit\n"
+        "2. Kunjungi portal BIMA-AI untuk panduan langkah demi langkah\n"
+        "3. Hubungi petugas DPMPTSP Jawa Tengah untuk kasus kompleks\n\n"
+        f"[Buka Portal BIMA-AI →]({_PORTAL_URL})"
+    )
+
+
 def _smart_placeholder(message: str, user_ctx: dict, rag_chunks: list) -> str:
-    """Structured placeholder when Gemini API key is missing."""
+    """Structured placeholder when Gemini API key is missing (dev/demo mode)."""
     has_rag = bool(rag_chunks)
     rag_note = (
-        f"\n\n📚 *Konteks RAG ditemukan:* {len(rag_chunks)} chunk regulasi relevan."
+        f"\n\n📚 Ditemukan {len(rag_chunks)} referensi regulasi OSS yang relevan."
         if has_rag
-        else "\n\n⚠️ *RAG:* Belum ada data regulasi di ChromaDB."
+        else "\n\n⚠️ Basis data regulasi OSS belum tersedia."
     )
     portal = f"\n\n[Buka Portal BIMA-AI →]({_PORTAL_URL})"
     return (
-        f"[BIMA-AI Demo — GEMINI_API_KEY belum dikonfigurasi]\n\n"
-        f"Pesan Anda: *{message[:100]}*\n\n"
+        f"[Demo Mode — konfigurasi server belum selesai]\n\n"
+        f"Pertanyaan Anda: *{message[:100]}*\n\n"
         f"Saya siap membantu proses perizinan OSS RBA Anda."
         f"{rag_note}{portal}"
     )
