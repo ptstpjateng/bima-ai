@@ -67,6 +67,7 @@ services:
     env_file: ./data-pipeline/.env
     volumes:
       - ./data-pipeline/data:/app/data
+      - backend_storage:/app/backend_storage:ro  # read-only access to backend uploads
     networks:
       - bima-internal
     depends_on:
@@ -152,7 +153,7 @@ services:
       REDIS_PORT: 6379
       AI_ENGINE_URL: http://ai-engine:8000
       QUEUE_CONNECTION: redis
-    command: ["php", "artisan", "queue:work", "--sleep=3", "--tries=3", "--max-time=3600"]
+    command: ["php", "artisan", "queue:work", "--sleep=3", "--tries=3", "--max-time=3600", "--timeout=90"]
     volumes:
       - backend_storage:/var/www/html/storage/app
     networks:

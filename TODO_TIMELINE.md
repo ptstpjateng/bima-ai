@@ -112,11 +112,12 @@
 ## Phase E — Demo Preparation (Week 2–3)
 
 ### E1. Demo script
-- [ ] 🔴 Write a 3-minute demo script covering all 3 lifecycle phases:
+- [x] 🔴 Write a 3-minute demo script covering all 3 lifecycle phases — see `DEMO_SCRIPT.md`
   1. Phase 1: "Saya mau buka warung makan, perlu izin apa?" → BIMA-AI explains KBLI 56102, NIB + Sertifikat Standar
   2. Phase 2: User opens portal → fills wizard → gets approved
   3. Phase 3: "Izin saya sudah keluar, selanjutnya apa?" → LKPM reminder, KUR info
-- [ ] 🔴 Seed demo user: create `demo@bima.ai` account with complete MSME profile + 1 approved permit
+- [x] 🔴 Seed demo user: `DemoSeeder.php` creates `demo@bima.ai` + `admin@bima.ai`, business record, 1 approved + 1 under_review permit
+  - Run: `php artisan db:seed --class=DemoSeeder`
 - [ ] 🔴 Pre-warm model: make 1 test Telegram call 5 min before demo to avoid cold-start latency
 
 ### E2. Slide deck
@@ -127,9 +128,9 @@
 - [ ] 🟡 Roadmap slide: WhatsApp, React Native, 500+ KBLI coverage
 
 ### E3. Infrastructure reliability
-- [ ] 🟠 Docker Compose restart policy: confirm all services have `restart: unless-stopped`
+- [x] 🟠 Docker Compose restart policy: all long-running services have `restart: unless-stopped` (`data-pipeline` intentionally `"no"`)
 - [ ] 🟠 Run full smoke test 1 day before demo: Telegram, portal login, permit wizard, Filament admin
-- [ ] 🟡 Nginx rate limiting: prevent demo from being disrupted by stray requests
+- [x] 🟡 Nginx rate limiting: `limit_req_zone` added — 30r/m on `/webhook/`, 120r/m on `/api|admin`
 - [ ] 🟡 Backup ChromaDB volume: `docker exec bima-ai-ai-engine-1 tar czf /tmp/chroma_backup.tar.gz /app/chroma_db`
 
 ---

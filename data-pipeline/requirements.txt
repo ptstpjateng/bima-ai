@@ -4,6 +4,7 @@ httpx==0.28.1
 beautifulsoup4==4.12.3
 requests==2.32.3
 pdfplumber==0.11.4
+Pillow>=10.0,<12.0
 langchain==0.3.25
 langchain-community==0.3.23
 sentence-transformers==3.4.1

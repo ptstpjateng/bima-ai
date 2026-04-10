@@ -10,10 +10,13 @@
 BIMA-AI is a production-deployed, omnichannel AI assistant that guides Indonesian UMKM owners through the full business licensing lifecycle (OSS RBA). The core messaging pipeline (Telegram → FastAPI → Gemma → ChromaDB → Reply) is **live and working**. The Next.js frontend portal is **live on Vercel**. The Laravel admin panel is **live on VPS**.
 
 **What works end-to-end today:**
-- Telegram bot receives messages → classifies intent → queries ChromaDB → calls Gemma → replies in clean Indonesian
-- Next.js portal: magic-link auth, permit wizard UI, profile page, dashboard skeleton
-- Filament admin: user/permit/KBLI/AI-log management
-- 35 KBLI codes fully scraped and indexed (274 semantic chunks in ChromaDB)
+- Telegram bot: receives messages → intent classification → ChromaDB RAG → Gemma reply in Indonesian
+- Telegram account linking: portal generates 15-min token → deep link → bot detects `/start tglink_TOKEN` → backend links account → confirms to user
+- Telegram notifications: permit status changes (approved/rejected/under_review/additional_docs) trigger formatted Telegram messages via `PermitApplicationObserver`
+- Next.js portal: magic-link auth, permit wizard with KBLI typeahead, permit detail page (per-record API with ownership check), profile inline editing, Telegram connect flow, LKPM banner, chat widget (server-verified identity)
+- Business record auto-populated on every permit application (upserted in same DB transaction)
+- Filament admin: UserStatsWidget, enhanced AI Interactions with session thread view, KBLI scrape management
+- 35+ KBLI codes fully scraped; pipeline running more (25 additional queued 2026-04-10)
 
 ---
 
@@ -28,9 +31,9 @@ BIMA-AI is a production-deployed, omnichannel AI assistant that guides Indonesia
 | **PostgreSQL** | ✅ Live | internal `postgres:5432` |
 | **Redis** | ✅ Live | internal `redis:6379` |
 | **Next.js Frontend** | ✅ Live | `https://project-5z22k.vercel.app` (auto-deploy on push to `main`) |
-| **Telegram Bot** | ✅ Live | webhook configured, messages processing |
-| **WhatsApp Bot** | ⏳ Not configured | Meta token placeholder — not yet set up |
-| **Data Pipeline** | ✅ Done (35/35 KBLI) | `data-pipeline` service, run on-demand |
+| **Telegram Bot** | ✅ Live | webhook configured, messages processing, account linking working |
+| **WhatsApp Bot** | ⏳ Not configured | Meta token placeholder — Phase D |
+| **Data Pipeline** | ✅ Running | 35 done, 25 more queued (triggered 2026-04-10) |
 
 ---
 
@@ -39,55 +42,56 @@ BIMA-AI is a production-deployed, omnichannel AI assistant that guides Indonesia
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        USER CHANNELS                                 │
-│   Telegram Bot              WhatsApp (Meta Cloud)                    │
-│   @bima_ai_bot              (not yet configured)                     │
-└──────────────┬──────────────────────────────────────────────────────┘
-               │  HTTPS webhook POST
-               ▼
+│   Telegram Bot              WhatsApp (Meta Cloud)    Next.js Portal  │
+│   @bima_ai_bot              (not yet configured)     Vercel          │
+└──────┬───────────────────────────────────────────────────┬──────────┘
+       │  HTTPS webhook POST                               │ HTTPS API
+       ▼                                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  VPS  116.254.113.81  (Docker Compose)                               │
 │                                                                      │
 │  ┌─────────────────────────────────────────────────────────────┐    │
 │  │  nginx :80  (sole public entry)                             │    │
-│  │   /webhook/*   → ai-engine:8000                             │    │
+│  │   /webhook/*         → ai-engine:8000                       │    │
 │  │   /api, /admin, /sanctum, /storage → backend:80             │    │
-│  │   /           → 302 /admin                                  │    │
-│  └──────────────────┬───────────────────┬───────────────────────┘   │
-│                     │                   │                            │
-│         ┌───────────▼──────┐  ┌─────────▼──────────────────────┐   │
-│         │  FastAPI AI      │  │  Laravel 13 + FrankenPHP        │   │
-│         │  ai-engine:8000  │  │  backend:80                     │   │
-│         │                  │  │                                 │   │
-│         │  /webhook/tg     │  │  /api/internal/ai-logs          │   │
-│         │  /webhook/wa     │  │  /api/internal/user-context     │   │
-│         │  /vectorize      │  │  /api/auth  (magic link)        │   │
-│         │  /health         │  │  /api/permits                   │   │
-│         │                  │  │  /admin  (Filament)             │   │
-│         │  Services:       │  │  /api/pipeline/trigger          │   │
-│         │  ├ ai_handler    │  │                                 │   │
-│         │  ├ rag_service   │  │  Queue worker (redis)           │   │
-│         │  ├ user_context  │  └──────────┬──────────────────────┘   │
-│         │  └ telegram_poll │             │                           │
-│         └───────┬──────────┘  ┌──────────▼──────┐  ┌────────────┐  │
-│                 │             │  PostgreSQL 16   │  │  Redis 7   │  │
-│         ┌───────▼──────────┐  │  :5432 internal │  │  :6379     │  │
-│         │  ChromaDB        │  │                 │  │  sessions  │  │
-│         │  (embedded,      │  │  Tables:        │  │  queues    │  │
-│         │   persistent)    │  │  users          │  │  cache     │  │
-│         │  274 chunks      │  │  businesses     │  └────────────┘  │
-│         │  35 KBLI codes   │  │  permit_applic. │                  │
-│         │  collection:     │  │  ai_interactions│                  │
-│         │  oss_regulations │  │  kbli_scrape_t. │                  │
-│         └──────────────────┘  │  knowledge_base │                  │
-│                               │  magic_link_tok.│                  │
-│                               └─────────────────┘                  │
+│  │   /                  → 302 /admin                           │    │
+│  └────────────────┬──────────────────────┬──────────────────────┘   │
+│                   │                      │                           │
+│       ┌───────────▼──────┐   ┌───────────▼────────────────────┐    │
+│       │  FastAPI AI      │   │  Laravel 13 + FrankenPHP        │    │
+│       │  ai-engine:8000  │   │  backend:80                     │    │
+│       │                  │   │                                 │    │
+│       │  /webhook/tg     │   │  /api/auth  (magic link)        │    │
+│       │  /webhook/wa     │   │  /api/auth/me                   │    │
+│       │  /webhook/chat   │◄──┤  /api/permits                   │    │
+│       │  /vectorize      │   │  /api/permits/detail/{id}       │    │
+│       │  /health         │   │  /api/profile                   │    │
+│       │                  │   │  /api/profile/telegram-token    │    │
+│       │  Services:       │   │  /api/internal/ai-logs          │    │
+│       │  ├ ai_handler    │──►│  /api/internal/user-context     │    │
+│       │  ├ rag_service   │   │  /api/internal/telegram/link    │    │
+│       │  └ user_context  │   │  /api/pipeline/trigger          │    │
+│       └──────┬───────────┘   │  /admin  (Filament)             │    │
+│              │               └──────────┬──────────────────────┘    │
+│       ┌──────▼───────────┐  ┌───────────▼─────┐  ┌─────────────┐  │
+│       │  ChromaDB        │  │  PostgreSQL 16   │  │  Redis 7    │  │
+│       │  (embedded,      │  │  :5432 internal  │  │  sessions   │  │
+│       │   persistent)    │  │                  │  │  queues     │  │
+│       │  35+ KBLI codes  │  │  Tables:         │  │  cache      │  │
+│       │  collection:     │  │  users           │  └─────────────┘  │
+│       │  oss_regulations │  │  businesses      │                   │
+│       └──────────────────┘  │  permit_applic.  │                   │
+│                             │  ai_interactions  │                   │
+│                             │  kbli_scrape_t.  │                   │
+│                             │  magic_link_tok. │                   │
+│                             └──────────────────┘                   │
 └─────────────────────────────────────────────────────────────────────┘
                │
                │  External APIs
                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Google Generative Language API                                      │
-│  models/gemma-4-26b-a4b-it  (MoE: 26B total, 4B active)            │
+│  models/gemma-3-27b-it  (main) + models/gemma-3-4b-it (intent)     │
 │  generativelanguage.googleapis.com/v1beta                           │
 └─────────────────────────────────────────────────────────────────────┘
 
@@ -109,48 +113,80 @@ User sends message on Telegram
 Telegram POST /webhook/telegram/  (ai-engine)
         │
         ├─ Signature validation (TELEGRAM_SECRET_TOKEN)
-        ├─ Deduplicate (update_id cache)
         │
-        ▼
-process_message()   [ai_handler.py]
+        ├─ text = "/start tglink_{TOKEN}"?
+        │       └─► handle_telegram_link(chat_id, token)
+        │               ├─ POST /api/internal/telegram/link  (Laravel)
+        │               └─ Sends confirmation or error message to user
         │
-        ├─ 1. analyze_user_intent()  ──── Gemma JSON call ──► phase (1/2/3) + KBLI code
-        ├─ 2. fetch_user_context()  ───── GET /api/internal/user-context (Laravel)
-        │       └─ business profile, license vault, Telegram↔user binding
-        ├─ 3. query_regulations()   ───── ChromaDB semantic search
-        │       └─ KBLI-prefixed query if KBLI detected (n=8), else n=4
+        ├─ text = "/start"?
+        │       └─► handle_start_command(chat_id) — sends onboarding welcome
         │
-        ├─ 4. Build systemInstruction (system prompt + user ctx + RAG chunks)
-        │
-        ├─ 5. _call_gemma_with_retry()  ─ Google API (3 attempts, backoff 1s/2s)
-        │       └─ Filters thought=True parts (gemma-4 thinking model)
-        │       └─ Falls back to _rag_fallback_response() if all retries fail
-        │
-        ├─ 6. _send_telegram_reply()  ── Telegram sendMessage (Markdown + inline button)
-        │
-        └─ 7. log_to_backend()  ──────── POST /api/internal/ai-logs (fire-and-forget)
+        └─ Normal message → process_message()  [ai_handler.py]
+                │
+                ├─ Rate limit check: 5 msg/min per chat_id (in-memory)
+                ├─ 1. analyze_user_intent()  ── Gemma 4b JSON call ─► phase (1/2/3) + KBLI code
+                ├─ 2. fetch_user_context()  ─── GET /api/internal/user-context (Laravel)
+                │       └─ business profile, license vault, Telegram↔user binding
+                ├─ 3. query_regulations()   ─── ChromaDB semantic search
+                │       └─ KBLI-prefixed query if KBLI detected (n=8), else n=4
+                ├─ 4. Build systemInstruction (system prompt + user ctx + RAG chunks)
+                ├─ 5. _call_gemma_with_retry()  ─ Google API (3 attempts, backoff 1s/2s)
+                │       └─ Falls back to _rag_fallback_response() if all retries fail
+                │       └─ Appends portal CTA if phase==2 and URL missing
+                ├─ 6. _send_telegram_reply()  ── Telegram sendMessage (Markdown)
+                └─ 7. log_to_backend()  ──────── POST /api/internal/ai-logs (fire-and-forget)
 ```
 
 ---
 
-## 5. AI Pipeline Detail
+## 5. Request Flow — Next.js Portal Chat Widget
 
-### 5.1 LLM
+```
+User types message in ChatWidget
+        │
+        ▼
+POST /api/ai/chat  (Next.js API Route — server-side)
+        │
+        ├─ Read Authorization: Bearer {token} from request header
+        ├─ Validate token: GET /api/auth/me  (Laravel)
+        │       └─ Reject 401 if token invalid or expired
+        ├─ Extract verified user_id from /auth/me response
+        │       └─ Client-supplied user_id is IGNORED entirely
+        │
+        ▼
+POST /webhook/chat  (ai-engine — via AI_ENGINE_URL env var)
+        │  Body: { user_id: "web-{verifiedId}", message }
+        ├─ generate_ai_response()  (same AI pipeline as Telegram)
+        └─ Returns { response, elapsed }
+```
+
+---
+
+## 6. AI Pipeline Detail
+
+### 6.1 LLM
 
 | Property | Value |
 |---|---|
-| **Model** | `models/gemma-4-26b-a4b-it` |
-| **Architecture** | MoE — 26B total params, ~4B active |
+| **Main model** | `models/gemma-3-27b-it` (env: `GEMINI_MODEL`) |
+| **Intent model** | `models/gemma-3-4b-it` (env: `GEMINI_INTENT_MODEL`) |
 | **Hosting** | Google AI Studio (same infra as Gemini) |
 | **No GPU on VPS** | ✅ — all inference is remote |
-| **thinkingConfig** | Not sent (model handles thinking internally) |
-| **Thought filtering** | Parts with `thought=True` stripped from response |
+| **thinkingConfig** | Not sent (not supported by Gemma) |
+| **JSON output** | Enforced via prompt only; strip Markdown fences before `json.loads()` |
 | **Timeout** | 120s per call |
 | **Max output tokens** | 2048 (main), 128 (intent) |
 | **Retry** | 3 attempts, 1s / 2s backoff on 429/503 |
 | **Fallback** | RAG-only response if all retries fail |
 
-### 5.2 Embeddings (RAG)
+### 6.2 Conversation History
+
+- Last 2 turns per user stored in-memory (keyed by `user_id`)
+- Passed as `contents[]` array to the Gemma API alongside the system instruction
+- Separate history per channel (Telegram, WhatsApp, web)
+
+### 6.3 Embeddings (RAG)
 
 | Property | Value |
 |---|---|
@@ -160,19 +196,18 @@ process_message()   [ai_handler.py]
 | **Used in** | Both ingest (data-pipeline) and query (rag_service) |
 | **Loaded as** | Module-level singleton (`_get_embedder()`) |
 
-### 5.3 ChromaDB
+### 6.4 ChromaDB
 
 | Property | Value |
 |---|---|
 | **Collection** | `oss_regulations` |
 | **Distance metric** | cosine (`hnsw:space=cosine`) |
-| **Total chunks** | 274 |
-| **KBLI codes indexed** | 35 |
+| **KBLI codes indexed** | 35+ (pipeline running more) |
 | **Persistence** | Docker volume `chroma_data` at `/app/chroma_db` |
 
 ---
 
-## 6. Database Schema (PostgreSQL)
+## 7. Database Schema (PostgreSQL)
 
 ### `users`
 | Column | Type | Notes |
@@ -181,14 +216,14 @@ process_message()   [ai_handler.py]
 | `name` | varchar | |
 | `email` | varchar unique | |
 | `password` | varchar | hashed (cast) |
-| `telegram_id` | varchar | links Telegram user to account |
-| `telegram_username` | varchar | |
-| `phone` | varchar | |
-| `business_name` | varchar | MSME profile |
-| `kbli_code` | varchar | primary KBLI |
-| `business_scale` | varchar | Mikro/Kecil/Menengah/Besar |
-| `nik` | varchar | national ID |
-| `npwp` | varchar | tax ID |
+| `role` | varchar | `msme` / `admin` |
+| `telegram_chat_id` | bigint nullable | links Telegram chat to account |
+| `telegram_username` | varchar nullable | |
+| `phone` | varchar nullable | |
+| `nik` | varchar nullable | national ID |
+| `npwp` | varchar nullable | tax ID |
+| `business_name` | varchar nullable | MSME profile shortcut |
+| `business_address` | text nullable | |
 | `created_at`, `updated_at` | timestamp | |
 
 ### `businesses`
@@ -196,24 +231,35 @@ process_message()   [ai_handler.py]
 |---|---|---|
 | `id` | bigint PK | |
 | `user_id` | FK → users | |
+| `is_primary` | boolean | true for the main MSME |
 | `name` | varchar | |
-| `kbli_code` | varchar | |
+| `primary_kbli_code` | varchar | e.g. `56102` |
+| `primary_kbli_description` | varchar | human-readable KBLI name |
 | `legal_entity` | varchar | PT / CV / Perorangan |
-| `scale` | varchar | |
-| `address` | text | |
-| `nib` | varchar | Nomor Induk Berusaha |
+| `scale` | varchar | mikro / kecil / menengah / besar |
+| `revenue` | bigint nullable | annual revenue in IDR |
+| `employee_count` | int nullable | |
+| `address` | text nullable | |
+| `nib` | varchar nullable | Nomor Induk Berusaha |
 | `created_at`, `updated_at` | timestamp | |
+
+> Auto-upserted on every `POST /api/permits/apply` inside the same DB transaction.
 
 ### `permit_applications`
 | Column | Type | Notes |
 |---|---|---|
 | `id` | bigint PK | |
 | `user_id` | FK → users | |
+| `application_number` | varchar unique | auto-generated on submit |
 | `kbli_code` | varchar | |
+| `kbli_section` | varchar | KBLI section name |
 | `permit_type` | varchar | NIB / Sertifikat Standar / Izin |
-| `status` | varchar | draft / submitted / approved / rejected |
-| `documents` | jsonb | uploaded document manifest |
-| `submitted_at` | timestamp | |
+| `status` | varchar | draft / submitted / under_review / additional_docs_required / approved / rejected |
+| `documents` | jsonb | `[{path, type, notes}]` — path validated as URL, type as enum |
+| `applicant_notes` | text nullable | capped at 2000 chars |
+| `reviewer_notes` | text nullable | set by admin on review |
+| `submitted_at` | timestamp nullable | |
+| `rejected_at` | timestamp nullable | |
 | `created_at`, `updated_at` | timestamp | |
 
 ### `ai_interactions`
@@ -221,11 +267,14 @@ process_message()   [ai_handler.py]
 |---|---|---|
 | `id` | bigint PK | |
 | `session_id` | varchar | channel-user-uuid |
-| `turn_index` | int | 0=user, 1=ai |
-| `channel` | varchar | telegram / whatsapp |
-| `message_type` | varchar | user_message / ai_response |
+| `turn_index` | int | message sequence within session |
+| `channel` | varchar | telegram / whatsapp / web / mobile / internal |
+| `message_type` | varchar | user_message / ai_response / system_event |
+| `intent` | varchar nullable | classified intent from `analyze_user_intent()` |
 | `content` | text | |
 | `user_id` | bigint nullable | FK → users |
+| `response_time_ms` | int nullable | AI response latency |
+| `is_flagged` | boolean | manual flag by admin |
 | `created_at`, `updated_at` | timestamp | |
 
 ### `kbli_scrape_targets`
@@ -234,17 +283,7 @@ process_message()   [ai_handler.py]
 | `id` | bigint PK | |
 | `kbli_code` | varchar | e.g. `56102` |
 | `status` | varchar | pending / scraping / done / error |
-| `scraped_content` | text | raw JSON from OSS scraper |
-| `created_at`, `updated_at` | timestamp | |
-
-### `knowledge_base_articles`
-| Column | Type | Notes |
-|---|---|---|
-| `id` | bigint PK | |
-| `title` | varchar | |
-| `content` | text | |
-| `kbli_code` | varchar | |
-| `category` | varchar | |
+| `scraped_content` | text | raw JSON from OSS scraper (added via ALTER TABLE) |
 | `created_at`, `updated_at` | timestamp | |
 
 ### `magic_link_tokens`
@@ -252,9 +291,11 @@ process_message()   [ai_handler.py]
 |---|---|---|
 | `id` | bigint PK | |
 | `user_id` | FK → users | |
-| `token` | varchar unique | |
-| `expires_at` | timestamp | |
-| `used_at` | timestamp nullable | |
+| `token` | varchar unique | random 32-char hex |
+| `channel` | varchar | `email` / `telegram_link` |
+| `expires_at` | timestamp | 15-min TTL for telegram_link, longer for email |
+| `used_at` | timestamp nullable | set when consumed |
+| `created_at`, `updated_at` | timestamp | |
 
 ### ChromaDB Document Schema (`oss_regulations`)
 ```json
@@ -274,61 +315,93 @@ process_message()   [ai_handler.py]
 
 ---
 
-## 7. Component Completion Status
+## 8. Security Posture
+
+| Layer | Measure |
+|---|---|
+| **CORS** | Locked to `FRONTEND_URL` env var — no wildcard `*` |
+| **Chat widget auth** | Next.js `/api/ai/chat` validates Bearer token against `/api/auth/me`; `user_id` is server-extracted, client cannot impersonate |
+| **Internal routes** | `X-Internal-Key` validated with `hash_equals` on all `/api/internal/*` |
+| **Rate limiting (API)** | `throttle:120,1` on all `auth:sanctum` routes (Laravel) |
+| **Rate limiting (AI)** | 5 messages/min per `user_id` in ai-engine (in-memory, friendly Indonesian rejection) |
+| **Permit ownership** | `GET /api/permits/detail/{id}` checks `user_id === auth()->id()` — MSME cannot view others' permits |
+| **Document validation** | Path validated as URL; type restricted to enum; notes capped at 2000 chars; max 20 docs per application |
+| **Telegram linking** | Token 15-min TTL; duplicate chat_id returns 409; one-time use only |
+
+---
+
+## 9. Component Completion Status
 
 ### Pillar 1 — AI Engine (FastAPI + ChromaDB)
 
 | Component | Status | Notes |
 |---|---|---|
-| Telegram webhook receiver | ✅ Done | Signature validation, dedup |
-| WhatsApp webhook receiver | ⏳ Skeleton | Meta token not configured |
-| `analyze_user_intent()` | ✅ Done | JSON-mode Gemma pre-call |
-| `query_regulations()` RAG | ✅ Done | Multilingual embeddings, metadata fixed |
-| `generate_ai_response()` | ✅ Done | systemInstruction, thought filtering |
+| Telegram webhook receiver | ✅ Done | Signature validation, `/start` routing |
+| Telegram account linking handler | ✅ Done | `handle_telegram_link()` + `handle_start_command()` |
+| WhatsApp webhook receiver | ⏳ Skeleton | Meta token not configured — Phase D |
+| Web chat endpoint (`/webhook/chat`) | ✅ Done | Synchronous, called by Next.js API route |
+| `analyze_user_intent()` | ✅ Done | JSON-mode Gemma 4b pre-call, KBLI extraction |
+| `query_regulations()` RAG | ✅ Done | KBLI-prefixed query (n=8) or fallback (n=4) |
+| `generate_ai_response()` | ✅ Done | systemInstruction, phase CTA enforcement |
+| Conversation history | ✅ Done | Last 2 turns per user, passed as `contents[]` |
 | Gemma retry + fallback | ✅ Done | 3 attempts, RAG-only fallback |
+| AI-engine rate limiter | ✅ Done | 5 msg/min per user_id, friendly Indonesian error |
 | `log_to_backend()` | ✅ Done | Fire-and-forget to Laravel |
-| `/vectorize` endpoint | ✅ Done | Manual re-index trigger |
-| Data pipeline (scraper) | ✅ Done | 35/35 KBLI scraped, 274 chunks indexed |
+| `/health` endpoint | ✅ Done | Returns model, chunk count, chroma_status |
+| Data pipeline (scraper) | ✅ Running | 35+ KBLI done, 25 more queued |
 
 ### Pillar 2 — TALL Backend (Laravel + Filament)
 
 | Component | Status | Notes |
 |---|---|---|
 | Auth (magic link) | ✅ Done | Passwordless email login |
-| User MSME profile | ✅ Done | kbli_code, scale, NIK, NPWP fields |
-| Telegram↔account binding | ✅ Done | `telegram_id` on users table |
-| Permit applications CRUD | ✅ Done | API + Filament resource |
+| User MSME profile | ✅ Done | name, phone, NIK, NPWP, business_name/address via `PATCH /api/profile` |
+| Telegram account linking | ✅ Done | Token generation, `/api/internal/telegram/link`, duplicate check |
+| Telegram notifications | ✅ Done | `PermitApplicationObserver` — approved/rejected/under_review/additional_docs |
+| Permit applications CRUD | ✅ Done | API + Filament resource; document/ownership validation |
+| Permit detail endpoint | ✅ Done | `GET /api/permits/detail/{id}` with MSME ownership check |
+| Business auto-population | ✅ Done | `Business::updateOrCreate()` in same transaction as permit apply |
 | AI logs API | ✅ Done | `/api/internal/ai-logs` |
-| User context API | ✅ Done | `/api/internal/user-context` |
+| User context API | ✅ Done | `/api/internal/user-context` (returns businesses[], telegram_chat_id) |
 | Filament admin panel | ✅ Done | Styled with Ethereal Slate design |
-| Queue worker | ✅ Done | Redis-backed, separate container |
-| Business profile model | ✅ Done | Separate from users table |
+| Filament UserStatsWidget | ✅ Done | UMKM users, Telegram-linked, active 24h, pending permits |
+| Filament AI Interactions | ✅ Done | Session thread filter, view-thread action, 30s live poll |
 | Pipeline trigger API | ✅ Done | `POST /api/pipeline/trigger` |
+| API rate limiting | ✅ Done | `throttle:120,1` on auth:sanctum group |
+| CORS lockdown | ✅ Done | Restricted to `FRONTEND_URL` |
 
 ### Pillar 3 — Next.js Frontend
 
 | Component | Status | Notes |
 |---|---|---|
 | Magic link login page | ✅ Done | |
-| Dashboard skeleton | ✅ Done | Loading states, skeleton UI |
-| Permit wizard (`/permits`) | ✅ Done | Multi-step apply flow |
-| Permit detail (`/permits/[id]`) | ✅ Done | |
-| Profile page | ✅ Done | |
+| Dashboard with real data | ✅ Done | SWR, permit count, status, KBLI name |
+| LKPM reminder banner | ✅ Done | Fires for kecil/menengah permits >90 days old |
+| Chat widget | ✅ Done | Collapsible, server-token-validated, typing indicator |
+| Permit wizard (`/permits/new`) | ✅ Done | KBLI typeahead (debounced), multi-step apply |
+| Permit list (`/permits`) | ✅ Done | Skeletons, empty state, status badges |
+| Permit detail (`/permits/[id]`) | ✅ Done | SWR + dedicated API, NextActionCard (6 states), requirements checklist, docs list |
+| Profile page — view | ✅ Done | All MSME fields displayed |
+| Profile page — inline edit | ✅ Done | Save/cancel bar, `PATCH /api/profile` |
+| Telegram connect flow | ✅ Done | Token generation, deep link button, "connected" badge |
+| Mobile responsive | ✅ Done | BottomNav, `pb-24`, `sm:grid-cols-2` throughout |
+| Skeleton loaders | ✅ Done | Dashboard, permits list, permit detail |
+| Empty states | ✅ Done | `EmptyState` component on zero-permit views |
 | Design system applied | ✅ Done | Ethereal Slate, Manrope, glassmorphism |
-| Auth context | ✅ Done | |
 | Business dashboard (post-license) | ⏳ Not built | Phase 3 features |
 | React Native mobile app | ⏳ Not started | Hackathon stretch goal |
 
 ---
 
-## 8. Known Issues
+## 10. Known Issues
 
 | # | Issue | Severity | Status |
 |---|---|---|---|
-| 1 | `analyze_user_intent` KBLI extraction not used in live queries (KBLI passed but RAG query targeting needs verification) | Medium | Open |
-| 2 | WhatsApp webhook not connected (no Meta token) | Medium | Blocked (credentials) |
-| 3 | Business profile not populated for any user (0 businesses in DB) | Medium | Open |
-| 4 | ChromaDB only has 35 KBLI codes — OSS has thousands | Low | Known scope limit |
-| 5 | `sentence-transformers` version conflict (`huggingface_hub` API breaking change) — worked around by downgrade but fragile | Low | Monitoring |
-| 6 | No rate limiting on Telegram webhook endpoint | Low | Open |
-| 7 | Gemma response time 25–55s (acceptable for hackathon, not production) | Info | Accepted |
+| 1 | WhatsApp webhook not connected (no Meta token) | Medium | Blocked — Phase D |
+| 2 | Gemma response time 25–55s (acceptable for hackathon demo) | Info | Accepted |
+| 3 | `sentence-transformers` version pinned (`huggingface-hub==0.27.0`) — fragile workaround | Low | Monitoring |
+| 4 | ChromaDB has 35+ KBLI codes — OSS has thousands | Low | Known scope limit |
+| 5 | AI-engine rate limiter is in-memory — resets on container restart | Low | Accepted for hackathon |
+| 6 | Conversation history is in-memory — lost on container restart | Low | Accepted for hackathon |
+
+> Previously tracked issues now resolved: business profile empty (fixed: auto-upserted on permit apply), no rate limiting (fixed: `throttle:120,1` on API + 5 msg/min in ai-engine).

@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Api\AiLogController;
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\PdfJobController;
 use App\Http\Controllers\Api\PermitController;
 use App\Http\Controllers\Api\PipelineController;
 use App\Http\Controllers\Api\ProfileController;
@@ -35,6 +36,14 @@ Route::prefix('internal')->group(function () {
 
     // Telegram account linking: called by the bot after /start tglink_{token}
     Route::post('/telegram/link', [AuthController::class, 'telegramLink']);
+
+    // PDF parsing jobs: lifecycle callbacks from pdf_agent_pipeline.py
+    Route::prefix('pdf-jobs')->group(function () {
+        Route::get('/{id}', [PdfJobController::class, 'show'])->whereNumber('id');
+        Route::patch('/{id}/progress', [PdfJobController::class, 'updateProgress'])->whereNumber('id');
+        Route::post('/{id}/complete', [PdfJobController::class, 'complete'])->whereNumber('id');
+        Route::post('/{id}/fail', [PdfJobController::class, 'fail'])->whereNumber('id');
+    });
 });
 
 // ── Magic link generation via Sanctum (admin/staff via dashboard) ─────────────
