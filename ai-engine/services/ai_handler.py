@@ -660,6 +660,73 @@ async def _post_log(
 
 
 # ---------------------------------------------------------------------------
+# 3b. Telegram account linking helpers
+# ---------------------------------------------------------------------------
+
+async def handle_telegram_link(chat_id: int, token: str, from_user: Any) -> None:
+    """
+    Called when a user sends /start tglink_{token} to the bot.
+    Calls the backend to bind their Telegram chat_id to the portal account.
+    """
+    url = f"{_LARAVEL_BACKEND_URL}/api/internal/telegram/link"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+        "X-Internal-Key": _LARAVEL_API_KEY,
+    }
+    username = getattr(from_user, "username", None) if from_user else None
+    payload  = {"token": token, "chat_id": chat_id, "username": username}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+        data = resp.json()
+
+        if resp.status_code == 200:
+            name = data.get("data", {}).get("user_name", "Anda")
+            msg = (
+                f"✅ *Akun berhasil terhubung!*\n\n"
+                f"Halo *{name}*\\! Akun portal BIMA\\-AI Anda kini terhubung dengan Telegram\\.\n\n"
+                f"Mulai sekarang Anda bisa:\n"
+                f"• Bertanya tentang izin usaha OSS RBA\n"
+                f"• Mengetahui persyaratan KBLI Anda\n"
+                f"• Menerima notifikasi status permohonan\n\n"
+                f"Coba kirim pertanyaan pertama\\!"
+            )
+        elif resp.status_code == 409:
+            msg = "⚠️ Akun Telegram ini sudah terhubung ke akun portal lain."
+        else:
+            err = data.get("message", "")
+            logger.warning("Telegram link rejected | chat_id=%s | status=%s | msg=%s",
+                           chat_id, resp.status_code, err)
+            msg = (
+                "❌ Token tidak valid atau sudah kedaluwarsa.\n\n"
+                "Silakan buat token baru melalui portal BIMA\\-AI → Profil → Hubungkan Telegram\\."
+            )
+    except Exception:
+        logger.exception("Telegram link backend call failed | chat_id=%s", chat_id)
+        msg = "❌ Terjadi kesalahan saat menghubungkan akun. Coba lagi sebentar."
+
+    await _send_telegram_reply(chat_id=chat_id, message=msg)
+
+
+async def handle_start_command(chat_id: int, from_user: Any) -> None:
+    """Generic /start welcome — no linking token present."""
+    first = getattr(from_user, "first_name", None) if from_user else None
+    name = first or "Pengguna"
+    msg = (
+        f"Halo *{name}*\\! 👋 Selamat datang di *BIMA\\-AI*\\.\n\n"
+        "Saya asisten perizinan UMKM yang membantu Anda memahami OSS RBA\\.\n\n"
+        "Tanyakan apa saja, contohnya:\n"
+        "• _'Saya mau buka warung makan, izin apa yang diperlukan?'_\n"
+        "• _'Apa itu NIB dan bagaimana cara mendapatkannya?'_\n"
+        "• _'KBLI untuk salon kecantikan apa?'_\n\n"
+        "Atau kunjungi portal untuk mengajukan izin secara online\\."
+    )
+    await _send_telegram_reply(chat_id=chat_id, message=msg)
+
+
+# ---------------------------------------------------------------------------
 # 4. Main pipeline entry point
 # ---------------------------------------------------------------------------
 

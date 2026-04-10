@@ -26,7 +26,12 @@ from pydantic import BaseModel, ValidationError, field_validator
 
 import time as _time
 
-from services.ai_handler import generate_ai_response, process_message
+from services.ai_handler import (
+    generate_ai_response,
+    handle_start_command,
+    handle_telegram_link,
+    process_message,
+)
 
 load_dotenv()
 
@@ -346,21 +351,41 @@ async def telegram_webhook(
     try:
         if update.message and update.message.text:
             chat_id = update.message.chat.id
-            text = update.message.text
-            user_id = str(chat_id)
+            text    = update.message.text.strip()
+            from_user = update.message.from_
+
             logger.info(
                 "Telegram text message queued | chat_id=%s | update_id=%s | request_id=%s",
                 chat_id,
                 update.update_id,
                 request_id,
             )
-            background_tasks.add_task(
-                process_message,
-                user_id=user_id,
-                message=text,
-                platform="telegram",
-                reply_context={"chat_id": chat_id},
-            )
+
+            if text.startswith("/start tglink_"):
+                # Portal "Connect Telegram" deep link — complete account linking.
+                token = text[len("/start tglink_"):].strip()
+                background_tasks.add_task(
+                    handle_telegram_link,
+                    chat_id=chat_id,
+                    token=token,
+                    from_user=from_user,
+                )
+            elif text.startswith("/start"):
+                # Generic bot entry — send onboarding welcome.
+                background_tasks.add_task(
+                    handle_start_command,
+                    chat_id=chat_id,
+                    from_user=from_user,
+                )
+            else:
+                background_tasks.add_task(
+                    process_message,
+                    user_id=str(chat_id),
+                    message=text,
+                    platform="telegram",
+                    reply_context={"chat_id": chat_id},
+                )
+
         elif update.edited_message and update.edited_message.text:
             # Treat edited messages the same as new messages.
             chat_id = update.edited_message.chat.id

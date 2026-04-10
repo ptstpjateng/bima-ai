@@ -192,6 +192,66 @@ class AuthController extends ApiController
     }
 
     /**
+     * POST /api/internal/telegram/link
+     * Called by the bot after the user sends /start tglink_{token}.
+     * Validates the one-time token and binds telegram_chat_id to the user account.
+     */
+    public function telegramLink(Request $request): JsonResponse
+    {
+        try {
+            $internalKey = config('app.internal_api_key');
+            $providedKey  = $request->header('X-Internal-Key');
+
+            if (! $internalKey || ! $providedKey || ! hash_equals($internalKey, (string) $providedKey)) {
+                return $this->error('Akses ditolak.', 403, 'FORBIDDEN');
+            }
+
+            $validated = $request->validate([
+                'token'    => ['required', 'string', 'max:64'],
+                'chat_id'  => ['required', 'integer'],
+                'username' => ['nullable', 'string', 'max:100'],
+            ]);
+
+            $magic = MagicLinkToken::where('token', $validated['token'])
+                ->where('channel', 'telegram_link')
+                ->whereNull('used_at')
+                ->where('expires_at', '>', now())
+                ->with('user')
+                ->first();
+
+            if (! $magic) {
+                return $this->error('Token tidak valid atau sudah kadaluarsa.', 404, 'INVALID_TOKEN');
+            }
+
+            // Prevent the same Telegram account from being linked to multiple portal accounts.
+            $alreadyLinked = User::where('telegram_chat_id', $validated['chat_id'])
+                ->where('id', '!=', $magic->user_id)
+                ->exists();
+
+            if ($alreadyLinked) {
+                return $this->error('Akun Telegram ini sudah terhubung ke akun lain.', 409, 'ALREADY_LINKED');
+            }
+
+            $magic->user->update([
+                'telegram_chat_id'  => $validated['chat_id'],
+                'telegram_username' => $validated['username'] ?? $magic->user->telegram_username,
+            ]);
+
+            $magic->update(['used_at' => now()]);
+
+            return $this->success([
+                'user_id'   => $magic->user_id,
+                'user_name' => $magic->user->name,
+            ], 200, 'Akun berhasil dihubungkan.');
+
+        } catch (ValidationException $e) {
+            return $this->error($e->getMessage(), 422, 'VALIDATION_ERROR');
+        } catch (\Throwable $e) {
+            return $this->serverError($e, 'AuthController@telegramLink');
+        }
+    }
+
+    /**
      * GET /api/auth/magic/{token}
      * Exchange a magic link token for a Sanctum token + user data.
      */

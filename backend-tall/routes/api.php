@@ -32,6 +32,9 @@ Route::prefix('internal')->group(function () {
     // Data pipeline: queue management and status reporting
     Route::get('/pipeline/queue', [PipelineController::class, 'queue']);
     Route::post('/pipeline/status', [PipelineController::class, 'updateStatus']);
+
+    // Telegram account linking: called by the bot after /start tglink_{token}
+    Route::post('/telegram/link', [AuthController::class, 'telegramLink']);
 });
 
 // ── Magic link generation via Sanctum (admin/staff via dashboard) ─────────────

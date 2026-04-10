@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Models\Business;
 use App\Models\PermitApplication;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
@@ -130,13 +131,34 @@ class PermitController extends ApiController
             $permit = DB::transaction(function () use ($validated, $user) {
                 $applicationNumber = $this->generateApplicationNumber();
 
-                return PermitApplication::create([
+                $permit = PermitApplication::create([
                     ...$validated,
                     'user_id'            => $user->id,
                     'application_number' => $applicationNumber,
                     'status'             => 'submitted',
                     'submitted_at'       => now(),
                 ]);
+
+                // Sync the user's primary business record so the AI engine can
+                // personalise responses with real KBLI / scale context.
+                Business::updateOrCreate(
+                    ['user_id' => $user->id, 'is_primary' => true],
+                    [
+                        'name'                     => $user->business_name
+                                                        ?? 'UMKM ' . $validated['kbli_description'],
+                        'primary_kbli_code'        => $validated['kbli_code'],
+                        'primary_kbli_description' => $validated['kbli_description'],
+                        'scale'                    => $validated['business_scale'],
+                        'annual_revenue_estimate'  => $validated['annual_revenue_estimate'] ?? null,
+                        'employee_count'           => $validated['employee_count'] ?? null,
+                        'address'                  => $validated['business_location_address'] ?? null,
+                        'province'                 => $validated['business_location_province'] ?? null,
+                        'city'                     => $validated['business_location_city'] ?? null,
+                        'is_primary'               => true,
+                    ]
+                );
+
+                return $permit;
             });
 
             return $this->success(
