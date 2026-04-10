@@ -88,6 +88,11 @@ export async function fetchPermits(userId: number): Promise<PermitApplication[]>
   return res.data.permits;
 }
 
+export async function fetchPermit(id: number): Promise<PermitApplication> {
+  const res = await request<{ permit: PermitApplication }>(`/permits/detail/${id}`);
+  return res.data.permit;
+}
+
 export async function applyPermit(payload: PermitApplyPayload): Promise<{
   id: number;
   application_number: string;
@@ -150,11 +155,15 @@ export async function generateTelegramToken(): Promise<string> {
 
 // ── Web chat (portal → Next.js API route → ai-engine) ─────────────────────────
 
-export async function webChat(message: string, userId: number): Promise<string> {
+export async function webChat(message: string): Promise<string> {
+  const token = getToken();
   const res = await fetch("/api/ai/chat", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, user_id: `web-${userId}` }),
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ message }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));

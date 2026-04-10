@@ -16,10 +16,12 @@ return [
 
     'allowed_methods' => ['*'],
 
-    // Temporarily open for Vercel deployment.
-    // Once the Vercel URL is known, replace '*' with the specific domain
-    // and re-enable supports_credentials for Sanctum SPA cookie auth.
-    'allowed_origins' => ['*'],
+    'allowed_origins' => array_filter([
+        env('FRONTEND_URL', 'https://project-5z22k.vercel.app'),
+        // Allow localhost for local development
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+    ]),
 
     'allowed_origins_patterns' => [],
 

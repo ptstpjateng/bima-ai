@@ -1,21 +1,56 @@
 import { NextRequest, NextResponse } from "next/server";
 
 // Server-side proxy: Next.js portal → ai-engine /webhook/chat
-// Keeps the ai-engine URL server-only and handles auth validation.
+// Validates the Sanctum token against the backend /auth/me before forwarding,
+// then uses the server-verified user_id — never trusts the client-supplied value.
 
 const AI_ENGINE_URL =
   process.env.AI_ENGINE_URL ??
   process.env.NEXT_PUBLIC_API_URL ??
   "http://116.254.113.81";
 
+const BACKEND_URL =
+  process.env.BACKEND_URL ??
+  process.env.NEXT_PUBLIC_API_URL ??
+  "http://116.254.113.81";
+
 export async function POST(req: NextRequest) {
-  // Require a valid Authorization header (Sanctum token from the portal)
   const authHeader = req.headers.get("Authorization");
   if (!authHeader?.startsWith("Bearer ")) {
     return NextResponse.json({ message: "Unauthorized" }, { status: 401 });
   }
 
-  let body: { message?: unknown; user_id?: unknown };
+  // Validate token against the backend and get the real user id.
+  let verifiedUserId: number;
+  try {
+    const meRes = await fetch(`${BACKEND_URL}/api/auth/me`, {
+      headers: {
+        Authorization: authHeader,
+        Accept: "application/json",
+      },
+      cache: "no-store",
+    });
+
+    if (!meRes.ok) {
+      return NextResponse.json({ message: "Unauthorized" }, { status: 401 });
+    }
+
+    const meData = (await meRes.json()) as {
+      data?: { user?: { id?: number } };
+    };
+    const uid = meData?.data?.user?.id;
+    if (!uid || typeof uid !== "number") {
+      return NextResponse.json({ message: "Unauthorized" }, { status: 401 });
+    }
+    verifiedUserId = uid;
+  } catch {
+    return NextResponse.json(
+      { message: "Tidak dapat memverifikasi sesi. Coba lagi." },
+      { status: 503 },
+    );
+  }
+
+  let body: { message?: unknown };
   try {
     body = await req.json();
   } catch {
@@ -23,12 +58,17 @@ export async function POST(req: NextRequest) {
   }
 
   const message = typeof body.message === "string" ? body.message.trim() : "";
-  const userId = typeof body.user_id === "string" ? body.user_id : "";
-
-  if (!message || !userId) {
+  if (!message) {
     return NextResponse.json(
-      { message: "message and user_id are required" },
+      { message: "message is required" },
       { status: 400 },
+    );
+  }
+
+  if (message.length > 2000) {
+    return NextResponse.json(
+      { message: "Pesan terlalu panjang (maks 2000 karakter)." },
+      { status: 422 },
     );
   }
 
@@ -36,8 +76,8 @@ export async function POST(req: NextRequest) {
     const upstream = await fetch(`${AI_ENGINE_URL}/webhook/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, message }),
-      // Next.js fetch cache: no-store so every chat message is fresh
+      // user_id uses verified server-side id — never client-supplied
+      body: JSON.stringify({ user_id: `web-${verifiedUserId}`, message }),
       cache: "no-store",
     });
 

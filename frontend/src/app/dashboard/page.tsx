@@ -133,7 +133,7 @@ export default function DashboardPage() {
         </div>
 
         {/* BIMA-AI Chat Widget */}
-        {user && <ChatWidget userId={user.id} />}
+        <ChatWidget />
 
         {/* AI Activity Feed */}
         <AiActivityFeed interactions={interactions} isLoading={logsLoading} />

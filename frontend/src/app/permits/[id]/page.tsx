@@ -18,9 +18,10 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { use } from "react";
+import useSWR from "swr";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { StatusBadge } from "@/components/permits/StatusBadge";
-import { usePermits } from "@/hooks/usePermits";
+import { fetchPermit } from "@/lib/api";
 import {
   RISK_LABELS,
   SCALE_LABELS,
@@ -184,9 +185,13 @@ function NextActionCard({ permit }: { permit: PermitApplication }) {
 
 export default function PermitDetailPage({ params }: Props) {
   const { id } = use(params);
-  const { permits, isLoading } = usePermits();
+  const numericId = Number(id);
 
-  const permit = permits.find((p) => p.id === Number(id));
+  const { data: permit, isLoading } = useSWR(
+    numericId ? ["permit", numericId] : null,
+    () => fetchPermit(numericId),
+    { revalidateOnFocus: false },
+  );
 
   return (
     <AppLayout>

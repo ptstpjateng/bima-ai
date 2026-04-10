@@ -20,9 +20,7 @@ interface Message {
   timestamp: string;
 }
 
-interface ChatWidgetProps {
-  userId: number;
-}
+// userId prop removed — user identity is now server-verified via Bearer token
 
 const PORTAL_URL = "https://project-5z22k.vercel.app";
 
@@ -72,7 +70,7 @@ function ChatBubble({ content, role }: { content: string; role: "user" | "ai" })
   );
 }
 
-export function ChatWidget({ userId }: ChatWidgetProps) {
+export function ChatWidget() {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -108,7 +106,7 @@ export function ChatWidget({ userId }: ChatWidgetProps) {
     setLoading(true);
 
     try {
-      const response = await webChat(text, userId);
+      const response = await webChat(text);
       const aiMsg: Message = {
         id: crypto.randomUUID(),
         role: "ai",

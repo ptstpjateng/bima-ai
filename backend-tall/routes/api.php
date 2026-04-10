@@ -40,7 +40,7 @@ Route::middleware('auth:sanctum')->prefix('auth')->group(function () {
 });
 
 // ── Authenticated routes (Sanctum token) ─────────────────────────────────────
-Route::middleware('auth:sanctum')->group(function () {
+Route::middleware(['auth:sanctum', 'throttle:120,1'])->group(function () {
 
     Route::get('/user', fn (Request $request) => response()->json($request->user()));
     Route::get('/auth/me', [AuthController::class, 'me']);
@@ -57,6 +57,8 @@ Route::middleware('auth:sanctum')->group(function () {
     // Permit Applications
     Route::get('/permits/{user_id}', [PermitController::class, 'index'])
         ->whereNumber('user_id');
+    Route::get('/permits/detail/{id}', [PermitController::class, 'show'])
+        ->whereNumber('id');
     Route::post('/permits/apply', [PermitController::class, 'apply']);
 
     // KBLI search — returns scraped KBLI codes with descriptions for autocomplete.

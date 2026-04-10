@@ -36,7 +36,6 @@ class PermitController extends ApiController
             }
 
             $permits = PermitApplication::where('user_id', $userId)
-                ->whereNotIn('status', ['expired', 'rejected'])
                 ->orderByDesc('created_at')
                 ->get([
                     'id',
@@ -45,11 +44,13 @@ class PermitController extends ApiController
                     'nib',
                     'kbli_code',
                     'kbli_description',
+                    'kbli_section',
                     'business_scale',
                     'risk_level',
                     'status',
                     'submitted_at',
                     'approved_at',
+                    'rejected_at',
                     'permit_expiry_date',
                     'created_at',
                 ]);
@@ -62,6 +63,37 @@ class PermitController extends ApiController
 
         } catch (\Throwable $e) {
             return $this->serverError($e, 'PermitController@index');
+        }
+    }
+
+    /**
+     * GET /api/permits/detail/{id}
+     *
+     * Returns the full detail of a single permit application.
+     * MSME users can only view their own permits.
+     * Staff/admin can view any permit.
+     */
+    public function show(Request $request, int $id): JsonResponse
+    {
+        try {
+            /** @var \App\Models\User $caller */
+            $caller = $request->user();
+
+            $permit = PermitApplication::find($id);
+
+            if (! $permit) {
+                return $this->error('Permohonan tidak ditemukan.', 404, 'NOT_FOUND');
+            }
+
+            // Ownership check — MSME users can only view their own permits.
+            if ($caller->role === 'msme' && $permit->user_id !== $caller->id) {
+                return $this->error('Anda tidak memiliki akses ke permohonan ini.', 403, 'FORBIDDEN');
+            }
+
+            return $this->success(['permit' => $permit]);
+
+        } catch (\Throwable $e) {
+            return $this->serverError($e, 'PermitController@show');
         }
     }
 
@@ -85,11 +117,11 @@ class PermitController extends ApiController
                 'business_location_city'     => ['nullable', 'string', 'max:100'],
                 'annual_revenue_estimate'    => ['nullable', 'integer', 'min:0'],
                 'employee_count'             => ['nullable', 'integer', 'min:0'],
-                'applicant_notes'            => ['nullable', 'string'],
-                'documents'                  => ['nullable', 'array'],
+                'documents'                  => ['nullable', 'array', 'max:20'],
                 'documents.*.name'           => ['required_with:documents', 'string', 'max:255'],
-                'documents.*.path'           => ['required_with:documents', 'string', 'max:500'],
-                'documents.*.type'           => ['required_with:documents', 'string', 'max:100'],
+                'documents.*.path'           => ['required_with:documents', 'string', 'url', 'max:1000'],
+                'documents.*.type'           => ['required_with:documents', 'string', 'in:ktp,npwp,surat_keterangan,akta_pendirian,sertifikat,foto,lainnya'],
+                'applicant_notes'            => ['nullable', 'string', 'max:2000'],
             ]);
 
             /** @var \App\Models\User $user */
