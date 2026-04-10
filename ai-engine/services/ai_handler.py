@@ -15,7 +15,10 @@ Persona & lifecycle model: see BIMA_PERSONA.md in the project root.
 
 import logging
 import os
+import re
+import time
 import uuid
+from collections import OrderedDict, defaultdict
 from typing import Any, Literal
 
 import httpx
@@ -32,9 +35,12 @@ logger = logging.getLogger("bima_ai.ai_handler")
 _LARAVEL_BACKEND_URL: str = os.getenv("LARAVEL_BACKEND_URL", "http://backend:80")
 _LARAVEL_API_KEY: str     = os.getenv("LARAVEL_API_KEY", "")
 _GEMINI_API_KEY: str      = os.getenv("GEMINI_API_KEY", "")
-# Primary model: gemma-3-27b-it (open-weights hosted on Google AI Studio infra).
-# Override via GEMINI_MODEL env var — e.g. models/gemma-3-12b-it for lighter load.
+# Primary model for full responses (open-weights, hosted on Google AI Studio).
 _GEMINI_MODEL: str        = os.getenv("GEMINI_MODEL", "models/gemma-3-27b-it")
+# Lightweight model for JSON-only intent classification — can be a smaller/faster
+# variant. Defaults to the same model; override with GEMINI_INTENT_MODEL env var.
+# E.g. set to models/gemma-3-4b-it for ~10x faster intent calls on free tier.
+_GEMINI_INTENT_MODEL: str = os.getenv("GEMINI_INTENT_MODEL", "") or _GEMINI_MODEL
 
 _WHATSAPP_API_TOKEN: str   = os.getenv("WHATSAPP_API_TOKEN", "")
 _WHATSAPP_API_VERSION: str = os.getenv("WHATSAPP_API_VERSION", "v19.0")
@@ -43,6 +49,53 @@ _TELEGRAM_BOT_TOKEN: str   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _PORTAL_URL = "https://project-5z22k.vercel.app"
 
 Platform = Literal["whatsapp", "telegram"]
+
+# ---------------------------------------------------------------------------
+# Rate limiter  (A4 — 5 messages per user per 60s, in-memory)
+# ---------------------------------------------------------------------------
+
+_RATE_WINDOW = 60.0   # seconds
+_RATE_MAX    = 5      # max messages per window
+_rate_timestamps: dict[str, list[float]] = defaultdict(list)
+
+
+def _is_rate_limited(user_id: str) -> bool:
+    """Return True and log if the user has exceeded the rate limit."""
+    now = time.time()
+    stamps = _rate_timestamps[user_id]
+    # Drop timestamps outside the window
+    _rate_timestamps[user_id] = [t for t in stamps if now - t < _RATE_WINDOW]
+    if len(_rate_timestamps[user_id]) >= _RATE_MAX:
+        logger.warning("Rate limit hit | user_id=%s | count=%d", user_id, len(_rate_timestamps[user_id]))
+        return True
+    _rate_timestamps[user_id].append(now)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Conversation history  (A3 — last 2 turns per user, in-memory, max 500 users)
+# ---------------------------------------------------------------------------
+
+_MAX_HISTORY_USERS = 500
+_MAX_TURNS         = 2   # each turn = 1 user msg + 1 model reply
+_history: OrderedDict[str, list[dict]] = OrderedDict()
+
+
+def _get_history(user_id: str) -> list[dict]:
+    """Return the stored conversation turns for a user (already in API format)."""
+    return list(_history.get(user_id, []))
+
+
+def _append_history(user_id: str, user_msg: str, model_reply: str) -> None:
+    """Append a completed turn and keep only the last _MAX_TURNS turns."""
+    turns = _history.get(user_id, [])
+    turns.append({"role": "user",  "parts": [{"text": user_msg}]})
+    turns.append({"role": "model", "parts": [{"text": model_reply}]})
+    # Keep only the tail so the history list never grows unbounded
+    _history[user_id] = turns[-(_MAX_TURNS * 2):]
+    # Evict the oldest user entry when the global dict is at capacity
+    while len(_history) > _MAX_HISTORY_USERS:
+        _history.popitem(last=False)
 
 # ---------------------------------------------------------------------------
 # System prompt  (BIMA_PERSONA.md → Phase 1 / 2 / 3)
@@ -143,28 +196,50 @@ Jawaban ini menggunakan basis pengetahuan AI umum."
 async def generate_ai_response(user_id: str, message: str) -> str:
     """
     Generate a personalized AI reply:
-    1. analyze_user_intent — classify phase + extract KBLI code (lightweight JSON call)
-    2. Fetch user context from Laravel (business profile + licenses)
-    3. Retrieve relevant regulations from ChromaDB (KBLI-targeted RAG)
-    4. Call Gemma — falls back to RAG-based response if API unavailable
+    1. Rate-limit check — reject if user exceeds 5 msg/min
+    2. analyze_user_intent — classify phase + extract KBLI (lightweight JSON call)
+    3. Fetch user context from Laravel (business profile + licenses)
+    4. Retrieve regulations from ChromaDB (KBLI-targeted RAG when code detected)
+    5. Call Gemma with conversation history — falls back to RAG response if unavailable
+    6. Enforce Phase 2 portal CTA and save turn to history
     """
     from services.rag_service import format_rag_context, query_regulations
     from services.user_context import fetch_user_context, format_user_context
 
+    # A4 — rate limit
+    if _is_rate_limited(user_id):
+        return (
+            "Mohon tunggu sebentar ya — Anda mengirim terlalu banyak pesan dalam waktu singkat. "
+            "Coba lagi dalam 1 menit. 🙏"
+        )
+
     try:
         import asyncio
 
-        # Step 1 — lightweight intent classification (runs concurrently with user context fetch)
+        # Step 1 — intent classification + user context fetch run concurrently
         intent_task   = asyncio.create_task(analyze_user_intent(message))
         user_ctx_task = asyncio.create_task(fetch_user_context(user_id))
 
         intent   = await intent_task
         user_ctx = await user_ctx_task
 
-        # Use detected KBLI to run a tighter RAG query (more results for known KBLI)
-        detected_kbli = intent.get("kbli_code")
-        rag_query     = f"KBLI {detected_kbli} {message}" if detected_kbli else message
-        n_results     = 8 if detected_kbli else 4
+        # A1 — normalise KBLI: strip non-digits, accept only 4–6 digit codes
+        raw_kbli = intent.get("kbli_code")
+        if raw_kbli:
+            digits = re.sub(r"\D", "", str(raw_kbli))
+            detected_kbli = digits if 4 <= len(digits) <= 6 else None
+        else:
+            detected_kbli = None
+
+        # A1 — KBLI-prefixed RAG query for tighter results when a code is known
+        rag_query = f"KBLI {detected_kbli} {message}" if detected_kbli else message
+        n_results = 8 if detected_kbli else 4
+
+        logger.info(
+            "Intent | phase=%s kbli=%s scale=%s | rag_query=%r | n_results=%d | user_id=%s",
+            intent.get("phase"), detected_kbli, intent.get("detected_scale"),
+            rag_query, n_results, user_id,
+        )
 
         rag_chunks = await asyncio.get_event_loop().run_in_executor(
             None, lambda: query_regulations(rag_query, n_results=n_results)
@@ -174,15 +249,8 @@ async def generate_ai_response(user_id: str, message: str) -> str:
         rag_ctx_str  = format_rag_context(rag_chunks)
         has_rag      = bool(rag_ctx_str)
 
-        logger.info(
-            "Intent | phase=%s kbli=%s scale=%s | rag_chunks=%d | user_id=%s",
-            intent.get("phase"), detected_kbli, intent.get("detected_scale"),
-            len(rag_chunks), user_id,
-        )
         if not has_rag:
-            logger.info(
-                "RAG returned 0 usable chunks — activating fallback prompt | user_id=%s", user_id
-            )
+            logger.info("RAG returned 0 usable chunks — activating fallback prompt | user_id=%s", user_id)
 
         # Build system instruction: base prompt + user profile + RAG context
         system = _SYSTEM_PROMPT if has_rag else f"{_SYSTEM_PROMPT}\n\n{_FALLBACK_SYSTEM_ADDITION}"
@@ -193,9 +261,14 @@ async def generate_ai_response(user_id: str, message: str) -> str:
             system_parts.append(rag_ctx_str)
         system_instruction = "\n\n".join(system_parts)
 
+        # A3 — pass last 2 conversation turns so follow-up questions have context
+        history = _get_history(user_id)
+
         if _GEMINI_API_KEY:
             try:
-                return await _call_gemma_with_retry(system_instruction, message)
+                ai_response = await _call_gemma_with_retry(
+                    system_instruction, message, history=history
+                )
             except Exception:
                 logger.warning(
                     "Gemma unavailable after retries — using RAG-based fallback | user_id=%s",
@@ -204,6 +277,15 @@ async def generate_ai_response(user_id: str, message: str) -> str:
                 return _rag_fallback_response(message, rag_chunks)
         else:
             return _smart_placeholder(message, user_ctx, rag_chunks)
+
+        # A3 — Phase 2 CTA enforcement: always append portal link if missing
+        if intent.get("phase") == 2 and _PORTAL_URL not in ai_response:
+            ai_response += f"\n\n[Buka Portal BIMA-AI →]({_PORTAL_URL})"
+
+        # Save turn to history for next message
+        _append_history(user_id, message, ai_response)
+
+        return ai_response
 
     except Exception:
         logger.exception("generate_ai_response failed | user_id=%s", user_id)
@@ -247,7 +329,11 @@ async def analyze_user_intent(message: str) -> dict:
         return {"phase": 1, "kbli_code": None, "detected_scale": None}
 
     try:
-        raw = await _call_gemma(_INTENT_SYSTEM, message, max_tokens=128, temperature=0.0)
+        raw = await _call_gemma(
+            _INTENT_SYSTEM, message,
+            max_tokens=128, temperature=0.0,
+            model_override=_GEMINI_INTENT_MODEL,
+        )
         cleaned = _strip_json_fences(raw)
         intent = json.loads(cleaned)
         # Normalise — ensure required keys exist
@@ -262,7 +348,12 @@ async def analyze_user_intent(message: str) -> dict:
 
 
 async def _call_gemma_with_retry(
-    system_prompt: str, user_message: str, max_attempts: int = 3, **kwargs
+    system_prompt: str,
+    user_message: str,
+    *,
+    max_attempts: int = 3,
+    history: list[dict] | None = None,
+    **kwargs,
 ) -> str:
     """Call Gemma with exponential backoff for transient 429/503 errors.
 
@@ -274,7 +365,7 @@ async def _call_gemma_with_retry(
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            return await _call_gemma(system_prompt, user_message, **kwargs)
+            return await _call_gemma(system_prompt, user_message, history=history, **kwargs)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status in (429, 503) and attempt < max_attempts - 1:
@@ -302,28 +393,33 @@ async def _call_gemma(
     *,
     max_tokens: int = 2048,
     temperature: float = 0.7,
+    history: list[dict] | None = None,
+    model_override: str | None = None,
 ) -> str:
     """
-    Call hosted Gemma (or any model on the Generative Language API) via REST.
+    Call hosted Gemma (or any Generative Language API model) via REST.
 
-    Uses systemInstruction for the system prompt so the model treats it as
-    directives, not as content to summarise or continue.  The user_message
-    goes in contents[].  This fixes the "Gemma echoes the system prompt"
-    regression caused by passing everything as a single flat text blob.
-
-    Notable differences from the old Gemini call:
-    - No thinkingConfig (Gemma models don't support it)
-    - Response text may contain Markdown code fences around JSON; callers that
-      need JSON should use _strip_json_fences() before parsing.
+    - systemInstruction carries the system prompt + context so the model treats
+      it as directives, not as content to summarise.
+    - history (optional): list of prior turn dicts in API format
+      [{"role":"user","parts":[...]}, {"role":"model","parts":[...]}]
+      placed before the current user message for multi-turn context.
+    - model_override: use a different model for this call (e.g. smaller intent model).
+    - Thought parts (thought=True) are filtered out — gemma-4 emits these as
+      internal reasoning that must not be shown to end users.
     """
-    model_name = _GEMINI_MODEL.removeprefix("models/")
+    model_name = (model_override or _GEMINI_MODEL).removeprefix("models/")
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model_name}:generateContent?key={_GEMINI_API_KEY}"
     )
+    # Build the contents array: history turns (if any) + current user message
+    contents: list[dict] = list(history or [])
+    contents.append({"role": "user", "parts": [{"text": user_message}]})
+
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "contents": contents,
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_tokens,

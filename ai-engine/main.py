@@ -171,8 +171,31 @@ app.include_router(vectorize.router, tags=["Vectorize"])
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Health check — A4: expose ChromaDB chunk count + model info
 # ---------------------------------------------------------------------------
 @app.get("/health", include_in_schema=False)
 async def health():
-    return {"status": "ok"}
+    import asyncio
+    from services.ai_handler import _GEMINI_MODEL, _GEMINI_INTENT_MODEL
+
+    # Query ChromaDB in a thread so we don't block the event loop
+    def _chroma_count() -> tuple[int, str]:
+        try:
+            import chromadb
+            import os
+            path = os.getenv("CHROMA_DB_PATH", "/app/chroma_db")
+            client = chromadb.PersistentClient(path=path)
+            col = client.get_collection("oss_regulations")
+            return col.count(), "ok"
+        except Exception as exc:
+            return 0, str(exc)[:120]
+
+    chunk_count, chroma_status = await asyncio.get_event_loop().run_in_executor(None, _chroma_count)
+
+    return {
+        "status": "ok",
+        "model": _GEMINI_MODEL,
+        "intent_model": _GEMINI_INTENT_MODEL,
+        "chroma_chunks": chunk_count,
+        "chroma_status": chroma_status,
+    }

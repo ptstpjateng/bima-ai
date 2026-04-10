@@ -6,4 +6,7 @@ python-dotenv==1.0.1
 requests==2.32.3
 httpx==0.28.1
 chromadb==0.6.3
-sentence-transformers>=3.0
+# Pinned to avoid huggingface_hub API breakage (is_offline_mode removed in >=0.28)
+huggingface-hub==0.27.0
+transformers==4.47.0
+sentence-transformers>=3.0,<6.0
