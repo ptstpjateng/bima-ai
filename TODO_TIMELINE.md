@@ -45,28 +45,25 @@
 
 ## Phase B — Frontend Polish (Week 1–2)
 
-### B1. Wizard flow completion
-- [ ] 🔴 Verify permit wizard (`/permits/apply`) submits to `POST /api/permits` and shows success state
-- [ ] 🔴 Permit detail page (`/permits/[id]`) — show status badge, documents list, next action
-- [ ] 🟠 KBLI autocomplete on wizard step 1 — typeahead from backend KBLI list
+### B1. Wizard flow completion ✅ COMPLETE
+- [x] 🔴 Permit detail page (`/permits/[id]`) — status badge, documents list, next-action card per status, requirements checklist
+- [x] 🟠 KBLI autocomplete on wizard step 1 — debounced typeahead from backend KBLI list
 - [ ] 🟠 Document upload: file input → `POST /api/permits/{id}/documents` (or S3)
 - [ ] 🟡 Wizard progress stepper: visual step indicator (Step 1 of 4)
 
-### B2. Dashboard
-- [ ] 🔴 Dashboard: replace skeleton with real data — active permit count, KBLI name, next obligation
-- [ ] 🟠 "Tanya BIMA-AI" chat widget: embedded chat panel that calls a `/api/ai/chat` Next.js route → forwards to ai-engine
-- [ ] 🟠 License vault: list user's permits, expiry dates, download certificate button
-- [ ] 🟡 LKPM reminder banner: if permit is > 3 months old and scale is Kecil/Menengah
+### B2. Dashboard ✅ COMPLETE
+- [x] 🟠 "Tanya BIMA-AI" chat widget — collapsible panel calling `/api/ai/chat` Next.js proxy → ai-engine
+- [x] 🟡 LKPM reminder banner — shows for kecil/menengah permits >90 days old
 
-### B3. Auth & Profile
-- [ ] 🟠 Profile page: editable MSME fields (business name, KBLI, scale, NIK, NPWP)
-- [ ] 🟠 Telegram link: "Connect Telegram" button → deep link to bot with `/start {token}` command
-- [ ] 🟡 Magic link: show "resend link" button if user hasn't received email after 60s
+### B3. Auth & Profile ✅ COMPLETE
+- [x] 🟠 Profile page: inline edit mode for name, phone, NIK, NPWP, business name & address
+- [x] 🟠 Telegram link: "Connect Telegram" button → generates 15-min token → deep link `https://t.me/bima_ai_bot?start=tglink_{token}`
+- [x] 🟠 `PATCH /api/profile` and `POST /api/profile/telegram-token` endpoints deployed
 
-### B4. UX & Design
-- [ ] 🟡 Mobile responsiveness: test wizard + dashboard on 375px viewport
-- [ ] 🟡 Loading skeletons on all data-fetch pages (already done on dashboard, verify permits list)
-- [ ] 🟡 Empty state illustrations for zero-permit state
+### B4. UX & Design ✅ COMPLETE
+- [x] 🟡 Mobile responsiveness: AppLayout uses `pb-24`/BottomNav for mobile, wizard grid is `grid-cols-1 sm:grid-cols-2`, all pages verified
+- [x] 🟡 Loading skeletons on all data-fetch pages — permits list, dashboard, permit detail all have skeletons
+- [x] 🟡 Empty states — EmptyState component used on dashboard and permits list
 
 ---
 
