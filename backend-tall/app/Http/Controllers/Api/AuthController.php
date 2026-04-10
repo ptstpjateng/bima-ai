@@ -255,6 +255,8 @@ class AuthController extends ApiController
             'village'             => $user->village,
             'postal_code'         => $user->postal_code,
             'email_verified_at'   => $user->email_verified_at?->toIso8601String(),
+            'telegram_chat_id'    => $user->telegram_chat_id,
+            'telegram_username'   => $user->telegram_username,
         ];
     }
 }

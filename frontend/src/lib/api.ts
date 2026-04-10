@@ -122,6 +122,32 @@ export async function searchKbli(q: string): Promise<KbliOption[]> {
   return Array.isArray(res.data) ? res.data : [];
 }
 
+// ── Profile ───────────────────────────────────────────────────────────────────
+
+export interface ProfileUpdatePayload {
+  name?: string;
+  phone?: string;
+  nik?: string;
+  npwp?: string;
+  business_name?: string;
+  business_address?: string;
+}
+
+export async function updateProfile(payload: ProfileUpdatePayload): Promise<User> {
+  const res = await request<{ user: User }>("/profile", {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  return res.data.user;
+}
+
+export async function generateTelegramToken(): Promise<string> {
+  const res = await request<{ token: string }>("/profile/telegram-token", {
+    method: "POST",
+  });
+  return res.data.token;
+}
+
 // ── Web chat (portal → Next.js API route → ai-engine) ─────────────────────────
 
 export async function webChat(message: string, userId: number): Promise<string> {

@@ -18,6 +18,7 @@ interface AuthContextValue {
   isAuthenticated: boolean;
   signIn: (token: string, user: User) => void;
   signOut: () => Promise<void>;
+  updateUser: (user: User) => void;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -43,6 +44,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(newUser);
   }, []);
 
+  const updateUser = useCallback((updatedUser: User) => {
+    const storedToken = getToken();
+    if (storedToken) saveAuth(storedToken, updatedUser);
+    setUser(updatedUser);
+  }, []);
+
   const signOut = useCallback(async () => {
     try {
       await apiLogout();
@@ -64,6 +71,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         isAuthenticated: !!token && !!user,
         signIn,
         signOut,
+        updateUser,
       }}
     >
       {children}

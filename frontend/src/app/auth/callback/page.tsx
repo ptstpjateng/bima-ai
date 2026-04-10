@@ -61,6 +61,8 @@ function CallbackContent() {
       village: null,
       postal_code: null,
       email_verified_at: null,
+      telegram_chat_id: null,
+      telegram_username: null,
     };
 
     signIn(apiToken, user);

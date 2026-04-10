@@ -4,6 +4,7 @@ use App\Http\Controllers\Api\AiLogController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\PermitController;
 use App\Http\Controllers\Api\PipelineController;
+use App\Http\Controllers\Api\ProfileController;
 use App\Http\Controllers\Api\UserContextController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -48,6 +49,10 @@ Route::middleware('auth:sanctum')->group(function () {
     // AI Engine: push chat log entries + fetch history for current user
     Route::post('/ai-logs', [AiLogController::class, 'store']);
     Route::get('/ai-logs', [AiLogController::class, 'index']);
+
+    // Profile management
+    Route::patch('/profile', [ProfileController::class, 'update']);
+    Route::post('/profile/telegram-token', [ProfileController::class, 'generateTelegramToken']);
 
     // Permit Applications
     Route::get('/permits/{user_id}', [PermitController::class, 'index'])

@@ -15,6 +15,8 @@ export interface User {
   village: string | null;
   postal_code: string | null;
   email_verified_at: string | null;
+  telegram_chat_id: number | null;
+  telegram_username: string | null;
 }
 
 export type PermitStatus =
