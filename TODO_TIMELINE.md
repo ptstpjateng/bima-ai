@@ -1,8 +1,8 @@
 # BIMA-AI — Todo Checklist & Timeline
 
-> **Project:** DPMPTSP Jawa Tengah Hackathon  
-> **Target event:** TBD (assume 2–3 weeks from 2026-04-10)  
-> **Current date:** 2026-04-10  
+> **Project:** DPMPTSP Jawa Tengah Hackathon
+> **Target event:** TBD (assume 2–3 weeks from 2026-04-10)
+> **Current date:** 2026-04-10
 > **Overall progress:** ~65% complete for core demo loop
 
 ---
@@ -43,51 +43,59 @@
 
 ---
 
-## Phase B — Frontend Polish (Week 1–2)
+## Phase B — Frontend Polish ✅ COMPLETE
 
-### B1. Wizard flow completion ✅ COMPLETE
-- [x] 🔴 Permit detail page (`/permits/[id]`) — status badge, documents list, next-action card per status, requirements checklist
-- [x] 🟠 KBLI autocomplete on wizard step 1 — debounced typeahead from backend KBLI list
-- [ ] 🟠 Document upload: file input → `POST /api/permits/{id}/documents` (or S3)
-- [ ] 🟡 Wizard progress stepper: visual step indicator (Step 1 of 4)
+### B1. Wizard flow completion ✅
+- [x] 🔴 Permit wizard submits to `POST /api/permits/apply` — shows success state with application number
+- [x] 🔴 Permit detail page (`/permits/[id]`) — fetches full data from `GET /api/permits/detail/{id}`, shows status badge, next-action card, documents list, requirements checklist
+- [x] 🟠 KBLI typeahead on wizard step 1 — 300ms debounce, click-outside close, auto-fills code/description/section
+- [ ] 🟠 Document upload: file input → storage (skipped — demo uses pre-seeded data)
+- [ ] 🟡 Wizard progress stepper (skipped — steps already labelled in header)
 
-### B2. Dashboard ✅ COMPLETE
-- [x] 🟠 "Tanya BIMA-AI" chat widget — collapsible panel calling `/api/ai/chat` Next.js proxy → ai-engine
-- [x] 🟡 LKPM reminder banner — shows for kecil/menengah permits >90 days old
+### B2. Dashboard ✅
+- [x] 🔴 Dashboard shows real permit data via SWR — permit count, status, KBLI name
+- [x] 🟠 "Tanya BIMA-AI" chat widget — collapsible, server-token-validated, starter prompts, typing indicator
+- [x] 🟡 LKPM reminder banner — fires for kecil/menengah permits >90 days old
 
-### B3. Auth & Profile ✅ COMPLETE
-- [x] 🟠 Profile page: inline edit mode for name, phone, NIK, NPWP, business name & address
-- [x] 🟠 Telegram link: "Connect Telegram" button → generates 15-min token → deep link `https://t.me/bima_ai_bot?start=tglink_{token}`
-- [x] 🟠 `PATCH /api/profile` and `POST /api/profile/telegram-token` endpoints deployed
+### B3. Auth & Profile ✅
+- [x] 🟠 Profile edit mode — inline form for name, phone, NIK, NPWP, business name, address via `PATCH /api/profile`
+- [x] 🟠 Telegram connect — generates 15-min token → deep link `https://t.me/bima_ai_bot?start=tglink_{token}`; shows linked badge if already connected
 
-### B4. UX & Design ✅ COMPLETE
-- [x] 🟡 Mobile responsiveness: AppLayout uses `pb-24`/BottomNav for mobile, wizard grid is `grid-cols-1 sm:grid-cols-2`, all pages verified
-- [x] 🟡 Loading skeletons on all data-fetch pages — permits list, dashboard, permit detail all have skeletons
-- [x] 🟡 Empty states — EmptyState component used on dashboard and permits list
+### B4. UX & Design ✅
+- [x] 🟡 Mobile responsive — AppLayout uses BottomNav + `pb-24`, all grids use `sm:grid-cols-2`
+- [x] 🟡 Skeletons on all data-fetch pages (dashboard, permits list, permit detail)
+- [x] 🟡 EmptyState component used on dashboard zero-permit and filtered permits list
+
+### Security hardening (added during B) ✅
+- [x] CORS locked to `FRONTEND_URL` — no more wildcard `*`
+- [x] `/api/ai/chat` validates Bearer token against `/api/auth/me` before forwarding; user_id is server-extracted
+- [x] `GET /api/permits/detail/{id}` with MSME ownership enforcement
+- [x] `throttle:120,1` on all `auth:sanctum` routes
+- [x] Document path validated as URL; type restricted to enum; notes capped at 2000 chars
 
 ---
 
-## Phase C — Backend & Admin (Week 1–2)
+## Phase C — Backend & Admin ✅ COMPLETE
 
-### C1. Telegram account linking
-- [ ] 🔴 Handle `/start {token}` Telegram bot command → link `telegram_id` to user account
-  - When user clicks "Connect Telegram" on portal, generate a one-time token
-  - `/start TOKEN` in Telegram → backend verifies token → stores `telegram_id` on user
-- [ ] 🟠 After linking, Telegram messages use user profile for personalized RAG queries
+### C1. Telegram account linking ✅
+- [x] 🔴 `POST /api/internal/telegram/link` — validates `tglink_{token}` (15-min TTL), binds `telegram_chat_id`, prevents duplicate linking (409)
+- [x] 🔴 Bot detects `/start tglink_{TOKEN}` → calls backend link → sends confirmation or error message
+- [x] 🟠 Bot `/start` (no token) → onboarding welcome message
+- [x] 🟠 After linking, `user-context` API returns `telegram_chat_id` — AI can reference Telegram identity
 
-### C2. Business profile population
-- [ ] 🟠 Trigger business record creation when user completes permit wizard step 1
-- [ ] 🟠 `user-context` API: return `businesses` array so AI handler can personalize responses
+### C2. Business profile population ✅
+- [x] 🟠 `PermitController@apply` upserts primary `Business` record in same DB transaction — syncs kbli_code, scale, revenue, employee_count, location
+- [x] 🟠 `UserContextController@show` already returns `businesses[]` — AI personalization fully wired
 
-### C3. Filament admin improvements
-- [ ] 🟡 AI Interactions viewer: add full conversation thread view (group by `session_id`)
-- [ ] 🟡 KBLI Scrape Targets: add "Re-scrape" action button for failed/outdated entries
-- [ ] 🟡 Dashboard widgets: total messages today, active users, ChromaDB chunk count
+### C3. Filament admin improvements ✅
+- [x] 🟡 AI Interactions table: session thread filter (filter by session_id), "view thread" action, today-only toggle, 30s live poll
+- [x] 🟡 KBLI Scrape Targets: re-scrape action + bulk re-queue already present
+- [x] 🟡 New `UserStatsWidget`: UMKM users, Telegram-linked count, active users (24h), pending/approved permits
+- [x] 🟡 `PipelineStatsWidget` already shows messages today + ChromaDB chunks
 
-### C4. API hardening
-- [ ] 🟠 Validate `X-Internal-Key` header on all `/api/internal/*` routes (already done — verify in tests)
-- [ ] 🟡 Add `POST /api/ai/chat` route on Laravel → proxies to ai-engine → used by frontend chat widget
-- [ ] 🟡 Permit status webhook: when permit status changes → send Telegram notification to user
+### C4. API hardening ✅
+- [x] 🟠 X-Internal-Key validated with `hash_equals` on all `/api/internal/*` routes
+- [x] 🟡 Permit status → Telegram notification: `PermitApplicationObserver` sends formatted Telegram message on approved/rejected/additional_docs/under_review status changes
 
 ---
 
