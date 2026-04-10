@@ -53,4 +53,20 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/permits/{user_id}', [PermitController::class, 'index'])
         ->whereNumber('user_id');
     Route::post('/permits/apply', [PermitController::class, 'apply']);
+
+    // KBLI search — returns scraped KBLI codes with descriptions for autocomplete.
+    // ?q= filters by code or description (min 2 chars), returns up to 10 results.
+    Route::get('/kbli', function (Request $request) {
+        $q = trim((string) $request->query('q', ''));
+        $query = \App\Models\KbliScrapeTarget::where('status', 'done')
+            ->orderBy('kbli_code');
+        if (mb_strlen($q) >= 2) {
+            $query->where(function ($sub) use ($q) {
+                $sub->where('kbli_code', 'like', "%{$q}%")
+                    ->orWhere('kbli_description', 'like', "%{$q}%");
+            });
+        }
+        $items = $query->limit(10)->get(['kbli_code', 'kbli_description', 'sector']);
+        return response()->json(['success' => true, 'data' => $items]);
+    });
 });

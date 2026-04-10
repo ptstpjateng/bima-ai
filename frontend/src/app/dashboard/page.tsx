@@ -1,11 +1,12 @@
 "use client";
 
-import { PlusCircle } from "lucide-react";
+import { AlertCircle, PlusCircle } from "lucide-react";
 import Link from "next/link";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { WelcomeCard } from "@/components/dashboard/WelcomeCard";
 import { LicensingProgress } from "@/components/dashboard/LicensingProgress";
 import { AiActivityFeed } from "@/components/dashboard/AiActivityFeed";
+import { ChatWidget } from "@/components/dashboard/ChatWidget";
 import { PermitCard } from "@/components/permits/PermitCard";
 import {
   CardSkeleton,
@@ -15,6 +16,21 @@ import { EmptyState } from "@/components/shared/EmptyState";
 import { useAuth } from "@/context/AuthContext";
 import { usePermits } from "@/hooks/usePermits";
 import { useAiLogs } from "@/hooks/useAiLogs";
+import type { PermitApplication } from "@/types";
+
+// LKPM applies to kecil/menengah scale permits approved > 90 days ago
+function getLkpmAlert(permits: PermitApplication[]): PermitApplication | null {
+  const now = Date.now();
+  const ninetyDays = 90 * 24 * 60 * 60 * 1000;
+  return (
+    permits.find((p) => {
+      if (p.status !== "approved") return false;
+      if (!["kecil", "menengah"].includes(p.business_scale)) return false;
+      const ref = p.approved_at ?? p.created_at;
+      return now - new Date(ref).getTime() > ninetyDays;
+    }) ?? null
+  );
+}
 
 export default function DashboardPage() {
   const { user } = useAuth();
@@ -23,10 +39,29 @@ export default function DashboardPage() {
 
   const recentPermits = permits.slice(0, 3);
   const hasAiSession = interactions.length > 0;
+  const lkpmAlert = getLkpmAlert(permits);
 
   return (
     <AppLayout>
       <div className="space-y-5">
+        {/* LKPM reminder banner */}
+        {lkpmAlert && (
+          <div className="flex items-start gap-3 rounded-2xl border border-orange-200 bg-orange-50 p-4">
+            <AlertCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-orange-500" />
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-orange-800">
+                Pengingat Laporan LKPM
+              </p>
+              <p className="mt-0.5 text-xs text-orange-700">
+                Izin usaha{" "}
+                <strong>{lkpmAlert.kbli_description}</strong> ({lkpmAlert.kbli_code})
+                sudah aktif lebih dari 90 hari. Pastikan laporan kegiatan penanaman modal
+                (LKPM) triwulan Anda sudah disampaikan ke OSS.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Welcome banner */}
         {user ? (
           <WelcomeCard user={user} permits={permits} />
@@ -96,6 +131,9 @@ export default function DashboardPage() {
             </div>
           </div>
         </div>
+
+        {/* BIMA-AI Chat Widget */}
+        {user && <ChatWidget userId={user.id} />}
 
         {/* AI Activity Feed */}
         <AiActivityFeed interactions={interactions} isLoading={logsLoading} />

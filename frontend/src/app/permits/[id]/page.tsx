@@ -4,10 +4,17 @@ import {
   ArrowLeft,
   Building2,
   Calendar,
+  CheckCircle2,
+  ChevronRight,
+  Circle,
+  Clock,
+  Download,
   FileText,
   Hash,
   MapPin,
+  PlusCircle,
   Users,
+  XCircle,
 } from "lucide-react";
 import Link from "next/link";
 import { use } from "react";
@@ -22,6 +29,7 @@ import {
   formatDate,
 } from "@/lib/utils";
 import { Skeleton } from "@/components/shared/LoadingSkeleton";
+import type { PermitApplication } from "@/types";
 
 interface Props {
   params: Promise<{ id: string }>;
@@ -46,6 +54,129 @@ function InfoRow({
       <div className="flex-1 min-w-0">
         <p className="text-xs font-medium text-gray-500">{label}</p>
         <p className="mt-0.5 text-sm text-gray-900">{value || "-"}</p>
+      </div>
+    </div>
+  );
+}
+
+function NextActionCard({ permit }: { permit: PermitApplication }) {
+  const config: Record<
+    string,
+    { icon: React.ElementType; color: string; title: string; body: string; href?: string; cta?: string }
+  > = {
+    draft: {
+      icon: PlusCircle,
+      color: "blue",
+      title: "Lengkapi Permohonan",
+      body: "Permohonan Anda masih berstatus draf. Lanjutkan pengisian formulir untuk mengajukan izin.",
+      href: "/permits/apply",
+      cta: "Lanjutkan Pengisian",
+    },
+    submitted: {
+      icon: Clock,
+      color: "indigo",
+      title: "Menunggu Peninjauan",
+      body: "Permohonan Anda telah diterima dan sedang menunggu antrian peninjauan oleh petugas DPMPTSP.",
+    },
+    under_review: {
+      icon: Clock,
+      color: "yellow",
+      title: "Sedang Diproses",
+      body: "Petugas sedang memeriksa kelengkapan dan kebenaran dokumen Anda. Harap tunggu notifikasi selanjutnya.",
+    },
+    additional_docs_required: {
+      icon: FileText,
+      color: "orange",
+      title: "Unggah Dokumen Tambahan",
+      body: "Petugas membutuhkan dokumen tambahan. Silakan siapkan dokumen yang diminta dan hubungi petugas DPMPTSP.",
+    },
+    approved: {
+      icon: CheckCircle2,
+      color: "green",
+      title: "Kewajiban Pasca Izin",
+      body: "Izin usaha Anda telah aktif. Pastikan Anda memenuhi kewajiban pelaporan LKPM setiap triwulan melalui portal OSS.",
+      href: "https://oss.go.id",
+      cta: "Buka Portal OSS",
+    },
+    rejected: {
+      icon: XCircle,
+      color: "red",
+      title: "Ajukan Permohonan Baru",
+      body: "Permohonan Anda ditolak. Perbaiki kekurangan yang disebutkan dalam catatan penolakan, lalu ajukan permohonan baru.",
+      href: "/permits/apply",
+      cta: "Ajukan Ulang",
+    },
+  };
+
+  const cfg = config[permit.status];
+  if (!cfg) return null;
+
+  const Icon = cfg.icon;
+  const colorMap: Record<string, string> = {
+    blue: "border-blue-200 bg-blue-50",
+    indigo: "border-indigo-200 bg-indigo-50",
+    yellow: "border-yellow-200 bg-yellow-50",
+    orange: "border-orange-200 bg-orange-50",
+    green: "border-green-200 bg-green-50",
+    red: "border-red-200 bg-red-50",
+  };
+  const iconColorMap: Record<string, string> = {
+    blue: "text-blue-600",
+    indigo: "text-indigo-600",
+    yellow: "text-yellow-600",
+    orange: "text-orange-600",
+    green: "text-green-600",
+    red: "text-red-600",
+  };
+  const titleColorMap: Record<string, string> = {
+    blue: "text-blue-900",
+    indigo: "text-indigo-900",
+    yellow: "text-yellow-900",
+    orange: "text-orange-900",
+    green: "text-green-900",
+    red: "text-red-900",
+  };
+  const bodyColorMap: Record<string, string> = {
+    blue: "text-blue-700",
+    indigo: "text-indigo-700",
+    yellow: "text-yellow-700",
+    orange: "text-orange-700",
+    green: "text-green-700",
+    red: "text-red-700",
+  };
+  const ctaColorMap: Record<string, string> = {
+    blue: "bg-blue-600 hover:bg-blue-700",
+    indigo: "bg-indigo-600 hover:bg-indigo-700",
+    yellow: "bg-yellow-600 hover:bg-yellow-700",
+    orange: "bg-orange-600 hover:bg-orange-700",
+    green: "bg-green-600 hover:bg-green-700",
+    red: "bg-red-600 hover:bg-red-700",
+  };
+
+  return (
+    <div className={cn("rounded-2xl border p-5", colorMap[cfg.color])}>
+      <div className="flex items-start gap-3">
+        <Icon className={cn("mt-0.5 h-5 w-5 flex-shrink-0", iconColorMap[cfg.color])} />
+        <div className="flex-1">
+          <p className={cn("text-sm font-bold", titleColorMap[cfg.color])}>{cfg.title}</p>
+          <p className={cn("mt-0.5 text-xs leading-relaxed", bodyColorMap[cfg.color])}>
+            {cfg.body}
+          </p>
+          {cfg.href && cfg.cta && (
+            <Link
+              href={cfg.href}
+              target={cfg.href.startsWith("http") ? "_blank" : undefined}
+              rel={cfg.href.startsWith("http") ? "noopener noreferrer" : undefined}
+              className={cn(
+                "mt-3 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold text-white transition-colors",
+                ctaColorMap[cfg.color],
+              )}
+            >
+              {cfg.cta}
+              <ChevronRight className="h-3 w-3" />
+            </Link>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -85,6 +216,9 @@ export default function PermitDetailPage({ params }: Props) {
           </div>
         ) : (
           <>
+            {/* Next action guidance */}
+            <NextActionCard permit={permit} />
+
             {/* Header card */}
             <div className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm">
               <div className="mb-4 flex items-start justify-between gap-3">
@@ -262,6 +396,73 @@ export default function PermitDetailPage({ params }: Props) {
                 <p className="text-sm text-gray-600 leading-relaxed">
                   {permit.applicant_notes}
                 </p>
+              </div>
+            )}
+
+            {/* Requirements checklist */}
+            {permit.requirements_checklist && permit.requirements_checklist.length > 0 && (
+              <div className="rounded-2xl border border-gray-100 bg-white p-5 shadow-sm">
+                <h2 className="mb-3 text-sm font-bold text-gray-900">
+                  Persyaratan & Checklist
+                </h2>
+                <ul className="space-y-2">
+                  {permit.requirements_checklist.map((item, i) => (
+                    <li key={i} className="flex items-start gap-2.5">
+                      {item.completed ? (
+                        <CheckCircle2 className="mt-0.5 h-4 w-4 flex-shrink-0 text-green-500" />
+                      ) : (
+                        <Circle className="mt-0.5 h-4 w-4 flex-shrink-0 text-gray-300" />
+                      )}
+                      <div>
+                        <p className={cn("text-sm", item.completed ? "text-gray-700" : "text-gray-500")}>
+                          {item.label}
+                        </p>
+                        {item.notes && (
+                          <p className="mt-0.5 text-xs text-gray-400">{item.notes}</p>
+                        )}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Documents */}
+            {permit.documents && permit.documents.length > 0 && (
+              <div className="rounded-2xl border border-gray-100 bg-white p-5 shadow-sm">
+                <h2 className="mb-3 text-sm font-bold text-gray-900">
+                  Dokumen Permohonan
+                </h2>
+                <ul className="space-y-2">
+                  {permit.documents.map((doc, i) => (
+                    <li
+                      key={i}
+                      className="flex items-center justify-between gap-3 rounded-xl border border-gray-100 px-4 py-2.5"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <FileText className="h-4 w-4 flex-shrink-0 text-brand-500" />
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium text-gray-800">
+                            {doc.name}
+                          </p>
+                          <p className="text-xs text-gray-400 capitalize">
+                            {doc.type}
+                            {doc.uploaded_at ? ` · ${formatDate(doc.uploaded_at)}` : ""}
+                          </p>
+                        </div>
+                      </div>
+                      <a
+                        href={doc.path}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex-shrink-0 rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors"
+                        title="Unduh dokumen"
+                      >
+                        <Download className="h-4 w-4" />
+                      </a>
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
           </>

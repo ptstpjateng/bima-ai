@@ -89,6 +89,12 @@ export interface AiInteraction {
   created_at: string;
 }
 
+export interface KbliOption {
+  kbli_code: string;
+  kbli_description: string | null;
+  sector: string | null;
+}
+
 export interface ApiResponse<T> {
   success: boolean;
   message: string;

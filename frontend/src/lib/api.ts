@@ -2,6 +2,7 @@ import type {
   ApiResponse,
   AuthPayload,
   AiInteraction,
+  KbliOption,
   PermitApplication,
   PermitApplyPayload,
   User,
@@ -110,6 +111,31 @@ export async function applyPermit(payload: PermitApplyPayload): Promise<{
 export async function fetchAiLogs(): Promise<AiInteraction[]> {
   const res = await request<{ interactions: AiInteraction[]; total: number }>("/ai-logs");
   return res.data.interactions;
+}
+
+// ── KBLI search ───────────────────────────────────────────────────────────────
+
+export async function searchKbli(q: string): Promise<KbliOption[]> {
+  const res = await request<KbliOption[]>(`/kbli?q=${encodeURIComponent(q)}`);
+  // Backend returns { success, data: [...] } — data key holds the array
+  // The generic request<T> returns body.data, which here is the array directly
+  return Array.isArray(res.data) ? res.data : [];
+}
+
+// ── Web chat (portal → Next.js API route → ai-engine) ─────────────────────────
+
+export async function webChat(message: string, userId: number): Promise<string> {
+  const res = await fetch("/api/ai/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, user_id: `web-${userId}` }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { message?: string }).message ?? "Gagal menghubungi asisten AI");
+  }
+  const data = (await res.json()) as { response: string };
+  return data.response;
 }
 
 // ── SWR fetcher helper ────────────────────────────────────────────────────────

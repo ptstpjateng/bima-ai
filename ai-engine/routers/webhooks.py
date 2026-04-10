@@ -24,7 +24,9 @@ from fastapi import APIRouter, BackgroundTasks, Header, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError, field_validator
 
-from services.ai_handler import process_message
+import time as _time
+
+from services.ai_handler import generate_ai_response, process_message
 
 load_dotenv()
 
@@ -388,3 +390,59 @@ async def telegram_webhook(
         )
 
     return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Web chat endpoint — synchronous, called by the Next.js portal
+# ---------------------------------------------------------------------------
+
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+
+    @field_validator("user_id")
+    @classmethod
+    def user_id_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("user_id must not be empty")
+        return v.strip()
+
+    @field_validator("message")
+    @classmethod
+    def message_must_not_be_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("message must not be empty")
+        if len(v) > 2000:
+            raise ValueError("message too long (max 2000 chars)")
+        return v
+
+
+@router.post("/webhook/chat", status_code=status.HTTP_200_OK)
+async def web_chat(body: ChatRequest) -> JSONResponse:
+    """
+    Synchronous web chat for the Next.js portal.
+    Accepts { user_id, message } and returns { response, elapsed }.
+    user_id should be prefixed with "web-" to keep history separate from
+    Telegram/WhatsApp sessions.
+    """
+    request_id = str(__import__("uuid").uuid4())
+    logger.info(
+        "Web chat | user_id=%s | msg_len=%d | request_id=%s",
+        body.user_id, len(body.message), request_id,
+    )
+    t0 = _time.monotonic()
+    try:
+        response = await generate_ai_response(body.user_id, body.message)
+        elapsed = round(_time.monotonic() - t0, 2)
+        logger.info(
+            "Web chat done | user_id=%s | elapsed=%.2fs | request_id=%s",
+            body.user_id, elapsed, request_id,
+        )
+        return JSONResponse({"response": response, "elapsed": elapsed})
+    except Exception:
+        logger.exception("Web chat failed | user_id=%s | request_id=%s", body.user_id, request_id)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=_error_body(500, "Gagal memproses pesan. Silakan coba lagi."),
+        )

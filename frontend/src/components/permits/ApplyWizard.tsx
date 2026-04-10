@@ -5,11 +5,12 @@ import {
   ArrowRight,
   CheckCircle2,
   Loader2,
+  Search,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
-import type { BusinessScale, PermitApplyPayload, RiskLevel } from "@/types";
-import { applyPermit } from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import type { BusinessScale, KbliOption, PermitApplyPayload, RiskLevel } from "@/types";
+import { applyPermit, searchKbli } from "@/lib/api";
 import {
   RISK_LABELS,
   SCALE_LABELS,
@@ -156,9 +157,56 @@ function Textarea({ id, value, onChange, placeholder }: {
   );
 }
 
-// ── Step 1: KBLI Classification ────────────────────────────────────────────────
+// ── Step 1: KBLI Classification with typeahead ─────────────────────────────────
 
 function Step1({ state, update }: { state: WizardState; update: (k: keyof WizardState, v: string) => void }) {
+  const [query, setQuery] = useState(state.kbli_code);
+  const [results, setResults] = useState<KbliOption[]>([]);
+  const [showDropdown, setShowDropdown] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Debounced search
+  useEffect(() => {
+    if (query.length < 2) {
+      setResults([]);
+      setShowDropdown(false);
+      return;
+    }
+    setSearching(true);
+    const timer = setTimeout(async () => {
+      try {
+        const data = await searchKbli(query);
+        setResults(data);
+        setShowDropdown(data.length > 0);
+      } catch {
+        // silently ignore search errors
+      } finally {
+        setSearching(false);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    function handler(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setShowDropdown(false);
+      }
+    }
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  function selectOption(opt: KbliOption) {
+    update("kbli_code", opt.kbli_code);
+    update("kbli_description", opt.kbli_description ?? "");
+    update("kbli_section", opt.sector ?? "");
+    setQuery(opt.kbli_code);
+    setShowDropdown(false);
+  }
+
   return (
     <div className="space-y-5">
       <div>
@@ -166,49 +214,108 @@ function Step1({ state, update }: { state: WizardState; update: (k: keyof Wizard
           Klasifikasi Bidang Usaha (KBLI)
         </h3>
         <p className="text-sm text-gray-500">
-          Masukkan kode KBLI (5 digit) dan deskripsi bidang usaha Anda.
-          Jika ragu, konsultasikan dengan asisten BIMA-AI via WhatsApp.
+          Cari kode KBLI berdasarkan kode atau nama bidang usaha Anda.
         </p>
       </div>
 
-      <div>
-        <Label htmlFor="kbli_code" required>Kode KBLI</Label>
-        <Input
-          id="kbli_code"
-          value={state.kbli_code}
-          onChange={(v) => update("kbli_code", v)}
-          placeholder="Contoh: 56101"
-        />
-        <p className="mt-1 text-xs text-gray-400">
-          Kode KBLI 5 digit sesuai Klasifikasi Baku Lapangan Usaha Indonesia
-        </p>
+      {/* KBLI typeahead */}
+      <div ref={containerRef} className="relative">
+        <Label htmlFor="kbli_search" required>Kode / Nama KBLI</Label>
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+          {searching && (
+            <Loader2 className="absolute right-3.5 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-brand-500" />
+          )}
+          <input
+            id="kbli_search"
+            type="text"
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              // If user clears the field, reset state fields too
+              if (!e.target.value) {
+                update("kbli_code", "");
+                update("kbli_description", "");
+                update("kbli_section", "");
+              }
+            }}
+            onFocus={() => results.length > 0 && setShowDropdown(true)}
+            placeholder="Cari: 56102 atau warung makan..."
+            autoComplete="off"
+            className="w-full rounded-xl border border-gray-200 bg-white py-2.5 pl-10 pr-10 text-sm text-gray-900 placeholder-gray-400 outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+          />
+        </div>
+
+        {/* Dropdown */}
+        {showDropdown && (
+          <div className="absolute z-20 mt-1 w-full overflow-hidden rounded-xl border border-gray-200 bg-white shadow-lg">
+            {results.map((opt) => (
+              <button
+                key={opt.kbli_code}
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => selectOption(opt)}
+                className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-brand-50 transition-colors"
+              >
+                <span className="mt-0.5 flex-shrink-0 rounded-md bg-brand-100 px-2 py-0.5 font-mono text-xs font-bold text-brand-700">
+                  {opt.kbli_code}
+                </span>
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-gray-900">
+                    {opt.kbli_description ?? "–"}
+                  </p>
+                  {opt.sector && (
+                    <p className="truncate text-xs text-gray-400">{opt.sector}</p>
+                  )}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
-      <div>
-        <Label htmlFor="kbli_description" required>Deskripsi Bidang Usaha</Label>
-        <Input
-          id="kbli_description"
-          value={state.kbli_description}
-          onChange={(v) => update("kbli_description", v)}
-          placeholder="Contoh: Restoran dan Rumah Makan"
-        />
-      </div>
+      {/* Selected KBLI preview */}
+      {state.kbli_code && (
+        <div className="rounded-xl border border-green-200 bg-green-50 p-3">
+          <p className="text-xs font-medium text-green-700">KBLI dipilih</p>
+          <p className="mt-0.5 text-sm font-semibold text-green-900">
+            {state.kbli_code} — {state.kbli_description || "—"}
+          </p>
+          {state.kbli_section && (
+            <p className="text-xs text-green-600">{state.kbli_section}</p>
+          )}
+        </div>
+      )}
 
-      <div>
-        <Label htmlFor="kbli_section">Sektor / Kelompok KBLI</Label>
-        <Input
-          id="kbli_section"
-          value={state.kbli_section}
-          onChange={(v) => update("kbli_section", v)}
-          placeholder="Contoh: Penyediaan Makanan dan Minuman"
-        />
-      </div>
+      {/* Manual override fields (collapsed under the selected state) */}
+      {!state.kbli_code && (
+        <div className="space-y-4">
+          <div>
+            <Label htmlFor="kbli_description" required>Deskripsi Bidang Usaha</Label>
+            <Input
+              id="kbli_description"
+              value={state.kbli_description}
+              onChange={(v) => update("kbli_description", v)}
+              placeholder="Contoh: Restoran dan Rumah Makan"
+            />
+          </div>
+          <div>
+            <Label htmlFor="kbli_section">Sektor / Kelompok KBLI</Label>
+            <Input
+              id="kbli_section"
+              value={state.kbli_section}
+              onChange={(v) => update("kbli_section", v)}
+              placeholder="Contoh: Penyediaan Makanan dan Minuman"
+            />
+          </div>
+        </div>
+      )}
 
       <div className="rounded-xl border border-brand-100 bg-brand-50 p-4">
         <p className="text-xs font-medium text-brand-700">💡 Tips</p>
         <p className="mt-1 text-xs text-brand-600">
-          Asisten BIMA-AI di WhatsApp telah membantu mengidentifikasi kode KBLI Anda.
-          Periksa riwayat chat untuk melihat rekomendasi kode yang tepat.
+          Gunakan kolom di atas untuk mencari kode KBLI. Jika tidak menemukan kode Anda,
+          konsultasikan dengan asisten BIMA-AI atau petugas DPMPTSP.
         </p>
       </div>
     </div>
