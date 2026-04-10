@@ -38,6 +38,9 @@ WORKDIR /var/www/html
 # Copy pre-built vendor from the composer stage
 COPY --from=vendor /app/vendor ./vendor
 
+# PHP upload / execution limits override
+COPY php/uploads.ini /usr/local/etc/php/conf.d/uploads.ini
+
 # Copy application source
 COPY . .
 

@@ -45,8 +45,7 @@ class PdfParseJobForm
                         ->directory('pdf_datasets/kbli')
                         ->visibility('private')
                         ->acceptedFileTypes(['application/pdf'])
-                        ->maxSize(102400)  // 100 MB
-                        ->required(),
+                        ->maxSize(307200),  // 300 MB
 
                     FileUpload::make('pb_umku_pdf_path')
                         ->label('PB-UMKU Detail PDF')
@@ -55,8 +54,7 @@ class PdfParseJobForm
                         ->directory('pdf_datasets/pb_umku')
                         ->visibility('private')
                         ->acceptedFileTypes(['application/pdf'])
-                        ->maxSize(204800)  // 200 MB (PB-UMKU table PDFs can be very large)
-                        ->required(),
+                        ->maxSize(307200),  // 300 MB
                 ]),
 
         ]);
