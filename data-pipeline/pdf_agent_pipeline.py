@@ -1,17 +1,21 @@
 """
-BIMA-AI — Multi-Agent PDF Parsing Pipeline
-==========================================
+BIMA-AI — Multi-Agent PDF Parsing Pipeline  (Deterministic + AI Hybrid)
+========================================================================
 
 Processes government OSS PDFs (KBLI Detail + PB-UMKU Detail) through a
 3-agent pipeline and vectorizes the merged output into ChromaDB.
 
 Agents
 ------
-  Agent 1 (Extractor)   — PDF → structured Markdown using pdfplumber + Gemini 2.5 Flash
-  Agent 2 (Structurer)  — Markdown → validated JSON (KbliDetailEnriched) with
-                          matching logic between KBLI and PB-UMKU tables.
-                          Self-healing: retry loop with error feedback if LLM output
-                          fails Pydantic validation.
+  Agent 1 (Extractor)   — PDF → Pandas DataFrame using pdfplumber only.
+                          NO LLM CALL. Pure deterministic table extraction.
+  Agent 2 (Structurer)  — DataFrames → validated JSON (KbliDetailEnriched).
+                          Pandas handles: cleaning, forward-fill of merged cells,
+                          and left-join merge on Nomenklatur/Nama Izin.
+                          LLM ONLY used per-record to map the condensed dict to
+                          our exact Pydantic schema (tiny prompt, ~500–1500 tokens
+                          vs 50,000+ tokens in the old all-markdown approach).
+                          Self-healing: retry loop with error feedback.
   Agent 3 (Ingestor)    — JSON → ChromaDB embeddings + PostgreSQL status update
 
 Usage
@@ -30,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import hashlib
 import json
 import logging
@@ -43,6 +46,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import pandas as pd
 import pdfplumber
 from pydantic import BaseModel, Field, ValidationError
 
@@ -164,7 +168,6 @@ async def _call_gemini(prompt: str, max_retries: int = 4) -> str:
                     continue
                 resp.raise_for_status()
                 data = resp.json()
-                # Extract text from response
                 candidates = data.get("candidates", [])
                 if not candidates:
                     raise ValueError("Gemini returned no candidates")
@@ -183,7 +186,6 @@ def _strip_markdown_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
-        # Remove first and last fence lines
         lines = lines[1:] if lines[0].startswith("```") else lines
         lines = lines[:-1] if lines and lines[-1].strip() == "```" else lines
         text = "\n".join(lines).strip()
@@ -277,16 +279,17 @@ async def _report_fail(job_id: int, error: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Agent 1 — Extractor (PDF → structured Markdown)
+# Legacy helpers — kept for test_agents.py compatibility
 # ---------------------------------------------------------------------------
 
 
 def _extract_pdf_text(pdf_path: Path) -> list[dict]:
     """
     Extract text and table content from each PDF page using pdfplumber.
+    Returns a list of page dicts: { page_num, text, table_text, combined, char_count }
 
-    Returns a list of page dicts:
-      { page_num, text, table_text, combined }
+    NOTE: This is the legacy per-page text extractor used by test_agents.py.
+    The main pipeline now uses extract_tables_with_plumber() instead.
     """
     pages = []
     with pdfplumber.open(str(pdf_path)) as pdf:
@@ -295,7 +298,6 @@ def _extract_pdf_text(pdf_path: Path) -> list[dict]:
         for i, page in enumerate(pdf.pages):
             raw_text = page.extract_text() or ""
 
-            # Extract table data using pdfplumber's table parser
             table_md = ""
             try:
                 tables = page.extract_tables() or []
@@ -324,108 +326,6 @@ def _extract_pdf_text(pdf_path: Path) -> list[dict]:
     return pages
 
 
-async def _gemini_pages_to_markdown(
-    pages_content: str,
-    doc_type: str,
-    chunk_idx: int,
-) -> str:
-    """Ask Gemini to convert raw page dump to structured Markdown tables."""
-    if doc_type == "kbli":
-        instructions = (
-            "Ekstrak semua entri KBLI dari teks halaman PDF ini.\n"
-            "Untuk setiap KBLI, hasilkan:\n"
-            "## KBLI [kode] — [nama singkat]\n"
-            "**Uraian:** [teks uraian]\n"
-            "**Ruang Lingkup:** [tabel per skala usaha]\n"
-            "**PB-UMKU Diperlukan:** [daftar nama PB-UMKU]\n"
-            "Pertahankan informasi selengkap mungkin. Jika ada tabel, representasikan "
-            "sebagai tabel Markdown dengan header yang jelas."
-        )
-    else:  # pb_umku
-        instructions = (
-            "Ekstrak semua entri PB-UMKU dari teks halaman PDF ini.\n"
-            "Untuk setiap entri PB-UMKU, hasilkan:\n"
-            "## [Nama Izin PB-UMKU]\n"
-            "| Kolom | Nilai |\n|---|---|\n"
-            "| Persyaratan | ... |\n"
-            "| Jangka Waktu | ... |\n"
-            "| Kewajiban | ... |\n"
-            "| Parameter Pemenuhan | ... |\n"
-            "| Kewenangan | ... |\n"
-            "| Waktu Pemenuhan | ... |\n"
-            "| Biaya | ... |\n"
-            "| Sanksi | ... |\n"
-            "Pertahankan semua detail. Jika sel kosong, tulis '—'."
-        )
-
-    prompt = (
-        f"Kamu adalah asisten ekstraksi dokumen pemerintah Indonesia yang presisi.\n"
-        f"Tugas: {instructions}\n\n"
-        f"--- KONTEN PDF (Chunk {chunk_idx + 1}) ---\n"
-        f"{pages_content}\n"
-        f"--- AKHIR KONTEN ---\n\n"
-        f"Hasilkan HANYA Markdown terstruktur tanpa penjelasan tambahan."
-    )
-    return await _call_gemini(prompt)
-
-
-async def extractor_agent(pdf_path: Path, doc_type: str) -> str:
-    """
-    Agent 1: Extract PDF content into structured Markdown.
-
-    Strategy:
-      1. pdfplumber extracts text + table cells per page.
-      2. Pages are batched (30 per chunk) and sent to Gemini for Markdown formatting.
-      3. Results are concatenated with page-break markers.
-
-    Args:
-        pdf_path: Absolute path to the PDF file.
-        doc_type: 'kbli' | 'pb_umku' — drives the extraction prompt.
-
-    Returns:
-        Combined Markdown string.
-    """
-    logger.info("[Agent 1] Extracting %s PDF: %s", doc_type.upper(), pdf_path.name)
-    pages = _extract_pdf_text(pdf_path)
-
-    CHUNK_SIZE = 30
-    all_markdown: list[str] = []
-
-    page_chunks = [pages[i: i + CHUNK_SIZE] for i in range(0, len(pages), CHUNK_SIZE)]
-    logger.info("[Agent 1] Processing %d chunks of ≤%d pages", len(page_chunks), CHUNK_SIZE)
-
-    for chunk_idx, chunk in enumerate(page_chunks):
-        combined_text = "\n\n".join(p["combined"] for p in chunk)
-        total_chars = sum(p["char_count"] for p in chunk)
-
-        logger.info(
-            "[Agent 1] Chunk %d/%d | pages %d–%d | ~%d chars",
-            chunk_idx + 1, len(page_chunks),
-            chunk[0]["page_num"], chunk[-1]["page_num"],
-            total_chars,
-        )
-
-        if total_chars < 500:
-            # Skip nearly-empty pages (cover pages, blank pages)
-            logger.debug("[Agent 1] Chunk %d skipped (too sparse)", chunk_idx + 1)
-            continue
-
-        markdown_chunk = await _gemini_pages_to_markdown(combined_text, doc_type, chunk_idx)
-        all_markdown.append(markdown_chunk)
-
-        # Polite delay to avoid hammering Gemini
-        await asyncio.sleep(1.5)
-
-    result = "\n\n---\n\n".join(all_markdown)
-    logger.info("[Agent 1] Extraction complete. Output: %d chars", len(result))
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Agent 2 — Structurer & Matcher
-# ---------------------------------------------------------------------------
-
-
 def _fuzzy_match(name: str, candidates: list[str], threshold: float = 0.7) -> Optional[str]:
     """
     Find the best fuzzy match for `name` in `candidates`.
@@ -444,133 +344,13 @@ def _fuzzy_match(name: str, candidates: list[str], threshold: float = 0.7) -> Op
     return best_match if best_score >= threshold else None
 
 
-async def _extract_kbli_list(
-    kbli_markdown: str,
-    kbli_filter: Optional[list[str]],
-) -> list[KbliExtracted]:
-    """Agent 2 Step A: Parse KBLI Markdown → list of KbliExtracted."""
-    filter_clause = ""
-    if kbli_filter:
-        filter_clause = (
-            f"\nPERHATIAN: Hanya ekstrak KBLI dengan kode berikut: {', '.join(kbli_filter)}. "
-            "Abaikan kode KBLI lainnya."
-        )
-
-    prompt = (
-        f"Kamu adalah parser data KBLI yang presisi.\n"
-        f"Berikut adalah Markdown hasil ekstraksi dari PDF KBLI Detail.\n"
-        f"Tugasmu: ekstrak semua entri KBLI dan kembalikan sebagai JSON.\n"
-        f"{filter_clause}\n\n"
-        f"Format JSON yang diharapkan:\n"
-        f"{{\n"
-        f'  "kbli_list": [\n'
-        f"    {{\n"
-        f'      "kbli_code": "56102",\n'
-        f'      "kbli_description": "Warung/Kedai Makan",\n'
-        f'      "uraian": "Kelompok ini mencakup...",\n'
-        f'      "ruang_lingkup": [\n'
-        f'        {{"skala": "Mikro", "tingkat_risiko": "Rendah", "perizinan_berusaha": "NIB", "jangka_waktu": "...", "pb_umku": "..."}}\n'
-        f"      ],\n"
-        f'      "pb_umku_names": ["Sertifikat Laik Higiene Sanitasi Jasa Boga", "..."]\n'
-        f"    }}\n"
-        f"  ]\n"
-        f"}}\n\n"
-        f"PENTING:\n"
-        f"- pb_umku_names harus berisi nama-nama PB-UMKU yang SPESIFIK (bukan kategori umum)\n"
-        f"- Kembalikan HANYA JSON, tanpa markdown fence atau teks lain\n"
-        f"- Jika tidak ada data KBLI ditemukan, kembalikan {{\"kbli_list\": []}}\n\n"
-        f"--- MARKDOWN KBLI ---\n"
-        f"{kbli_markdown[:60000]}\n"  # safety truncation
-        f"--- AKHIR ---"
-    )
-
-    result = await _structured_gemini_call(prompt, KbliListResponse)
-    logger.info("[Agent 2A] Extracted %d KBLI entries", len(result.kbli_list))
-    return result.kbli_list
-
-
-async def _extract_pb_umku_table(
-    pb_umku_markdown: str,
-    pb_umku_names_to_find: list[str],
-) -> dict[str, PbUmkuDetail]:
-    """
-    Agent 2 Step B: Parse PB-UMKU Markdown → dict of name → PbUmkuDetail.
-
-    Processes the markdown in chunks to handle very large PB-UMKU tables.
-    """
-    if not pb_umku_names_to_find:
-        logger.info("[Agent 2B] No PB-UMKU names to look up — skipping")
-        return {}
-
-    names_str = "\n".join(f"- {n}" for n in pb_umku_names_to_find)
-
-    # PB-UMKU PDFs can be very long — chunk the markdown
-    CHUNK_SIZE = 40_000  # characters
-    chunks = [
-        pb_umku_markdown[i: i + CHUNK_SIZE]
-        for i in range(0, len(pb_umku_markdown), CHUNK_SIZE)
-    ]
-    logger.info("[Agent 2B] Looking up %d PB-UMKU names across %d markdown chunks", len(pb_umku_names_to_find), len(chunks))
-
-    all_found: dict[str, PbUmkuDetail] = {}
-
-    for chunk_idx, chunk in enumerate(chunks):
-        # Only process chunk if it mentions at least one target name
-        chunk_lower = chunk.lower()
-        relevant = any(n.lower()[:20] in chunk_lower for n in pb_umku_names_to_find)
-        if not relevant:
-            continue
-
-        prompt = (
-            f"Kamu adalah parser tabel PB-UMKU yang presisi.\n"
-            f"Cari entri PB-UMKU berikut dalam teks Markdown ini:\n{names_str}\n\n"
-            f"Untuk setiap yang ditemukan, ekstrak:\n"
-            f"{{\n"
-            f'  "pb_umku_list": [\n'
-            f"    {{\n"
-            f'      "nama_izin": "Nama lengkap PB-UMKU",\n'
-            f'      "persyaratan": ["syarat 1", "syarat 2"],\n'
-            f'      "jangka_waktu": "...",\n'
-            f'      "kewajiban": ["kewajiban 1"],\n'
-            f'      "parameter_pemenuhan": "...",\n'
-            f'      "kewenangan": "...",\n'
-            f'      "waktu_pemenuhan": "...",\n'
-            f'      "biaya": "...",\n'
-            f'      "sanksi": "..."\n'
-            f"    }}\n"
-            f"  ]\n"
-            f"}}\n\n"
-            f"PENTING:\n"
-            f"- Hanya ekstrak PB-UMKU yang namanya mirip dengan daftar di atas\n"
-            f"- Jika tidak ditemukan dalam chunk ini, kembalikan {{\"pb_umku_list\": []}}\n"
-            f"- Kembalikan HANYA JSON\n\n"
-            f"--- MARKDOWN CHUNK {chunk_idx + 1} ---\n"
-            f"{chunk}\n"
-            f"--- AKHIR ---"
-        )
-
-        try:
-            result = await _structured_gemini_call(prompt, PbUmkuListResponse, max_retries=2)
-            for pb in result.pb_umku_list:
-                if pb.nama_izin not in all_found:
-                    all_found[pb.nama_izin] = pb
-                    logger.info("[Agent 2B] Found: %s", pb.nama_izin)
-        except Exception as exc:
-            logger.warning("[Agent 2B] Chunk %d failed: %s", chunk_idx + 1, exc)
-
-        await asyncio.sleep(1.5)
-
-    logger.info("[Agent 2B] Found %d/%d PB-UMKU entries", len(all_found), len(pb_umku_names_to_find))
-    return all_found
-
-
 def _match_and_merge(
     kbli_list: list[KbliExtracted],
     pb_umku_map: dict[str, PbUmkuDetail],
 ) -> list[KbliDetailEnriched]:
     """
-    Agent 2 Step C: Match each KBLI's pb_umku_names against pb_umku_map using
-    fuzzy matching and inject the details.
+    Legacy merge helper — kept for test_agents.py compatibility.
+    The main pipeline now uses the pandas-based structurer_agent instead.
     """
     enriched: list[KbliDetailEnriched] = []
     candidate_names = list(pb_umku_map.keys())
@@ -579,20 +359,12 @@ def _match_and_merge(
         matched: list[PbUmkuDetail] = []
 
         for name in kbli.pb_umku_names:
-            # Try exact match first, then fuzzy
             if name in pb_umku_map:
                 matched.append(pb_umku_map[name])
-                logger.debug("[Agent 2C] Exact match: %s → %s", kbli.kbli_code, name)
             else:
                 fuzzy = _fuzzy_match(name, candidate_names, threshold=0.75)
                 if fuzzy:
                     matched.append(pb_umku_map[fuzzy])
-                    logger.info(
-                        "[Agent 2C] Fuzzy match: %s — '%s' → '%s'",
-                        kbli.kbli_code, name, fuzzy,
-                    )
-                else:
-                    logger.debug("[Agent 2C] No match for: %s in KBLI %s", name, kbli.kbli_code)
 
         enriched.append(KbliDetailEnriched(
             kbli_code=kbli.kbli_code,
@@ -603,55 +375,736 @@ def _match_and_merge(
             pb_umku_detail=matched,
         ))
 
-    logger.info(
-        "[Agent 2C] Merged %d KBLI records | total PB-UMKU injected: %d",
-        len(enriched),
-        sum(len(r.pb_umku_detail) for r in enriched),
-    )
-    return enriched
-
-
-async def structurer_agent(
-    kbli_markdown: str,
-    pb_umku_markdown: str,
-    kbli_filter: Optional[list[str]],
-) -> list[KbliDetailEnriched]:
-    """
-    Agent 2: Parse and match KBLI Detail and PB-UMKU Detail Markdowns.
-
-    Returns a list of fully enriched KBLI records.
-    """
-    logger.info("[Agent 2] Starting Structurer agent")
-
-    # Step A: Extract KBLI list from KBLI Markdown
-    kbli_list = await _extract_kbli_list(kbli_markdown, kbli_filter)
-    if not kbli_list:
-        raise ValueError("Agent 2A: No KBLI entries extracted from KBLI PDF")
-
-    # Collect all PB-UMKU names that need to be looked up
-    all_pb_umku_names: list[str] = []
-    for kbli in kbli_list:
-        all_pb_umku_names.extend(kbli.pb_umku_names)
-    unique_pb_names = list(dict.fromkeys(all_pb_umku_names))  # preserve order, dedupe
-
-    # Step B: Extract PB-UMKU details from PB-UMKU Markdown
-    pb_umku_map = await _extract_pb_umku_table(pb_umku_markdown, unique_pb_names)
-
-    # Step C: Fuzzy-match and merge
-    enriched = _match_and_merge(kbli_list, pb_umku_map)
-
     return enriched
 
 
 # ---------------------------------------------------------------------------
-# Agent 3 — Ingestor (JSON → ChromaDB + PostgreSQL)
+# Agent 1 — Deterministic Extractor (PDF → Pandas DataFrame, NO LLM)
+# ---------------------------------------------------------------------------
+
+
+def extract_tables_with_plumber(pdf_path: Path) -> pd.DataFrame:
+    """
+    Deterministic PDF table extraction using pdfplumber.
+
+    Strategy (tried in order):
+      1. Border-based  — page.extract_tables() with default settings.
+         Works for PDFs with drawn cell borders.
+      2. Text-strategy — page.extract_tables(table_settings={...}) using
+         word-alignment to infer column/row boundaries.
+         Works for text-layout PDFs (no visible borders).
+      3. Words fallback — page.extract_words() with x-position clustering.
+         Last resort for scanned/OCR PDFs where neither table strategy fires.
+
+    Across all strategies:
+      - First non-empty table's first row becomes the canonical header.
+      - Rows that repeat the header are skipped (table continued on next page).
+      - All rows are padded / trimmed to the canonical column count.
+      - Returns one master DataFrame.
+    """
+    TEXT_SETTINGS = {
+        "vertical_strategy": "text",
+        "horizontal_strategy": "text",
+        "snap_tolerance": 3,
+        "join_tolerance": 3,
+        "min_words_vertical": 3,
+        "min_words_horizontal": 1,
+    }
+
+    # Keywords that indicate a legitimate table header row
+    HEADER_KEYWORDS = {
+        "kode", "kbli", "judul", "skala", "risiko", "izin", "perizinan",
+        "persyaratan", "nomenklatur", "tingkat", "usaha", "nomor", "nama",
+        "jangka", "waktu", "kewajiban", "sanksi", "biaya",
+    }
+
+    def _looks_like_header(row: list[str]) -> bool:
+        """True if the row has ≥ 2 distinct cells matching known header keywords."""
+        hits = sum(
+            1 for cell in row
+            if any(kw in cell.lower() for kw in HEADER_KEYWORDS)
+        )
+        return hits >= 2
+
+    all_rows: list[list[str]] = []
+    detected_header: Optional[list[str]] = None
+    pages_with_tables = 0
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        total = len(pdf.pages)
+        logger.info("[pdfplumber] Scanning %d pages: %s", total, pdf_path.name)
+
+        for page_num, page in enumerate(pdf.pages, 1):
+            # ── Strategy 1: border-based ──────────────────────────────────
+            try:
+                tables = page.extract_tables() or []
+            except Exception:
+                tables = []
+
+            # ── Strategy 2: text-strategy (only for early pages / header search)
+            # Text-strategy is accurate but slow (~300-500ms/page).
+            # Use it only until we find the real header, then switch to words-based.
+            if not tables and detected_header is None and page_num <= 10:
+                try:
+                    tables = page.extract_tables(table_settings=TEXT_SETTINGS) or []
+                except Exception:
+                    tables = []
+
+            # ── Strategy 3: words-based (fast, ~50-100ms/page) ───────────
+            # Primary fallback for all pages once header is established,
+            # or for any page where border + text-strategy both failed.
+            if not tables:
+                try:
+                    tables = _words_to_table(page)
+                except Exception:
+                    pass
+
+            if not tables:
+                continue
+
+            pages_with_tables += 1
+            for table in tables:
+                if not table:
+                    continue
+
+                # Clean every cell: collapse newlines, strip whitespace
+                cleaned_table = [
+                    [str(cell or "").replace("\n", " ").strip() for cell in row]
+                    for row in table
+                    if any(cell for cell in row)
+                ]
+                if len(cleaned_table) < 2:
+                    continue
+
+                if detected_header is None:
+                    # Search all rows of this table for the real header
+                    header_idx = None
+                    for idx, row in enumerate(cleaned_table):
+                        if _looks_like_header(row):
+                            header_idx = idx
+                            break
+
+                    if header_idx is not None:
+                        detected_header = cleaned_table[header_idx]
+                        all_rows.extend(cleaned_table[header_idx + 1:])
+                        logger.info(
+                            "[pdfplumber] Real header on page %d row %d (%d cols): %s …",
+                            page_num, header_idx, len(detected_header),
+                            detected_header[:5],
+                        )
+                    else:
+                        # No header found yet — skip this table, keep looking
+                        logger.debug(
+                            "[pdfplumber] Page %d: no header-like row found, skipping",
+                            page_num,
+                        )
+                        continue
+                else:
+                    first_row = cleaned_table[0]
+                    ncols = len(detected_header)
+                    rows_to_add = (
+                        cleaned_table[1:]
+                        if _looks_like_header(first_row)
+                        else cleaned_table
+                    )
+                    for row in rows_to_add:
+                        padded = row[:ncols] + [""] * (ncols - len(row))
+                        if any(c for c in padded):
+                            all_rows.append(padded)
+
+    logger.info(
+        "[pdfplumber] Pages with tables: %d/%d | total data rows: %d",
+        pages_with_tables, total, len(all_rows),
+    )
+
+    if not all_rows or detected_header is None:
+        logger.warning("[pdfplumber] No table data extracted from %s", pdf_path.name)
+        return pd.DataFrame()
+
+    ncols = len(detected_header)
+    padded_all = [
+        row[:ncols] + [""] * (ncols - len(row))
+        for row in all_rows
+    ]
+
+    df = pd.DataFrame(padded_all, columns=detected_header)
+    logger.info(
+        "[pdfplumber] Master DataFrame: %d rows × %d cols from %s",
+        len(df), len(df.columns), pdf_path.name,
+    )
+    return df
+
+
+def _words_to_table(page) -> list[list[list[str]]]:
+    """
+    Fallback table builder using pdfplumber word positions.
+    Groups words by y-coordinate (rows) then x-coordinate clusters (columns).
+    Used for scanned PDFs where neither border nor text strategy finds tables.
+    Returns a list containing one table (list of rows).
+    """
+    words = page.extract_words(x_tolerance=5, y_tolerance=3) or []
+    if len(words) < 5:
+        return []
+
+    # Collect all distinct x0 positions as candidate column anchors
+    x_positions = sorted(set(round(w["x0"] / 8) * 8 for w in words))
+    if not x_positions:
+        return []
+
+    # Cluster x positions (within 20px = same column)
+    col_anchors: list[float] = [x_positions[0]]
+    for x in x_positions[1:]:
+        if x - col_anchors[-1] > 20:
+            col_anchors.append(x)
+
+    # Group words by row (y0 within 5px tolerance)
+    rows_dict: dict[int, list] = {}
+    for w in words:
+        row_key = round(w["top"] / 5) * 5
+        rows_dict.setdefault(row_key, []).append(w)
+
+    table: list[list[str]] = []
+    for _, row_words in sorted(rows_dict.items()):
+        row_cells = [""] * len(col_anchors)
+        for w in sorted(row_words, key=lambda x: x["x0"]):
+            # Find which column this word belongs to
+            col_idx = 0
+            for i, anchor in enumerate(col_anchors):
+                if w["x0"] >= anchor - 10:
+                    col_idx = i
+            row_cells[col_idx] = (row_cells[col_idx] + " " + w["text"]).strip()
+        if any(c for c in row_cells):
+            table.append(row_cells)
+
+    return [table] if len(table) > 1 else []
+
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean a raw pdfplumber DataFrame:
+      - Replace empty strings with NaN for proper pandas handling.
+      - Drop rows where ALL cells are NaN (blank separator rows).
+      - Forward-fill the first 4 columns (handles PDF merged/spanned cells).
+      - Replace remaining NaN with empty string.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df = df.replace("", pd.NA)
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    # Forward-fill left-side columns that represent merged cells in the PDF
+    for col in df.columns[:4]:
+        df[col] = df[col].ffill()
+
+    df = df.fillna("")
+    return df
+
+
+def _find_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    """
+    Return the df column whose name best fuzzy-matches any of the candidate
+    key strings (case-insensitive, ignoring spaces/underscores).
+    Returns None if no column scores ≥ 0.65.
+    """
+    best_col: Optional[str] = None
+    best_score = 0.0
+
+    for col in df.columns:
+        col_norm = col.lower().replace(" ", "").replace("_", "").replace("/", "")
+        for cand in candidates:
+            cand_norm = cand.lower().replace(" ", "").replace("_", "").replace("/", "")
+            score = SequenceMatcher(None, col_norm, cand_norm).ratio()
+            if score > best_score:
+                best_score = score
+                best_col = col
+
+    return best_col if best_score >= 0.65 else None
+
+
+def _find_kbli_code_column(df: pd.DataFrame) -> Optional[int]:
+    """
+    Find the column INDEX (not name) that contains 5-digit KBLI codes.
+    Tries column name matching first, then falls back to content scanning.
+    Returns the column index (positional), or None if not found.
+    """
+    # Content-based detection: find column with most 5-digit entries
+    best_idx: Optional[int] = None
+    best_count = 0
+
+    for i in range(len(df.columns)):
+        try:
+            count = df.iloc[:, i].astype(str).str.match(r"^\d{5}$").sum()
+            if count > best_count:
+                best_count = count
+                best_idx = i
+        except Exception:
+            continue
+
+    return best_idx if best_count >= 1 else None
+
+
+def _has_valid_kbli_codes(df: pd.DataFrame) -> bool:
+    """Return True if the DataFrame contains at least one 5-digit KBLI code in any column."""
+    # Iterate by position to avoid issues with duplicate/empty column names
+    for i in range(len(df.columns)):
+        try:
+            col_series = df.iloc[:, i].astype(str)
+            if col_series.str.match(r"^\d{5}$").any():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def extract_text_based_kbli(pdf_path: Path) -> pd.DataFrame:
+    """
+    Fallback extractor for scanned/OCR PDFs where pdfplumber cannot detect
+    proper table structures.
+
+    Strategy:
+      1. Extract raw text from every page with pdfplumber.
+      2. Scan line by line for 5-digit KBLI codes.
+      3. Accumulate the surrounding context (up to 30 lines) per code.
+      4. Return a DataFrame with columns: [kbli_code, raw_text].
+
+    The raw_text field is kept small (~500-1500 chars) so the LLM call in
+    Agent 2 stays cheap.
+    """
+    import re
+    KBLI_RE = re.compile(r"^\s*(\d{5})\b")
+    CONTEXT_LINES = 25
+
+    code_context: dict[str, list[str]] = {}  # code → list of lines
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+            for i, line in enumerate(lines):
+                m = KBLI_RE.match(line)
+                if m:
+                    code = m.group(1)
+                    # Take the matched line + next CONTEXT_LINES lines as context
+                    context_lines = lines[i: i + CONTEXT_LINES]
+                    if code not in code_context:
+                        code_context[code] = context_lines
+                    else:
+                        # Append extra context from later pages
+                        code_context[code].extend(context_lines)
+
+    if not code_context:
+        logger.warning("[text-extract] No 5-digit KBLI codes found in %s", pdf_path.name)
+        return pd.DataFrame()
+
+    rows = [
+        {"kbli_code": code, "raw_text": " | ".join(ctx)[:2000]}
+        for code, ctx in sorted(code_context.items())
+    ]
+    df = pd.DataFrame(rows)
+    logger.info(
+        "[text-extract] Found %d unique KBLI codes in %s",
+        len(df), pdf_path.name,
+    )
+    return df
+
+
+def extract_text_based_pbumku(pdf_path: Path) -> pd.DataFrame:
+    """
+    Fallback extractor for PB-UMKU PDFs using text regex scanning.
+
+    Looks for permit name patterns (e.g., lines starting with 'Sertifikat', 'Izin', 'Tanda
+    Daftar', 'TDUP', 'TDKB') and accumulates context.
+    Returns DataFrame with columns: [nama_izin, raw_text].
+    """
+    import re
+    # Common PB-UMKU name patterns in Indonesian government docs
+    PERMIT_RE = re.compile(
+        r"^\s*((?:Sertifikat|Izin|Tanda\s+Daftar|TDUP|TDKB|Nomor\s+Induk)[^,\n]{5,80})",
+        re.IGNORECASE,
+    )
+    CONTEXT_LINES = 30
+
+    permit_context: dict[str, list[str]] = {}
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+            for i, line in enumerate(lines):
+                m = PERMIT_RE.match(line)
+                if m:
+                    name = m.group(1).strip()
+                    ctx = lines[i: i + CONTEXT_LINES]
+                    if name not in permit_context:
+                        permit_context[name] = ctx
+                    else:
+                        permit_context[name].extend(ctx)
+
+    if not permit_context:
+        logger.warning("[text-extract] No PB-UMKU permit names found in %s", pdf_path.name)
+        return pd.DataFrame()
+
+    rows = [
+        {"nama_izin": name, "raw_text": " | ".join(ctx)[:2000]}
+        for name, ctx in permit_context.items()
+    ]
+    df = pd.DataFrame(rows)
+    logger.info(
+        "[text-extract] Found %d PB-UMKU permits in %s",
+        len(df), pdf_path.name,
+    )
+    return df
+
+
+def extractor_agent(pdf_path: Path, doc_type: str) -> pd.DataFrame:
+    """
+    Agent 1: Deterministic PDF → DataFrame extraction. No LLM, no network.
+
+    For PDFs with proper table structure (digital PDFs with borders):
+      → Uses extract_tables_with_plumber() — returns full columnar DataFrame.
+
+    Fallback for scanned/OCR PDFs without vector table borders:
+      → kbli: extract_text_based_kbli() — returns [kbli_code, raw_text] DataFrame.
+      → pb_umku: extract_text_based_pbumku() — returns [nama_izin, raw_text] DataFrame.
+
+    Args:
+        pdf_path: Absolute path to the PDF file.
+        doc_type: 'kbli' | 'pb_umku' — drives fallback extraction strategy.
+
+    Returns:
+        DataFrame ready for Agent 2 structuring.
+    """
+    start = time.time()
+    logger.info("[Agent 1] Extracting %s PDF: %s", doc_type.upper(), pdf_path.name)
+
+    # ── Primary: table-based extraction ──────────────────────────────────────
+    df = extract_tables_with_plumber(pdf_path)
+
+    if not df.empty and _has_valid_kbli_codes(df):
+        elapsed = time.time() - start
+        logger.info(
+            "[Agent 1] Table extraction OK: %d rows × %d cols in %.1fs",
+            len(df), len(df.columns), elapsed,
+        )
+        return df
+
+    # ── Fallback: text-regex extraction ──────────────────────────────────────
+    logger.info(
+        "[Agent 1] Table extraction yielded no valid KBLI codes — "
+        "switching to text-regex fallback for %s PDF",
+        doc_type.upper(),
+    )
+
+    if doc_type == "kbli":
+        df = extract_text_based_kbli(pdf_path)
+    else:
+        df = extract_text_based_pbumku(pdf_path)
+
+    elapsed = time.time() - start
+    if df.empty:
+        logger.warning("[Agent 1] Text-regex fallback also found nothing in %s", pdf_path.name)
+    else:
+        logger.info(
+            "[Agent 1] Text-regex fallback: %d entries in %.1fs (NO LLM used)",
+            len(df), elapsed,
+        )
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Agent 2 — Pandas Merge + LLM Structuring (one small LLM call per KBLI)
+# ---------------------------------------------------------------------------
+
+
+async def _llm_structure_condensed(condensed: dict) -> KbliDetailEnriched:
+    """
+    The LLM's ONLY job in the new pipeline:
+    Map a small (~500–1500 token) condensed dict to our exact Pydantic schema.
+
+    The dict contains raw row data with whatever column names came from the PDF.
+    The LLM handles the final semantic mapping and type coercion.
+    """
+    prompt = (
+        "Kamu adalah validator data KBLI OSS Indonesia yang presisi.\n"
+        "Berikut adalah data mentah SATU entri KBLI yang diekstrak dari tabel PDF pemerintah "
+        "(Lampiran PP No. 5/2021 atau turunannya). Nama kolom bisa tidak standar.\n\n"
+        "DATA MENTAH:\n"
+        f"{json.dumps(condensed, ensure_ascii=False, indent=2)}\n\n"
+        "TUGASMU: Petakan data di atas ke schema JSON berikut secara tepat.\n"
+        "Gunakan penilaian terbaikmu untuk mencocokkan nama kolom dengan field schema.\n\n"
+        "SCHEMA YANG DIHARAPKAN:\n"
+        "{\n"
+        '  "kbli_code": "56102",\n'
+        '  "kbli_description": "Nama KBLI",\n'
+        '  "uraian": "Teks uraian lengkap",\n'
+        '  "ruang_lingkup": [\n'
+        '    {\n'
+        '      "skala": "Mikro",\n'
+        '      "tingkat_risiko": "Rendah",\n'
+        '      "perizinan_berusaha": "NIB",\n'
+        '      "jangka_waktu": null,\n'
+        '      "luas_lahan": null,\n'
+        '      "pb_umku": "Nama PB-UMKU atau null"\n'
+        '    }\n'
+        "  ],\n"
+        '  "pb_umku_names": ["Nama Izin 1", "Nama Izin 2"],\n'
+        '  "pb_umku_detail": [\n'
+        '    {\n'
+        '      "nama_izin": "Nama Izin 1",\n'
+        '      "persyaratan": ["syarat 1", "syarat 2"],\n'
+        '      "jangka_waktu": "30 hari",\n'
+        '      "kewajiban": ["kewajiban 1"],\n'
+        '      "parameter_pemenuhan": null,\n'
+        '      "kewenangan": null,\n'
+        '      "waktu_pemenuhan": null,\n'
+        '      "biaya": null,\n'
+        '      "sanksi": null\n'
+        '    }\n'
+        "  ]\n"
+        "}\n\n"
+        "ATURAN:\n"
+        "- Kembalikan HANYA JSON, tanpa markdown fence atau teks lain\n"
+        "- Gunakan null (bukan string kosong) untuk field yang tidak tersedia\n"
+        "- pb_umku_detail diisi dari data di kunci 'pbumku_rows' jika ada\n"
+        "- Setiap baris di 'scale_rows' adalah satu elemen ruang_lingkup\n"
+        "- pb_umku_names adalah daftar unik semua nama izin PB-UMKU yang disebut\n"
+        "- Jika kbli_code tidak bisa diidentifikasi, gunakan nilai dari 'kbli_code_detected'\n"
+    )
+    return await _structured_gemini_call(prompt, KbliDetailEnriched)
+
+
+async def structurer_agent(
+    kbli_df: pd.DataFrame,
+    pbumku_df: pd.DataFrame,
+    kbli_filter: Optional[list[str]],
+) -> list[KbliDetailEnriched]:
+    """
+    Agent 2: Deterministic pandas merge + minimal LLM structuring.
+
+    Pipeline:
+      1. Clean both DataFrames with pandas (drop empties, forward-fill merged cells).
+      2. Auto-detect merge key columns using fuzzy column-name matching.
+      3. Left-join KBLI df with PB-UMKU df on the Nomenklatur / Nama Izin column.
+      4. Group by KBLI code.
+      5. For each KBLI group → create a condensed dict → one small LLM call.
+
+    Token savings vs old approach:
+      Old: ~50,000+ chars of markdown per PDF chunk per LLM call
+      New: ~500–1,500 chars condensed dict per KBLI per LLM call
+    """
+    logger.info("[Agent 2] Starting Pandas-based Structurer agent")
+
+    # ── Step 1: Clean DataFrames ──────────────────────────────────────────────
+    kbli_df  = clean_dataframe(kbli_df)
+    pbumku_df = clean_dataframe(pbumku_df)
+
+    logger.info("[Agent 2] KBLI   DF: %d rows × %d cols | cols=%s",
+                len(kbli_df), len(kbli_df.columns), list(kbli_df.columns))
+    logger.info("[Agent 2] PB-UMKU DF: %d rows × %d cols | cols=%s",
+                len(pbumku_df), len(pbumku_df.columns), list(pbumku_df.columns))
+
+    # ── Step 2: Detect key columns ────────────────────────────────────────────
+    # Try name-based matching first, then content-based positional fallback
+    kbli_code_col    = _find_column(kbli_df,  ["kode", "kbli", "kodekbli", "no", "nomor"])
+    kbli_name_col    = _find_column(kbli_df,  ["nama", "uraian", "namakbli", "judul", "deskripsi"])
+    kbli_pbumku_col  = _find_column(kbli_df,  ["pbumku", "nomenklatur", "namaizin",
+                                                "perizinanberusaha", "jenisizin"])
+    pbumku_name_col  = _find_column(pbumku_df, ["namaizin", "nomenklatur", "pbumku",
+                                                 "nama", "jenisizin"])
+
+    # Content-based KBLI code column detection (handles OCR-shifted columns)
+    kbli_code_idx = _find_kbli_code_column(kbli_df)
+    if kbli_code_idx is not None:
+        kbli_code_col_positional = kbli_df.columns[kbli_code_idx]
+        if kbli_code_col != kbli_code_col_positional:
+            logger.info(
+                "[Agent 2] Name-based kbli_code_col=%r overridden by content-based col[%d]=%r",
+                kbli_code_col, kbli_code_idx, kbli_code_col_positional,
+            )
+            kbli_code_col = kbli_code_col_positional
+
+    logger.info(
+        "[Agent 2] Column map — kbli_code: %r (idx=%s) | kbli_name: %r | "
+        "kbli→pb_umku: %r | pb_umku name: %r",
+        kbli_code_col, kbli_code_idx, kbli_name_col, kbli_pbumku_col, pbumku_name_col,
+    )
+
+    # ── Step 3: Apply KBLI filter ─────────────────────────────────────────────
+    if kbli_filter and kbli_code_col:
+        kbli_df = kbli_df[kbli_df[kbli_code_col].isin(kbli_filter)].reset_index(drop=True)
+        logger.info("[Agent 2] After KBLI filter: %d rows", len(kbli_df))
+
+    # ── Step 4: Merge KBLI with PB-UMKU ──────────────────────────────────────
+    if kbli_pbumku_col and pbumku_name_col and not pbumku_df.empty:
+        # Rename PB-UMKU name column to avoid collision
+        pbumku_renamed = pbumku_df.rename(columns={pbumku_name_col: "_pb_name"})
+        merged_df = pd.merge(
+            kbli_df,
+            pbumku_renamed,
+            left_on=kbli_pbumku_col,
+            right_on="_pb_name",
+            how="left",
+            suffixes=("", "_pbumku"),
+        )
+        logger.info(
+            "[Agent 2] Merged DataFrame: %d rows × %d cols",
+            len(merged_df), len(merged_df.columns),
+        )
+    else:
+        logger.warning(
+            "[Agent 2] Could not identify merge columns — using KBLI data only "
+            "(PB-UMKU details will be empty)"
+        )
+        merged_df = kbli_df.copy()
+
+    # Fill any NaN introduced by the left-join
+    merged_df = merged_df.fillna("")
+
+    # ── Detect if DataFrames are text-based fallback (have 'raw_text' column) ──
+    kbli_is_text_based  = "raw_text" in kbli_df.columns
+    pbumku_is_text_based = "raw_text" in pbumku_df.columns
+
+    if kbli_is_text_based:
+        logger.info("[Agent 2] KBLI DF is text-based (raw_text mode) — skipping pandas merge")
+        return await _structure_text_based(kbli_df, pbumku_df)
+
+    # ── Step 5: Group by KBLI code → condensed dict → LLM structuring ─────────
+    group_col = kbli_code_col or merged_df.columns[0]
+    logger.info("[Agent 2] Grouping by column: %r", group_col)
+
+    # PB-UMKU columns are those that came from the right-side of the merge
+    pbumku_cols = [c for c in merged_df.columns if c.endswith("_pbumku") or c == "_pb_name"]
+    kbli_only_cols = [c for c in merged_df.columns if c not in pbumku_cols]
+
+    groups = merged_df.groupby(group_col)
+    total_groups = len(groups)
+    enriched_records: list[KbliDetailEnriched] = []
+
+    logger.info("[Agent 2] Processing %d KBLI groups through LLM structurer", total_groups)
+
+    for i, (kbli_code_val, group_df) in enumerate(groups):
+        kbli_code_str = str(kbli_code_val).strip()
+        if not kbli_code_str or kbli_code_str.lower() in ("nan", "", "kode", "no"):
+            continue
+
+        # Build condensed dict with all available data
+        scale_rows = group_df[kbli_only_cols].to_dict(orient="records")
+
+        pbumku_rows: list[dict] = []
+        if pbumku_cols:
+            pb_seen: set[str] = set()
+            for _, row in group_df.iterrows():
+                pb_row = {c: row[c] for c in pbumku_cols if row[c]}
+                pb_key = str(row.get("_pb_name", "")).strip()
+                if pb_key and pb_key not in pb_seen:
+                    pb_seen.add(pb_key)
+                    pbumku_rows.append(pb_row)
+
+        condensed = {
+            "kbli_code_detected": kbli_code_str,
+            "scale_rows": scale_rows,
+            "pbumku_rows": pbumku_rows,
+        }
+
+        try:
+            record = await _llm_structure_condensed(condensed)
+            if not record.kbli_code:
+                record.kbli_code = kbli_code_str
+            enriched_records.append(record)
+            logger.info(
+                "[Agent 2] ✓ KBLI %-8s (%d/%d) | scopes=%d | pb_umku=%d",
+                kbli_code_str, i + 1, total_groups,
+                len(record.ruang_lingkup), len(record.pb_umku_detail),
+            )
+        except Exception as exc:
+            logger.error("[Agent 2] ✗ KBLI %s failed LLM structuring: %s", kbli_code_str, exc)
+
+        await asyncio.sleep(0.5)
+
+    logger.info(
+        "[Agent 2] Structuring complete: %d/%d records successful",
+        len(enriched_records), total_groups,
+    )
+    return enriched_records
+
+
+async def _structure_text_based(
+    kbli_df: pd.DataFrame,
+    pbumku_df: pd.DataFrame,
+) -> list[KbliDetailEnriched]:
+    """
+    Structure text-based fallback DataFrames ([kbli_code, raw_text]).
+
+    For each KBLI code, find the matching PB-UMKU text (if any) and send a
+    compact condensed dict to the LLM. Token cost: ~500-2000 per KBLI.
+    """
+    # Build PB-UMKU lookup from raw_text if available
+    pbumku_lookup: dict[str, str] = {}
+    if not pbumku_df.empty and "raw_text" in pbumku_df.columns:
+        name_col = "nama_izin" if "nama_izin" in pbumku_df.columns else pbumku_df.columns[0]
+        for _, row in pbumku_df.iterrows():
+            pbumku_lookup[str(row[name_col])] = str(row.get("raw_text", ""))
+
+    enriched_records: list[KbliDetailEnriched] = []
+    total = len(kbli_df)
+    logger.info("[Agent 2/text] Structuring %d KBLI text entries via LLM", total)
+
+    for i, row in kbli_df.iterrows():
+        kbli_code = str(row.get("kbli_code", "")).strip()
+        raw_text  = str(row.get("raw_text", "")).strip()
+
+        if not kbli_code:
+            continue
+
+        # Find related PB-UMKU text (fuzzy search on permit names mentioned in kbli raw_text)
+        related_pbumku: list[dict] = []
+        for permit_name, permit_text in pbumku_lookup.items():
+            if permit_name[:20].lower() in raw_text.lower():
+                related_pbumku.append({
+                    "nama_izin": permit_name,
+                    "raw_text": permit_text[:500],
+                })
+
+        condensed = {
+            "kbli_code_detected": kbli_code,
+            "kbli_raw_text": raw_text[:1500],   # capped to keep prompt small
+            "pbumku_raw": related_pbumku[:3],   # top 3 matched permits
+        }
+
+        try:
+            record = await _llm_structure_condensed(condensed)
+            if not record.kbli_code:
+                record.kbli_code = kbli_code
+            enriched_records.append(record)
+            logger.info(
+                "[Agent 2/text] ✓ KBLI %-8s (%d/%d)",
+                kbli_code, i + 1, total,
+            )
+        except Exception as exc:
+            logger.error("[Agent 2/text] ✗ KBLI %s: %s", kbli_code, exc)
+
+        await asyncio.sleep(0.5)
+
+    logger.info(
+        "[Agent 2/text] Complete: %d/%d records",
+        len(enriched_records), total,
+    )
+    return enriched_records
+
+
+# ---------------------------------------------------------------------------
+# Agent 3 — Ingestor (JSON → ChromaDB + PostgreSQL) — UNCHANGED
 # ---------------------------------------------------------------------------
 
 
 def _generate_chunks(record: KbliDetailEnriched) -> list[tuple[str, dict, str]]:
     """
     Generate (text, metadata, doc_id) tuples for ChromaDB ingestion.
-
     Each semantic unit gets its own chunk to maximise retrieval precision.
     """
     chunks: list[tuple[str, dict, str]] = []
@@ -754,7 +1207,6 @@ async def ingestor_agent(
 ) -> int:
     """
     Agent 3: Vectorize enriched records into ChromaDB and update PostgreSQL.
-
     Returns total chunks upserted.
     """
     logger.info("[Agent 3] Starting Ingestor agent for %d records", len(enriched_records))
@@ -772,7 +1224,6 @@ async def ingestor_agent(
             metadatas.append(meta)
             ids.append(doc_id)
 
-            # Upsert in batches
             if len(texts) >= BATCH_SIZE:
                 await asyncio.get_event_loop().run_in_executor(
                     None,
@@ -813,7 +1264,10 @@ async def ingestor_agent(
                     headers=HEADERS,
                 )
             except Exception as exc:
-                logger.warning("[Agent 3] Failed to update kbli_scrape_targets for %s: %s", record.kbli_code, exc)
+                logger.warning(
+                    "[Agent 3] Failed to update kbli_scrape_targets for %s: %s",
+                    record.kbli_code, exc,
+                )
 
     logger.info("[Agent 3] Done. Total chunks upserted: %d", total_chunks)
     return total_chunks
@@ -827,9 +1281,14 @@ async def ingestor_agent(
 async def run_pipeline(job_id: int) -> None:
     """
     Main orchestrator: coordinates the 3 agents and lifecycle reporting.
+
+    Timing is tracked per-agent and printed at the end so we can compare
+    the new pdfplumber approach vs the old LLM-heavy approach.
     """
+    pipeline_start = time.time()
+
     logger.info("=" * 60)
-    logger.info("Starting PDF pipeline | job_id=%d", job_id)
+    logger.info("Starting PDF pipeline [Deterministic+AI Hybrid] | job_id=%d", job_id)
     logger.info("=" * 60)
 
     # 1. Fetch job details from backend
@@ -841,8 +1300,10 @@ async def run_pipeline(job_id: int) -> None:
         resp.raise_for_status()
         job = resp.json()["data"]
 
-    logger.info("Job: %s | KBLI PDF: %s | PB-UMKU PDF: %s",
-                job["name"], job["kbli_pdf_path"], job["pb_umku_pdf_path"])
+    logger.info(
+        "Job: %s | KBLI PDF: %s | PB-UMKU PDF: %s",
+        job["name"], job["kbli_pdf_path"], job["pb_umku_pdf_path"],
+    )
 
     # Resolve absolute paths within the mounted backend storage
     kbli_path    = BACKEND_STORAGE / job["kbli_pdf_path"]
@@ -864,29 +1325,48 @@ async def run_pipeline(job_id: int) -> None:
         ]
         logger.info("KBLI filter active: %s", kbli_filter)
 
-    # ── Agent 1: Extract both PDFs ──────────────────────────────────────────
+    # ── Agent 1: Deterministic pdfplumber extraction ────────────────────────
     await _report_progress(job_id, 5)
-    logger.info("--- Agent 1: Extracting KBLI PDF ---")
-    kbli_markdown = await extractor_agent(kbli_path, "kbli")
+    logger.info("--- Agent 1: Deterministic pdfplumber Extraction (NO LLM) ---")
 
-    await _report_progress(job_id, 25)
-    logger.info("--- Agent 1: Extracting PB-UMKU PDF ---")
-    pb_umku_markdown = await extractor_agent(pb_umku_path, "pb_umku")
+    agent1_start = time.time()
+    kbli_df    = extractor_agent(kbli_path, "kbli")
+    pbumku_df  = extractor_agent(pb_umku_path, "pb_umku")
+    agent1_elapsed = time.time() - agent1_start
 
-    await _report_progress(job_id, 45)
+    logger.info(
+        "⏱ Agent 1 (pdfplumber) completed in %.1f seconds | "
+        "KBLI: %d rows, PB-UMKU: %d rows",
+        agent1_elapsed, len(kbli_df), len(pbumku_df),
+    )
 
-    # ── Agent 2: Structure & Match ──────────────────────────────────────────
-    logger.info("--- Agent 2: Structuring & Matching ---")
-    enriched_records = await structurer_agent(kbli_markdown, pb_umku_markdown, kbli_filter)
+    await _report_progress(job_id, 30)
+
+    # ── Agent 2: Pandas merge + LLM structuring ─────────────────────────────
+    logger.info("--- Agent 2: Pandas Merge + LLM Structuring (per-record) ---")
+
+    agent2_start = time.time()
+    enriched_records = await structurer_agent(kbli_df, pbumku_df, kbli_filter)
+    agent2_elapsed = time.time() - agent2_start
+
+    logger.info(
+        "⏱ Agent 2 (pandas+LLM) completed in %.1f seconds | %d records structured",
+        agent2_elapsed, len(enriched_records),
+    )
 
     if not enriched_records:
-        raise ValueError("Agent 2 returned zero enriched records — check PDF content")
+        raise ValueError("Agent 2 returned zero enriched records — check PDF table structure")
 
     await _report_progress(job_id, 70)
 
-    # ── Agent 3: Ingest to ChromaDB ─────────────────────────────────────────
+    # ── Agent 3: Ingest to ChromaDB ──────────────────────────────────────────
     logger.info("--- Agent 3: Ingesting to ChromaDB ---")
+
+    agent3_start = time.time()
     total_chunks = await ingestor_agent(enriched_records, job_id)
+    agent3_elapsed = time.time() - agent3_start
+
+    logger.info("⏱ Agent 3 (ingestor) completed in %.1f seconds", agent3_elapsed)
 
     await _report_progress(job_id, 95)
 
@@ -905,10 +1385,21 @@ async def run_pipeline(job_id: int) -> None:
         result_json=result_json,
     )
 
+    pipeline_elapsed = time.time() - pipeline_start
+
+    logger.info("=" * 60)
     logger.info(
         "Pipeline COMPLETE | job_id=%d | KBLI=%d | chunks=%d",
         job_id, len(enriched_records), total_chunks,
     )
+    logger.info("⏱ TIMING BREAKDOWN:")
+    logger.info("   Agent 1 – pdfplumber extraction : %6.1f s", agent1_elapsed)
+    logger.info("   Agent 2 – pandas + LLM          : %6.1f s", agent2_elapsed)
+    logger.info("   Agent 3 – ChromaDB ingestor      : %6.1f s", agent3_elapsed)
+    logger.info("   ─────────────────────────────────────────")
+    logger.info("   TOTAL                            : %6.1f s  (%.1f min)",
+                pipeline_elapsed, pipeline_elapsed / 60)
+    logger.info("=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -932,7 +1423,6 @@ def main() -> None:
         asyncio.run(run_pipeline(args.job_id))
     except Exception as exc:
         logger.exception("Pipeline FAILED | job_id=%d", args.job_id)
-        # Best-effort failure report
         asyncio.run(_report_fail(args.job_id, str(exc)))
         sys.exit(1)
 
