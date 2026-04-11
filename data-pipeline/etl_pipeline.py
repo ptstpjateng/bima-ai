@@ -45,8 +45,9 @@ def clean_text(val) -> str:
     if pd.isna(val):
         return ""
     s = str(val).strip()
-    # Fix hyphenation artifacts from Excel line breaks (e.g. "Mene-\nngah" → "Menengah")
-    s = re.sub(r"-\s*\n\s*", "", s)
+    # Fix hyphenation artifacts from Excel (e.g. "Mene-\nngah" or "Penang-kapan")
+    # Pattern: lowercase letter + hyphen + optional whitespace/newline + lowercase letter
+    s = re.sub(r"(\w)-\s*\n?\s*(\w)", r"\1\2", s)
     # Collapse runs of whitespace (but preserve intentional newlines for later splitting)
     s = re.sub(r"[ \t]+", " ", s)
     return s
