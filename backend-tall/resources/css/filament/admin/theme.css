@@ -5,32 +5,42 @@
 @source '../../../../resources/views/filament/**/*';
 
 /* ═══════════════════════════════════════════════════════════════
-   THE ETHEREAL SLATE — "Digital Observatory"
-   BIMA-AI Admin Panel Design System v2
+   VOLCANIC AMBER — "Molten Command Center"
+   BIMA-AI Admin Panel Design System v3
+   Deep obsidian + warm amber/copper/gold. Top Navigation.
    ═══════════════════════════════════════════════════════════════ */
 
 /* ── 1. DESIGN TOKENS ──────────────────────────────────────── */
 :root {
-    --obs-surface:              #0b1326;
-    --obs-surface-low:          #131b2e;
-    --obs-surface-container:    #1a2438;
-    --obs-surface-high:         #212d42;
-    --obs-surface-highest:      #2d3449;
-    --obs-surface-lowest:       #060e20;
+    /* Surface palette — warm charcoal, not blue */
+    --va-surface:              #0c0a09;
+    --va-surface-low:          #1c1917;
+    --va-surface-container:    #292524;
+    --va-surface-high:         #44403c;
+    --va-surface-highest:      #57534e;
+    --va-surface-lowest:       #060504;
 
-    --obs-primary:              #c3c0ff;
-    --obs-primary-container:    #4f46e5;
-    --obs-outline-variant:      #464555;
+    /* Amber / Copper accent system */
+    --va-primary:              #fbbf24;
+    --va-primary-light:        #fde68a;
+    --va-primary-container:    #b45309;
+    --va-on-primary:           #0c0a09;
+    --va-outline-variant:      #57534e;
 
-    --obs-glass-bg:             rgba(45, 52, 73, 0.60);
-    --obs-glass-border:         rgba(70, 69, 85, 0.15);
-    --obs-glass-blur:           20px;
+    /* Glass — warm-tinted */
+    --va-glass-bg:             rgba(41, 37, 36, 0.65);
+    --va-glass-border:         rgba(87, 83, 78, 0.18);
+    --va-glass-blur:           20px;
 
-    --obs-ambient-shadow:       0px 20px 40px rgba(0, 0, 0, 0.4);
-    --obs-inner-stroke:         inset 0 1px 0 rgba(195, 192, 255, 0.08);
+    /* Shadows & strokes */
+    --va-ambient-shadow:       0px 16px 48px rgba(0, 0, 0, 0.50);
+    --va-inner-stroke:         inset 0 1px 0 rgba(251, 191, 36, 0.06);
+    --va-glow:                 0 0 40px rgba(251, 191, 36, 0.08);
 
-    --obs-gradient:             linear-gradient(135deg, #4f46e5 0%, #c3c0ff 100%);
-    --obs-gradient-subtle:      linear-gradient(135deg, rgba(79,70,229,0.15) 0%, rgba(195,192,255,0.08) 100%);
+    /* Gradients */
+    --va-gradient:             linear-gradient(135deg, #b45309 0%, #fbbf24 50%, #fde68a 100%);
+    --va-gradient-button:      linear-gradient(135deg, #d97706 0%, #f59e0b 100%);
+    --va-gradient-subtle:      linear-gradient(135deg, rgba(180,83,9,0.12) 0%, rgba(251,191,36,0.06) 100%);
 
     font-family: 'Manrope', system-ui, sans-serif !important;
 }
@@ -39,37 +49,74 @@
 html,
 body,
 .fi-body {
-    background-color: var(--obs-surface) !important;
+    background-color: var(--va-surface) !important;
     font-family: 'Manrope', system-ui, sans-serif !important;
 }
 
-/* ── 3. SIDEBAR ────────────────────────────────────────────── */
-.fi-sidebar {
-    background-color: var(--obs-surface-low) !important;
-    border-right: none !important;
-    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.25) !important;
+/* ── 3. TOP NAVIGATION BAR ─────────────────────────────────── */
+.fi-topbar {
+    background-color: rgba(28, 25, 23, 0.88) !important;
+    backdrop-filter: blur(20px) saturate(1.4) !important;
+    -webkit-backdrop-filter: blur(20px) saturate(1.4) !important;
+    border-bottom: 1px solid rgba(251, 191, 36, 0.08) !important;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.30), var(--va-inner-stroke) !important;
 }
 
-.fi-sidebar-nav-groups {
-    padding: 0.5rem 0.75rem !important;
+/* Top-nav navigation items */
+.fi-topbar-nav-item-button {
+    font-family: 'Manrope', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 0.8125rem !important;
+    color: rgba(245, 239, 225, 0.60) !important;
+    border-radius: 0.5rem !important;
+    padding: 0.375rem 0.75rem !important;
+    transition: all 0.15s ease !important;
+}
+
+.fi-topbar-nav-item-button:hover {
+    background-color: rgba(251, 191, 36, 0.08) !important;
+    color: var(--va-primary) !important;
+}
+
+.fi-topbar-nav-item-active .fi-topbar-nav-item-button,
+.fi-topbar-nav-item-button[aria-current="page"] {
+    background: rgba(251, 191, 36, 0.12) !important;
+    color: var(--va-primary) !important;
+    box-shadow: inset 0 -2px 0 var(--va-primary) !important;
+}
+
+/* Group labels in top-nav dropdown */
+.fi-topbar-nav-group-label {
+    font-family: 'Manrope', sans-serif !important;
+    font-size: 0.6875rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.08em !important;
+    text-transform: uppercase !important;
+    color: rgba(251, 191, 36, 0.40) !important;
+}
+
+/* ── 4. SIDEBAR (mobile slide-out) ─────────────────────────── */
+.fi-sidebar {
+    background-color: var(--va-surface-low) !important;
+    border-right: none !important;
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.35) !important;
 }
 
 .fi-sidebar-item-button {
-    border-radius: 0.625rem !important;
+    border-radius: 0.5rem !important;
     font-family: 'Manrope', sans-serif !important;
     font-weight: 500 !important;
-    transition: background 0.15s ease, color 0.15s ease !important;
+    transition: background 0.15s ease !important;
 }
 
 .fi-sidebar-item-button:hover {
-    background-color: rgba(79, 70, 229, 0.12) !important;
-    color: var(--obs-primary) !important;
+    background-color: rgba(251, 191, 36, 0.08) !important;
+    color: var(--va-primary) !important;
 }
 
 .fi-sidebar-item-active .fi-sidebar-item-button {
-    background: linear-gradient(135deg, rgba(79,70,229,0.25) 0%, rgba(195,192,255,0.12) 100%) !important;
-    color: var(--obs-primary) !important;
-    box-shadow: var(--obs-inner-stroke) !important;
+    background: var(--va-gradient-subtle) !important;
+    color: var(--va-primary) !important;
 }
 
 .fi-sidebar-group-label {
@@ -78,26 +125,16 @@ body,
     font-weight: 700 !important;
     letter-spacing: 0.08em !important;
     text-transform: uppercase !important;
-    color: rgba(195, 192, 255, 0.45) !important;
-    padding: 1.25rem 0.75rem 0.375rem !important;
-}
-
-/* ── 4. TOPBAR ─────────────────────────────────────────────── */
-.fi-topbar {
-    background-color: rgba(19, 27, 46, 0.80) !important;
-    backdrop-filter: blur(16px) !important;
-    -webkit-backdrop-filter: blur(16px) !important;
-    border-bottom: none !important;
-    box-shadow: 0 1px 0 rgba(70, 69, 85, 0.20), 0 4px 16px rgba(0,0,0,0.2) !important;
+    color: rgba(251, 191, 36, 0.35) !important;
 }
 
 /* ── 5. MAIN CONTENT AREA ──────────────────────────────────── */
 .fi-main {
-    background-color: var(--obs-surface) !important;
+    background-color: var(--va-surface) !important;
 }
 
 .fi-main-ctn {
-    background-color: var(--obs-surface) !important;
+    background-color: var(--va-surface) !important;
 }
 
 /* ── 6. GLASS CARDS & SECTIONS ─────────────────────────────── */
@@ -105,27 +142,27 @@ body,
 .fi-wi-stats-overview-stat,
 .fi-wi,
 .fi-card {
-    background: var(--obs-glass-bg) !important;
-    backdrop-filter: blur(var(--obs-glass-blur)) !important;
-    -webkit-backdrop-filter: blur(var(--obs-glass-blur)) !important;
-    border: 1px solid var(--obs-glass-border) !important;
-    border-radius: 1rem !important;
-    box-shadow: var(--obs-ambient-shadow), var(--obs-inner-stroke) !important;
+    background: var(--va-glass-bg) !important;
+    backdrop-filter: blur(var(--va-glass-blur)) !important;
+    -webkit-backdrop-filter: blur(var(--va-glass-blur)) !important;
+    border: 1px solid var(--va-glass-border) !important;
+    border-radius: 0.875rem !important;
+    box-shadow: var(--va-ambient-shadow), var(--va-inner-stroke) !important;
 }
 
 .fi-section-header {
-    border-bottom: 1px solid rgba(70, 69, 85, 0.12) !important;
+    border-bottom: 1px solid rgba(87, 83, 78, 0.15) !important;
 }
 
 .fi-section-header-heading {
     font-family: 'Manrope', sans-serif !important;
     font-weight: 700 !important;
     letter-spacing: -0.01em !important;
-    color: #e8e6ff !important;
+    color: #fef3c7 !important;
 }
 
 .fi-section-header-description {
-    color: rgba(195, 192, 255, 0.55) !important;
+    color: rgba(245, 239, 225, 0.50) !important;
 }
 
 /* ── 7. STAT WIDGETS ───────────────────────────────────────── */
@@ -134,7 +171,7 @@ body,
     font-weight: 800 !important;
     font-size: 1.875rem !important;
     letter-spacing: -0.02em !important;
-    background: var(--obs-gradient) !important;
+    background: var(--va-gradient) !important;
     -webkit-background-clip: text !important;
     -webkit-text-fill-color: transparent !important;
     background-clip: text !important;
@@ -146,41 +183,47 @@ body,
     font-weight: 700 !important;
     letter-spacing: 0.05em !important;
     text-transform: uppercase !important;
-    color: rgba(195, 192, 255, 0.55) !important;
+    color: rgba(251, 191, 36, 0.50) !important;
 }
 
 .fi-wi-stats-overview-stat-description {
-    color: rgba(195, 192, 255, 0.40) !important;
+    color: rgba(245, 239, 225, 0.40) !important;
     font-size: 0.75rem !important;
+}
+
+/* Warm accent bar on hover */
+.fi-wi-stats-overview-stat:hover {
+    border-color: rgba(251, 191, 36, 0.20) !important;
+    box-shadow: var(--va-ambient-shadow), var(--va-glow) !important;
 }
 
 /* ── 8. TABLES ─────────────────────────────────────────────── */
 .fi-ta-header-cell {
-    background-color: var(--obs-surface-low) !important;
+    background-color: var(--va-surface-low) !important;
     font-family: 'Manrope', sans-serif !important;
     font-size: 0.6875rem !important;
     font-weight: 700 !important;
     letter-spacing: 0.05em !important;
     text-transform: uppercase !important;
-    color: rgba(195, 192, 255, 0.50) !important;
+    color: rgba(251, 191, 36, 0.45) !important;
     border-bottom: none !important;
     padding-top: 0.875rem !important;
     padding-bottom: 0.875rem !important;
 }
 
 .fi-ta-row {
-    border-bottom: 1px solid rgba(70, 69, 85, 0.07) !important;
+    border-bottom: 1px solid rgba(87, 83, 78, 0.08) !important;
     transition: background 0.12s ease !important;
 }
 
 .fi-ta-row:hover {
-    background-color: var(--obs-surface-high) !important;
-    box-shadow: inset 2px 0 0 var(--obs-primary-container) !important;
+    background-color: rgba(41, 37, 36, 0.80) !important;
+    box-shadow: inset 3px 0 0 var(--va-primary-container) !important;
 }
 
 .fi-ta-cell {
     font-family: 'Manrope', sans-serif !important;
-    color: rgba(232, 230, 255, 0.85) !important;
+    color: rgba(245, 239, 225, 0.82) !important;
     border: none !important;
 }
 
@@ -190,70 +233,62 @@ body,
 
 .fi-ta-filters-form,
 .fi-ta-header {
-    background-color: var(--obs-surface-low) !important;
-    border-bottom: 1px solid rgba(70, 69, 85, 0.12) !important;
+    background-color: var(--va-surface-low) !important;
+    border-bottom: 1px solid rgba(87, 83, 78, 0.12) !important;
 }
 
 .fi-ta-content {
-    background-color: var(--obs-surface-container) !important;
+    background-color: var(--va-surface-container) !important;
 }
 
 /* ── 9. BUTTONS ────────────────────────────────────────────── */
 .fi-btn-color-primary {
-    background: var(--obs-gradient) !important;
+    background: var(--va-gradient-button) !important;
     border: none !important;
-    color: #ffffff !important;
+    color: #0c0a09 !important;
     font-family: 'Manrope', sans-serif !important;
-    font-weight: 600 !important;
-    box-shadow: 0 4px 14px rgba(79, 70, 229, 0.35) !important;
+    font-weight: 700 !important;
+    box-shadow: 0 4px 16px rgba(251, 191, 36, 0.25) !important;
     border-radius: 0.5rem !important;
 }
 
 .fi-btn-color-primary:hover {
-    box-shadow: 0 6px 20px rgba(79, 70, 229, 0.50) !important;
-    opacity: 0.92 !important;
+    box-shadow: 0 6px 24px rgba(251, 191, 36, 0.40) !important;
+    filter: brightness(1.08) !important;
 }
 
 .fi-btn-color-gray {
-    background: rgba(45, 52, 73, 0.40) !important;
+    background: rgba(41, 37, 36, 0.50) !important;
     backdrop-filter: blur(10px) !important;
-    border: 1px solid rgba(70, 69, 85, 0.25) !important;
-    color: rgba(232, 230, 255, 0.80) !important;
+    border: 1px solid rgba(87, 83, 78, 0.25) !important;
+    color: rgba(245, 239, 225, 0.75) !important;
     font-family: 'Manrope', sans-serif !important;
     font-weight: 500 !important;
     border-radius: 0.5rem !important;
 }
 
 .fi-btn-color-gray:hover {
-    background: rgba(45, 52, 73, 0.65) !important;
-    color: var(--obs-primary) !important;
+    background: rgba(41, 37, 36, 0.75) !important;
+    color: var(--va-primary-light) !important;
+    border-color: rgba(251, 191, 36, 0.20) !important;
 }
 
 .fi-btn-color-warning {
     background: rgba(251, 146, 60, 0.15) !important;
     border: 1px solid rgba(251, 146, 60, 0.30) !important;
     color: #fb923c !important;
-    font-family: 'Manrope', sans-serif !important;
-    font-weight: 600 !important;
-    border-radius: 0.5rem !important;
 }
 
 .fi-btn-color-danger {
-    background: rgba(239, 68, 68, 0.15) !important;
-    border: 1px solid rgba(239, 68, 68, 0.30) !important;
+    background: rgba(239, 68, 68, 0.12) !important;
+    border: 1px solid rgba(239, 68, 68, 0.25) !important;
     color: #ef4444 !important;
-    font-family: 'Manrope', sans-serif !important;
-    font-weight: 600 !important;
-    border-radius: 0.5rem !important;
 }
 
 .fi-btn-color-success {
-    background: rgba(34, 197, 94, 0.15) !important;
-    border: 1px solid rgba(34, 197, 94, 0.30) !important;
+    background: rgba(34, 197, 94, 0.12) !important;
+    border: 1px solid rgba(34, 197, 94, 0.25) !important;
     color: #22c55e !important;
-    font-family: 'Manrope', sans-serif !important;
-    font-weight: 600 !important;
-    border-radius: 0.5rem !important;
 }
 
 .fi-btn {
@@ -267,9 +302,9 @@ body,
 .fi-input,
 .fi-select-input,
 .fi-textarea {
-    background-color: var(--obs-surface-lowest) !important;
-    border-color: rgba(70, 69, 85, 0.30) !important;
-    color: rgba(232, 230, 255, 0.90) !important;
+    background-color: var(--va-surface-lowest) !important;
+    border-color: rgba(87, 83, 78, 0.30) !important;
+    color: rgba(245, 239, 225, 0.90) !important;
     font-family: 'Manrope', sans-serif !important;
     border-radius: 0.5rem !important;
 }
@@ -277,8 +312,8 @@ body,
 .fi-input:focus,
 .fi-select-input:focus,
 .fi-textarea:focus {
-    border-color: var(--obs-primary) !important;
-    box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.20) !important;
+    border-color: var(--va-primary) !important;
+    box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.15) !important;
     outline: none !important;
 }
 
@@ -287,29 +322,28 @@ body,
     font-size: 0.75rem !important;
     font-weight: 600 !important;
     letter-spacing: 0.02em !important;
-    color: rgba(195, 192, 255, 0.70) !important;
+    color: rgba(251, 191, 36, 0.60) !important;
 }
 
 /* ── 11. MODALS & POPOVERS ─────────────────────────────────── */
 .fi-modal-window,
 .fi-ac-modal {
-    background: rgba(26, 36, 56, 0.90) !important;
+    background: rgba(28, 25, 23, 0.92) !important;
     backdrop-filter: blur(24px) !important;
     -webkit-backdrop-filter: blur(24px) !important;
-    border: 1px solid rgba(70, 69, 85, 0.20) !important;
-    border-radius: 1.25rem !important;
-    box-shadow: var(--obs-ambient-shadow), var(--obs-inner-stroke) !important;
+    border: 1px solid rgba(87, 83, 78, 0.20) !important;
+    border-radius: 1rem !important;
+    box-shadow: var(--va-ambient-shadow) !important;
 }
 
 .fi-modal-header {
-    border-bottom: 1px solid rgba(70, 69, 85, 0.15) !important;
+    border-bottom: 1px solid rgba(87, 83, 78, 0.15) !important;
 }
 
 .fi-modal-heading {
     font-family: 'Manrope', sans-serif !important;
     font-weight: 700 !important;
-    letter-spacing: -0.01em !important;
-    color: #e8e6ff !important;
+    color: #fef3c7 !important;
 }
 
 /* ── 12. BADGES ────────────────────────────────────────────── */
@@ -318,17 +352,17 @@ body,
     font-size: 0.6875rem !important;
     font-weight: 600 !important;
     border-radius: 9999px !important;
-    padding: 0.2rem 0.6rem !important;
+    padding: 0.2rem 0.625rem !important;
     letter-spacing: 0.02em !important;
 }
 
 /* ── 13. NOTIFICATIONS ─────────────────────────────────────── */
 .fi-no-notification {
-    background: rgba(26, 36, 56, 0.92) !important;
+    background: rgba(28, 25, 23, 0.94) !important;
     backdrop-filter: blur(20px) !important;
-    border: 1px solid rgba(70, 69, 85, 0.20) !important;
-    border-radius: 1rem !important;
-    box-shadow: var(--obs-ambient-shadow) !important;
+    border: 1px solid rgba(87, 83, 78, 0.20) !important;
+    border-radius: 0.875rem !important;
+    box-shadow: var(--va-ambient-shadow) !important;
 }
 
 /* ── 14. PAGE HEADERS ──────────────────────────────────────── */
@@ -337,12 +371,12 @@ body,
     font-weight: 800 !important;
     font-size: 1.75rem !important;
     letter-spacing: -0.02em !important;
-    color: #e8e6ff !important;
+    color: #fef3c7 !important;
 }
 
 .fi-header-subheading {
     font-family: 'Manrope', sans-serif !important;
-    color: rgba(195, 192, 255, 0.55) !important;
+    color: rgba(245, 239, 225, 0.50) !important;
 }
 
 .fi-breadcrumbs-item {
@@ -354,38 +388,40 @@ body,
 .fi-pagination-item-btn {
     font-family: 'Manrope', sans-serif !important;
     background: transparent !important;
-    border: 1px solid rgba(70, 69, 85, 0.20) !important;
-    color: rgba(195, 192, 255, 0.70) !important;
+    border: 1px solid rgba(87, 83, 78, 0.20) !important;
+    color: rgba(245, 239, 225, 0.65) !important;
     border-radius: 0.5rem !important;
 }
 
 .fi-pagination-item-btn[aria-current="page"] {
-    background: var(--obs-gradient) !important;
+    background: var(--va-gradient-button) !important;
     border-color: transparent !important;
-    color: #ffffff !important;
+    color: #0c0a09 !important;
+    font-weight: 700 !important;
 }
 
 /* ── 16. LOGIN PAGE ────────────────────────────────────────── */
 .fi-simple-layout {
-    background: var(--obs-surface) !important;
+    background: var(--va-surface) !important;
     background-image:
-        radial-gradient(ellipse at 20% 30%, rgba(79,70,229,0.12) 0%, transparent 60%),
-        radial-gradient(ellipse at 80% 70%, rgba(195,192,255,0.06) 0%, transparent 60%) !important;
+        radial-gradient(ellipse at 30% 20%, rgba(180, 83, 9, 0.15) 0%, transparent 55%),
+        radial-gradient(ellipse at 70% 80%, rgba(251, 191, 36, 0.06) 0%, transparent 55%),
+        radial-gradient(ellipse at 50% 50%, rgba(120, 53, 15, 0.08) 0%, transparent 70%) !important;
 }
 
 .fi-simple-page {
-    background: var(--obs-glass-bg) !important;
-    backdrop-filter: blur(24px) !important;
-    -webkit-backdrop-filter: blur(24px) !important;
-    border: 1px solid rgba(70, 69, 85, 0.20) !important;
-    border-radius: 1.5rem !important;
-    box-shadow: var(--obs-ambient-shadow), var(--obs-inner-stroke) !important;
+    background: rgba(28, 25, 23, 0.75) !important;
+    backdrop-filter: blur(24px) saturate(1.3) !important;
+    -webkit-backdrop-filter: blur(24px) saturate(1.3) !important;
+    border: 1px solid rgba(251, 191, 36, 0.10) !important;
+    border-radius: 1.25rem !important;
+    box-shadow: var(--va-ambient-shadow), 0 0 80px rgba(251, 191, 36, 0.04) !important;
 }
 
 /* ── 17. SCROLLBARS ────────────────────────────────────────── */
 * {
     scrollbar-width: thin !important;
-    scrollbar-color: rgba(70, 69, 85, 0.50) transparent !important;
+    scrollbar-color: rgba(87, 83, 78, 0.50) transparent !important;
 }
 
 *::-webkit-scrollbar {
@@ -398,7 +434,7 @@ body,
 }
 
 *::-webkit-scrollbar-thumb {
-    background-color: rgba(70, 69, 85, 0.50) !important;
+    background-color: rgba(87, 83, 78, 0.50) !important;
     border-radius: 9999px !important;
 }
 
@@ -409,15 +445,14 @@ body,
     font-weight: 700 !important;
     letter-spacing: 0.05em !important;
     text-transform: uppercase !important;
-    color: rgba(195, 192, 255, 0.50) !important;
+    color: rgba(251, 191, 36, 0.45) !important;
 }
 
 .fi-in-text {
     font-family: 'Manrope', sans-serif !important;
-    color: rgba(232, 230, 255, 0.85) !important;
+    color: rgba(245, 239, 225, 0.85) !important;
 }
 
-/* Scrollable scraped content blocks */
 .fi-in-text .prose,
 .fi-in-text pre {
     max-height: 70vh;
@@ -431,53 +466,78 @@ body,
 .fi-wi-header-heading {
     font-family: 'Manrope', sans-serif !important;
     font-weight: 700 !important;
-    color: rgba(232, 230, 255, 0.90) !important;
-    letter-spacing: -0.01em !important;
+    color: rgba(245, 239, 225, 0.90) !important;
 }
 
 /* ── 20. DROPDOWN MENUS ────────────────────────────────────── */
 .fi-dropdown-panel {
-    background: rgba(26, 36, 56, 0.95) !important;
+    background: rgba(28, 25, 23, 0.96) !important;
     backdrop-filter: blur(20px) !important;
-    border: 1px solid rgba(70, 69, 85, 0.20) !important;
+    border: 1px solid rgba(87, 83, 78, 0.20) !important;
     border-radius: 0.75rem !important;
-    box-shadow: var(--obs-ambient-shadow) !important;
+    box-shadow: var(--va-ambient-shadow) !important;
 }
 
 .fi-dropdown-list-item-label {
     font-family: 'Manrope', sans-serif !important;
-    color: rgba(232, 230, 255, 0.80) !important;
+    color: rgba(245, 239, 225, 0.80) !important;
 }
 
 .fi-dropdown-list-item:hover {
-    background-color: rgba(79, 70, 229, 0.12) !important;
+    background-color: rgba(251, 191, 36, 0.08) !important;
 }
 
 /* ── 21. TABS ──────────────────────────────────────────────── */
 .fi-tabs-tab {
     font-family: 'Manrope', sans-serif !important;
     font-weight: 600 !important;
-    color: rgba(195, 192, 255, 0.55) !important;
+    color: rgba(245, 239, 225, 0.50) !important;
 }
 
 .fi-tabs-tab-active,
 .fi-tabs-tab[aria-selected="true"] {
-    color: var(--obs-primary) !important;
-    border-color: var(--obs-primary-container) !important;
+    color: var(--va-primary) !important;
+    border-color: var(--va-primary) !important;
 }
 
-/* ── 22. TENANT/BRAND AREA ─────────────────────────────────── */
+/* ── 22. BRAND / LOGO ──────────────────────────────────────── */
 .fi-sidebar-header {
-    border-bottom: 1px solid rgba(70, 69, 85, 0.12) !important;
+    border-bottom: 1px solid rgba(87, 83, 78, 0.12) !important;
     padding: 1rem 1.25rem !important;
 }
 
-.fi-logo-text {
+.fi-logo-text,
+.fi-topbar .fi-logo span,
+.fi-topbar [class*="brand"] {
     font-family: 'Manrope', sans-serif !important;
     font-weight: 800 !important;
     letter-spacing: -0.02em !important;
-    background: var(--obs-gradient) !important;
+    background: var(--va-gradient) !important;
     -webkit-background-clip: text !important;
     -webkit-text-fill-color: transparent !important;
     background-clip: text !important;
+}
+
+/* ── 23. TOPBAR GLOBAL SEARCH ──────────────────────────────── */
+.fi-global-search-input {
+    background-color: rgba(12, 10, 9, 0.60) !important;
+    border: 1px solid rgba(87, 83, 78, 0.25) !important;
+    color: rgba(245, 239, 225, 0.85) !important;
+    font-family: 'Manrope', sans-serif !important;
+    border-radius: 0.5rem !important;
+}
+
+.fi-global-search-input:focus {
+    border-color: var(--va-primary) !important;
+    box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.12) !important;
+}
+
+/* ── 24. DATA IMPORT HUB — custom page accents ─────────────── */
+.data-import-hub .fi-section {
+    border-left: 3px solid rgba(251, 191, 36, 0.25) !important;
+}
+
+.data-import-hub .fi-section:hover {
+    border-left-color: var(--va-primary) !important;
+    box-shadow: var(--va-ambient-shadow), var(--va-glow) !important;
 }

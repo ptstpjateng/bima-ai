@@ -144,6 +144,78 @@ def pdf_pipeline_status(job_id: int) -> JSONResponse:
     return JSONResponse(content={"job_id": job_id, **_pdf_jobs[job_id]})
 
 
+# ── Excel ETL → ChromaDB endpoint ─────────────────────────────────────────────
+
+_etl_state = {
+    "running":      False,
+    "status":       "idle",
+    "started_at":   None,
+    "finished_at":  None,
+    "last_message": "",
+}
+
+
+@app.post("/pipeline/etl-excel", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_etl_excel(background_tasks: BackgroundTasks) -> JSONResponse:
+    """
+    Run etl_pipeline.py to rebuild ChromaDB oss_regulations from Excel data.
+    Non-blocking — returns 409 if already running.
+    """
+    if _etl_state["running"]:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"message": "ETL pipeline already running", **_etl_state},
+        )
+    background_tasks.add_task(_run_etl_pipeline)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"message": "ETL pipeline started", "status": "accepted"},
+    )
+
+
+@app.get("/pipeline/etl-excel/status")
+def etl_pipeline_status() -> dict:
+    return dict(_etl_state)
+
+
+async def _run_etl_pipeline() -> None:
+    """Run etl_pipeline.py as a subprocess."""
+    _etl_state["running"]     = True
+    _etl_state["status"]      = "running"
+    _etl_state["started_at"]  = datetime.now(timezone.utc).isoformat()
+    _etl_state["finished_at"] = None
+    logger.info("ETL Excel pipeline subprocess started")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "etl_pipeline.py",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd="/app",
+        )
+
+        output_lines = []
+        async for raw_line in proc.stdout:
+            line = raw_line.decode(errors="replace").rstrip()
+            output_lines.append(line)
+            logger.info("[etl_excel] %s", line)
+
+        rc = await proc.wait()
+        _etl_state["status"]       = "done" if rc == 0 else "error"
+        _etl_state["last_message"] = output_lines[-1] if output_lines else f"exit={rc}"
+        logger.info("ETL Excel pipeline finished | returncode=%d", rc)
+
+    except Exception as exc:
+        logger.exception("ETL Excel pipeline raised an exception")
+        _etl_state["status"]       = "error"
+        _etl_state["last_message"] = str(exc)
+
+    finally:
+        _etl_state["running"]     = False
+        _etl_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
 # ── Background runners ────────────────────────────────────────────────────────
 
 async def _run_pipeline(limit: int) -> None:

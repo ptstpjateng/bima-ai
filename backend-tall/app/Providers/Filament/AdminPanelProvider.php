@@ -28,22 +28,28 @@ class AdminPanelProvider extends PanelProvider
             ->path('admin')
             ->viteTheme('resources/css/filament/admin/theme.css')
             ->login()
+            ->topNavigation()
             ->colors([
                 'primary' => [
-                    50  => '237 233 254',
-                    100 => '221 214 254',
-                    200 => '196 181 253',
-                    300 => '167 139 250',
-                    400 => '139 92 246',
-                    500 => '109 40 217',
-                    600 => '79 70 229',
-                    700 => '67 56 202',
-                    800 => '55 48 163',
-                    900 => '46 16 101',
-                    950 => '29 10 64',
+                    50  => '255 251 235',
+                    100 => '254 243 199',
+                    200 => '253 230 138',
+                    300 => '252 211 77',
+                    400 => '251 191 36',
+                    500 => '245 158 11',
+                    600 => '217 119 6',
+                    700 => '180 83 9',
+                    800 => '146 64 14',
+                    900 => '120 53 15',
+                    950 => '69 26 3',
                 ],
+                'danger' => Color::Rose,
+                'gray' => Color::Stone,
+                'info' => Color::Sky,
+                'success' => Color::Emerald,
+                'warning' => Color::Orange,
             ])
-            ->brandName('BIMA-AI Admin')
+            ->brandName('BIMA-AI')
             ->font('Manrope', provider: \Filament\FontProviders\GoogleFontProvider::class)
             ->discoverResources(in: app_path('Filament/Resources'), for: 'App\Filament\Resources')
             ->discoverPages(in: app_path('Filament/Pages'), for: 'App\Filament\Pages')

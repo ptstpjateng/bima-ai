@@ -22,7 +22,7 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 
 For ANY frontend changes in Filament or Next.js, you MUST first read design.md and strictly apply its color codes, typography (Manrope), and glassmorphism rules. Do not use default Tailwind borders or pure black/white backgrounds.
 
-The canonical design system is **The Ethereal Slate / Digital Observatory** — deep slate palette (`surface` #0b1326, `surface_container_low` #131b2e, `surface_container_highest` #2d3449), Manrope typeface, frosted glass cards with `backdrop-blur` 12–25px, indigo-to-lavender primary gradient (#4f46e5 → #c3c0ff), and the strict "No-Line Rule" (no solid borders for layout separation).
+The canonical design system is **Volcanic Amber / Molten Command Center** — deep obsidian-black base (`surface` #0c0a09, `surface_low` #1c1917, `surface_container` #292524), Manrope typeface, frosted glass cards with warm-tinted `backdrop-blur`, amber-to-gold primary gradient (#d97706 → #f59e0b), and **Top Navigation** layout. Previous theme was "Ethereal Slate" (indigo). The strict "No-Line Rule" still applies.
 
 Reference file: **[design.md](./design.md)**
 
@@ -48,7 +48,14 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 ### SSH Access
 *   **SSH Command:** `ssh bima-vps` → `wdnsds@116.254.113.81:2222` using `~/.ssh/id_bima_vps`
 *   **Project directory:** `~/bima-ai` on VPS
-*   **Deploy:** `ssh bima-vps "cd ~/bima-ai && docker compose pull && docker compose up -d --remove-orphans"`
+*   **Deploy (preferred — via git):**
+    ```bash
+    cd ~/bima-ai-project && git add -A && git commit -m "..." && git push
+    ssh bima-vps "cd ~/bima-ai && git pull && docker compose up -d --build --remove-orphans"
+    ```
+    Then run migrations: `ssh bima-vps "cd ~/bima-ai && docker compose exec backend php artisan migrate --force && docker compose exec backend php artisan optimize:clear"`
+*   **Vite theme build:** Node.js is not in the runtime container. Build assets locally or on VPS via fnm (`export PATH="$HOME/.local/share/fnm:$PATH" && eval "$(fnm env)"`), then commit `public/build/` to git.
+*   **Deploy (legacy direct):** `ssh bima-vps "cd ~/bima-ai && docker compose pull && docker compose up -d --remove-orphans"`
 
 ### Service Map
 | Service | Internal | Public | Notes |
@@ -59,6 +66,16 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 | **postgres** | `postgres:5432` | — | internal only |
 | **redis** | `redis:6379` | — | internal only |
 | **frontend** | — | Vercel | decoupled, git auto-deploy |
+| **data-pipeline** (FastAPI) | `data-pipeline:9000` | — | ETL + Playwright scraper |
+
+### KBLI / PB UMKU Data Architecture
+*   **Source of truth:** PostgreSQL tables `kblis` (14 columns incl. `sektor`) and `pb_umkus` (7 columns)
+*   **Excel headers (kbli.xlsx):** No | Kode KBLI | Judul KBLI | Ruang Lingkup | Skala Usaha | Tingkat Risiko | Perizinan Berusaha | Persyaratan | Jangka Waktu Penerbitan | Kewajiban | PB UMKU | Parameter | Kewenangan | **Sektor**
+*   **Excel headers (pb umku.xlsx):** No | Nomeklatur PB UMKU | Persyaratan | Jangka Waktu Penerbitan | Kewajiban | Masa Berlaku | Parameter | Kewenangan
+*   **KBLI codes are 5 digits, zero-padded** (e.g. `03111` not `3111`). Excel stores them as floats — always `zfill(5)`.
+*   **Import flow:** Upload Excel via Filament Data Import Hub (`/admin/data-import-hub`) → truncate+parse to PostgreSQL → click "Sync ke ChromaDB" → `POST data-pipeline:9000/pipeline/etl-excel` → runs `etl_pipeline.py` → rebuilds `oss_regulations` collection in ChromaDB
+*   **ETL script:** `data-pipeline/etl_pipeline.py` — deterministic Pandas pipeline, no LLM calls. Handles merged-cell forward-fill, multi-value Skala Usaha expansion, PB UMKU relational merge, semantic chunking, ChromaDB upsert with metadata filters.
+*   **Raw Excel files on VPS:** `data-pipeline/data/raw_excel/kbli.xlsx` and `pb_umku.xlsx` (mounted at `/app/data/raw_excel/` inside container)
 
 ### Nginx Routing (port 80)
 *   `/webhook/` → `ai-engine:8000`
@@ -128,7 +145,9 @@ DB_PASSWORD=<see VPS>
 
 > **Ollama proxy:** The pipeline container cannot reach `127.0.0.1:11434` directly. A Python TCP proxy (`~/ollama-proxy.py`) runs in a `screen` session named `ollama-proxy`, forwarding `0.0.0.0:11435 → 127.0.0.1:11434`. If the proxy dies, restart with: `screen -dmS ollama-proxy python3 ~/ollama-proxy.py`
 
-> **Pipeline worker:** `data-pipeline/run_pipeline_ollama.py` — called by `server.py` via `POST /pipeline/trigger?limit=N`. Reads `kbli_scrape_targets` for `status='pending'`, marks as `scraping`, scrapes OSS with Playwright (tabs + accordions), extracts with Gemini (falls back to Ollama), converts JSON to semantic Markdown chunks in ChromaDB, saves raw JSON to `scraped_content` column, sets `status='done'`.
+> **Pipeline worker (scraper):** `data-pipeline/run_pipeline_ollama.py` — called by `server.py` via `POST /pipeline/trigger?limit=N`. Reads `kbli_scrape_targets` for `status='pending'`, marks as `scraping`, scrapes OSS with Playwright (tabs + accordions), extracts with Gemini (falls back to Ollama), converts JSON to semantic Markdown chunks in ChromaDB, saves raw JSON to `scraped_content` column, sets `status='done'`.
+
+> **Pipeline worker (Excel ETL):** `data-pipeline/etl_pipeline.py` — called by `server.py` via `POST /pipeline/etl-excel`. Pure deterministic Pandas pipeline (no LLM). Reads Excel files from `/app/data/raw_excel/`, cleans merged cells, zero-pads KBLI codes, expands multi-value Skala Usaha, merges PB UMKU relations, generates semantic Markdown chunks, upserts to ChromaDB `oss_regulations` collection. Status: `GET /pipeline/etl-excel/status`.
 
 > **Note on table name:** The scrape queue is `kbli_scrape_targets` (not `knowledge_bases`). The `scraped_content TEXT` column was added manually via `ALTER TABLE`.
 
