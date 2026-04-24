@@ -405,3 +405,99 @@ POST /webhook/chat  (ai-engine — via AI_ENGINE_URL env var)
 | 6 | Conversation history is in-memory — lost on container restart | Low | Accepted for hackathon |
 
 > Previously tracked issues now resolved: business profile empty (fixed: auto-upserted on permit apply), no rate limiting (fixed: `throttle:120,1` on API + 5 msg/min in ai-engine).
+
+---
+
+---
+
+# Status Snapshot — 2026-04-13
+
+> **Updated:** 2026-04-13 | **Diff from:** 2026-04-10
+
+## What Changed Since Last Snapshot
+
+### Design System — Volcanic Amber (New)
+The entire admin panel theme was migrated from **Ethereal Slate** (indigo) to **Volcanic Amber / Molten Command Center**:
+- Base surface: `#0c0a09` (obsidian-black), `#1c1917`, `#292524`
+- Primary gradient: amber `#d97706` → gold `#f59e0b`
+- Frosted-glass cards with warm `backdrop-blur`
+- Typeface: Manrope (unchanged)
+- Layout: Top Navigation (replaces sidebar)
+- Applied to: all Filament pages, widgets, and admin resources
+
+> Previous "Ethereal Slate" (indigo) references in the status above are now outdated — the live panel uses Volcanic Amber.
+
+### KBLI / PB UMKU Data Hub (New — Filament)
+New Filament page at `/admin/data-import-hub`:
+- Upload KBLI Excel + PB UMKU Excel via Filament file upload (supports up to 300 MB)
+- Button: **"Sync ke ChromaDB"** → calls `POST data-pipeline:9000/pipeline/etl-excel`
+- Replaces the old manual `scp` + script workflow
+
+### Excel ETL Pipeline (New — `data-pipeline/etl_pipeline.py`)
+Fully deterministic Pandas pipeline, **no LLM calls**:
+- Reads `kbli.xlsx` + `pb_umku.xlsx` from `/app/data/raw_excel/`
+- Handles merged-cell forward-fill
+- Zero-pads KBLI codes to 5 digits (Excel stores as float)
+- Expands multi-value `Skala Usaha` rows
+- Merges PB UMKU relational data
+- Generates semantic Markdown chunks
+- Upserts into ChromaDB `oss_regulations` collection with full metadata
+- Fix applied (2026-04-13): handles mid-word hyphenation in Excel cells (e.g. `pe-nerbitan` → `penerbitan`)
+
+### Backend — phpoffice/phpspreadsheet Added
+`phpoffice/phpspreadsheet` added to `backend-tall` composer dependencies to support Excel file processing within the Laravel/Filament layer (composer.lock updated).
+
+### Data Pipeline — ETL API Endpoints
+| Endpoint | Method | Description |
+|---|---|---|
+| `/pipeline/etl-excel` | POST | Trigger Excel → PostgreSQL → ChromaDB ETL |
+| `/pipeline/etl-excel/status` | GET | Poll ETL job progress |
+
+---
+
+## Component Completion Status (2026-04-13)
+
+### Pillar 1 — AI Engine (FastAPI + ChromaDB)
+
+| Component | Status | Change |
+|---|---|---|
+| Telegram webhook receiver | ✅ Done | — |
+| Web chat endpoint | ✅ Done | — |
+| RAG + intent classification | ✅ Done | — |
+| Data pipeline (scraper) | ✅ Running | 35+ KBLI done (Excel ETL now primary source) |
+| **Excel ETL pipeline** | ✅ Done | **NEW** — deterministic, no LLM |
+| **ETL API endpoints** | ✅ Done | **NEW** — `/pipeline/etl-excel` + status |
+| WhatsApp | ⏳ Not configured | — |
+
+### Pillar 2 — TALL Backend (Laravel + Filament)
+
+| Component | Status | Change |
+|---|---|---|
+| All previously listed | ✅ Done | — |
+| **Volcanic Amber theme** | ✅ Done | **NEW** — replaces Ethereal Slate |
+| **Data Import Hub page** | ✅ Done | **NEW** — `/admin/data-import-hub` |
+| **phpspreadsheet dep** | ✅ Done | **NEW** — Excel upload support |
+
+### Pillar 3 — Next.js Frontend
+
+| Component | Status | Change |
+|---|---|---|
+| All previously listed | ✅ Done | — |
+| **Design references** | ⚠️ Check | Frontend still references Ethereal Slate tokens — may need Volcanic Amber audit |
+| Business dashboard (post-license) | ⏳ Not built | — |
+| React Native mobile app | ⏳ Not started | — |
+
+---
+
+## Known Issues (2026-04-13)
+
+| # | Issue | Severity | Status |
+|---|---|---|---|
+| 1 | WhatsApp webhook not connected (no Meta token) | Medium | Blocked — Phase D |
+| 2 | Gemma response time 25–55s | Info | Accepted |
+| 3 | `sentence-transformers` version pinned (`huggingface-hub==0.27.0`) | Low | Monitoring |
+| 4 | ChromaDB KBLI coverage: 35+ of thousands | Low | Excel ETL now faster path |
+| 5 | AI-engine rate limiter / conversation history in-memory | Low | Accepted for hackathon |
+| 6 | Next.js frontend may still use old Ethereal Slate color tokens | Low | Needs audit |
+
+> **Resolved since 2026-04-10:** mid-word hyphenation in Excel ETL (fixed commit `21f07b0`); Excel ETL pipeline now production-ready and replaces PDF-based AI scraper as primary KBLI data ingestion path.

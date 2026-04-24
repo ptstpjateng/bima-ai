@@ -30,6 +30,7 @@ from services.ai_handler import (
     generate_ai_response,
     handle_start_command,
     handle_telegram_link,
+    log_to_backend,
     process_message,
 )
 
@@ -444,7 +445,7 @@ class ChatRequest(BaseModel):
 
 
 @router.post("/webhook/chat", status_code=status.HTTP_200_OK)
-async def web_chat(body: ChatRequest) -> JSONResponse:
+async def web_chat(body: ChatRequest, background_tasks: BackgroundTasks) -> JSONResponse:
     """
     Synchronous web chat for the Next.js portal.
     Accepts { user_id, message } and returns { response, elapsed }.
@@ -464,6 +465,7 @@ async def web_chat(body: ChatRequest) -> JSONResponse:
             "Web chat done | user_id=%s | elapsed=%.2fs | request_id=%s",
             body.user_id, elapsed, request_id,
         )
+        background_tasks.add_task(log_to_backend, body.user_id, body.message, response, "web")
         return JSONResponse({"response": response, "elapsed": elapsed})
     except Exception:
         logger.exception("Web chat failed | user_id=%s | request_id=%s", body.user_id, request_id)

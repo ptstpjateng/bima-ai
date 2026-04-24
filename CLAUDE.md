@@ -62,7 +62,7 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 |---|---|---|---|
 | **nginx** | — | `:80` | Sole public entry point |
 | **backend** (FrankenPHP) | `backend:80` | `:8000` (direct debug) | Laravel 13 + Filament |
-| **ai-engine** (FastAPI) | `ai-engine:8000` | via `/webhook/` only | ChromaDB embedded |
+| **ai-engine** (FastAPI) | `ai-engine:8000` | via `/webhook/` only | ChromaDB embedded
 | **postgres** | `postgres:5432` | — | internal only |
 | **redis** | `redis:6379` | — | internal only |
 | **frontend** | — | Vercel | decoupled, git auto-deploy |

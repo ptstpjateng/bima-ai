@@ -752,5 +752,5 @@ async def process_message(
     except Exception:
         logger.exception("Reply dispatch failed | platform=%s | user_id=%s", platform, user_id)
 
-    await log_to_backend(user_id, message, ai_response)
+    await log_to_backend(user_id, message, ai_response, channel=platform)
     logger.info("Pipeline complete | platform=%s | user_id=%s", platform, user_id)

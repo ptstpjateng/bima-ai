@@ -8,7 +8,8 @@
       "Bash(rmdir _laravel_tmp)",
       "Bash(composer require:*)",
       "Bash(composer show:*)",
-      "Bash(php artisan:*)"
+      "Bash(php artisan:*)",
+      "Skill(update-config)"
     ]
   }
 }
