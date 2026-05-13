@@ -1,0 +1,125 @@
+name: CI
+
+# Lint backend, build all three Docker images, build the frontend.
+# Runs on every PR (against any base branch) and on direct pushes to main.
+# No secrets, no deploy steps — pure breakage detection before merge.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Cancel superseded runs on the same ref so a quick succession of pushes
+# doesn't rack up minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-lint:
+    name: backend-tall · PHP lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: pdo_pgsql, pgsql, redis, intl, zip, bcmath, pcntl, opcache, exif, gd
+          tools: composer:v2
+          coverage: none
+
+      - name: Cache composer vendor
+        uses: actions/cache@v4
+        with:
+          path: backend-tall/vendor
+          key: composer-${{ runner.os }}-${{ hashFiles('backend-tall/composer.lock') }}
+          restore-keys: |
+            composer-${{ runner.os }}-
+
+      - name: Install composer dependencies
+        working-directory: backend-tall
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Bootstrap .env so artisan can boot
+        working-directory: backend-tall
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Lint every PHP file under app/
+        working-directory: backend-tall
+        run: find app -name "*.php" -exec php -l {} \;
+
+      - name: Verify config loads (artisan boot smoke test)
+        working-directory: backend-tall
+        run: php artisan config:show app
+
+  ai-engine-build:
+    name: ai-engine · docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (cache via gha)
+        uses: docker/build-push-action@v6
+        with:
+          context: ai-engine
+          file: ai-engine/Dockerfile
+          push: false
+          cache-from: type=gha,scope=ai-engine
+          cache-to: type=gha,mode=max,scope=ai-engine
+
+  data-pipeline-build:
+    name: data-pipeline · docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (cache via gha)
+        uses: docker/build-push-action@v6
+        with:
+          context: data-pipeline
+          file: data-pipeline/Dockerfile
+          push: false
+          cache-from: type=gha,scope=data-pipeline
+          cache-to: type=gha,mode=max,scope=data-pipeline
+
+  frontend-build:
+    name: frontend · npm build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
