@@ -91,3 +91,33 @@ export interface Paginated<T> {
   page: number;
   limit: number;
 }
+
+/* ---------------------------------------------------------------------------
+ * Ingestion sources (Sprint C — `/data` page).
+ * Mirrors admin-api `app/schemas/ingestion.py`. Keep these literal unions in
+ * sync — Pydantic enforces them server-side, but the TS literal types let us
+ * narrow on the badge variant without `as` casts.
+ * ------------------------------------------------------------------------ */
+export type IngestionKind =
+  | "pdf"
+  | "excel_kbli"
+  | "excel_pb_umku"
+  | "url"
+  | "text"
+  | "docx";
+
+export type IngestionStatus = "pending" | "processing" | "done" | "failed";
+
+export interface IngestionSource {
+  id: number;
+  kind: IngestionKind;
+  display_name: string;
+  object_key: string | null;
+  metadata_json: Record<string, unknown>;
+  status: IngestionStatus;
+  chunks_indexed: number;
+  error: string | null;
+  created_by: number | null;
+  created_at: string;
+  last_run_at: string | null;
+}

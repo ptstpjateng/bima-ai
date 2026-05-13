@@ -68,6 +68,9 @@ services:
     volumes:
       - ./data-pipeline/data:/app/data
       - backend_storage:/app/backend_storage:ro  # read-only access to backend uploads
+      # Sprint C: ingestion-upload volume. admin-api writes here as
+      # /app/uploads (rw); data-pipeline reads via /app/data/uploads.
+      - ingestion_uploads:/app/data/uploads:ro
     networks:
       - bima-internal
     depends_on:
@@ -95,6 +98,14 @@ services:
       # are accepted, in addition to admin.nolongin.com (the eventual Vercel host).
       ADMIN_FRONTEND_URL: https://admin.nolongin.com,https://nolongin.com
       LOG_LEVEL: INFO
+      # Sprint C ingestion-upload: tell admin-api where data-pipeline lives
+      # so /ingestion/upload can trigger /pipeline/etl-excel on the internal
+      # bima-internal network.
+      DATA_PIPELINE_URL: http://data-pipeline:9000
+    volumes:
+      # rw mount of the shared ingestion volume; data-pipeline reads the
+      # same volume read-only under /app/data/uploads.
+      - ingestion_uploads:/app/uploads
     networks:
       - bima-internal
       - bima-public
@@ -225,3 +236,7 @@ volumes:
   backend_storage:
   caddy_data:
   caddy_config:
+  # Sprint C ingestion-upload: shared between admin-api (rw, /app/uploads)
+  # and data-pipeline (ro, /app/data/uploads). Admins drop XLSX files via
+  # the /data page; data-pipeline reads them by absolute path.
+  ingestion_uploads:

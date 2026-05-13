@@ -33,6 +33,10 @@ dependencies = [
     # Service-to-service HTTP (used by Phase 2 endpoints; pinned now so the
     # image is built once).
     "httpx>=0.27.0,<0.28",
+
+    # FastAPI multipart parser — required for UploadFile / Form fields on the
+    # /ingestion/upload endpoint (Sprint C ingestion-upload feature).
+    "python-multipart>=0.0.12,<0.0.20",
 ]
 
 [project.optional-dependencies]

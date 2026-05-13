@@ -16,6 +16,7 @@ worker hooks.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import time
@@ -30,7 +31,11 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from app.config import get_settings
-from app.routers import ai_interactions, auth, dashboard, health, kbli
+from app.routers import ai_interactions, auth, dashboard, health, ingestion, kbli
+from app.services.status_reconciler import (
+    POLL_INTERVAL_SECONDS as _RECONCILER_INTERVAL,
+    run_reconciler_loop,
+)
 
 # ---------------------------------------------------------------------------
 # Structured logging — same shape as ai-engine so log aggregators can parse
@@ -59,8 +64,25 @@ async def lifespan(app: FastAPI):
         _settings.cors_origins,
         _settings.trusted_hosts,
     )
-    yield
-    logger.info("admin-api shutting down.")
+
+    # Status reconciler: polls data-pipeline /etl-excel/status and flips
+    # ingestion_sources rows out of `processing` once a run finishes. Without
+    # this, uploads stay stuck on `processing` forever — there's no callback
+    # channel from the pipeline back to admin-api.
+    reconciler_stop = asyncio.Event()
+    reconciler_task = asyncio.create_task(
+        run_reconciler_loop(reconciler_stop), name="ingestion_status_reconciler"
+    )
+
+    try:
+        yield
+    finally:
+        logger.info("admin-api shutting down.")
+        reconciler_stop.set()
+        try:
+            await asyncio.wait_for(reconciler_task, timeout=_RECONCILER_INTERVAL + 1)
+        except asyncio.TimeoutError:
+            reconciler_task.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -199,3 +221,4 @@ app.include_router(
     tags=["AI Interactions"],
 )
 app.include_router(kbli.router, prefix="/kbli", tags=["KBLI"])
+app.include_router(ingestion.router, prefix="/ingestion", tags=["Ingestion"])

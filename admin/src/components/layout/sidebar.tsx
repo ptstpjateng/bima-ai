@@ -6,6 +6,7 @@ import {
   LayoutDashboard,
   MessageCircle,
   FileText,
+  Database,
   Settings,
   type LucideIcon,
 } from "lucide-react";
@@ -25,6 +26,7 @@ const NAV_ITEMS: NavItem[] = [
   { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
   { label: "AI Interactions", href: "/ai-interactions", icon: MessageCircle },
   { label: "KBLI", href: "/kbli", icon: FileText },
+  { label: "Sumber Data", href: "/data", icon: Database },
   { label: "Settings", href: "/settings", icon: Settings, disabled: true },
 ];
 

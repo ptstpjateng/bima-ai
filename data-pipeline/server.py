@@ -16,10 +16,11 @@ Runs on port 9000 inside the bima-internal Docker network.
 """
 import asyncio
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 
-from fastapi import BackgroundTasks, FastAPI, status
+from fastapi import BackgroundTasks, Body, FastAPI, status
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(
@@ -146,19 +147,43 @@ def pdf_pipeline_status(job_id: int) -> JSONResponse:
 
 # ── Excel ETL → ChromaDB endpoint ─────────────────────────────────────────────
 
-_etl_state = {
-    "running":      False,
-    "status":       "idle",
-    "started_at":   None,
-    "finished_at":  None,
-    "last_message": "",
+_etl_state: dict = {
+    "running":        False,
+    "status":         "idle",
+    "started_at":     None,
+    "finished_at":    None,
+    "last_message":   "",
+    # Populated by parsing `[etl] indexed <N> chunks` from the subprocess
+    # stdout. None until the subprocess emits that line. Sprint C ingestion
+    # UI surfaces this back to the admin.
+    "chunks_indexed": None,
 }
+
+# Subprocess emits this exact line at the end of a successful run, e.g.
+# `[etl] indexed 306 chunks`. Anchor on `[etl]` so log noise doesn't match.
+_CHUNKS_INDEXED_RE = re.compile(r"^\[etl\]\s+indexed\s+(\d+)\s+chunks", re.IGNORECASE)
+
+# Belt-and-suspenders: caller-supplied paths must live under this prefix.
+# The volume mount already enforces this, but a defensive check guards
+# against future misconfiguration.
+_ALLOWED_ETL_PATH_PREFIX = "/app/data/"
 
 
 @app.post("/pipeline/etl-excel", status_code=status.HTTP_202_ACCEPTED)
-async def trigger_etl_excel(background_tasks: BackgroundTasks) -> JSONResponse:
+async def trigger_etl_excel(
+    background_tasks: BackgroundTasks,
+    body: dict | None = Body(default=None),
+) -> JSONResponse:
     """
     Run etl_pipeline.py to rebuild ChromaDB oss_regulations from Excel data.
+
+    Body (optional, JSON):
+        kbli_path:   abs path to the KBLI .xlsx (under /app/data/)
+        pb_umku_path: abs path to the PB UMKU .xlsx (under /app/data/)
+
+    Either or both may be supplied. Omitted paths fall back to the hardcoded
+    defaults so callers that don't set a body keep working unchanged.
+
     Non-blocking — returns 409 if already running.
     """
     if _etl_state["running"]:
@@ -166,10 +191,31 @@ async def trigger_etl_excel(background_tasks: BackgroundTasks) -> JSONResponse:
             status_code=status.HTTP_409_CONFLICT,
             content={"message": "ETL pipeline already running", **_etl_state},
         )
-    background_tasks.add_task(_run_etl_pipeline)
+
+    kbli_path = (body or {}).get("kbli_path") if isinstance(body, dict) else None
+    pb_umku_path = (body or {}).get("pb_umku_path") if isinstance(body, dict) else None
+
+    for label, p in (("kbli_path", kbli_path), ("pb_umku_path", pb_umku_path)):
+        if p is None:
+            continue
+        if not isinstance(p, str) or not p.startswith(_ALLOWED_ETL_PATH_PREFIX):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "message": f"{label} must be a string under {_ALLOWED_ETL_PATH_PREFIX}.",
+                    "received": p,
+                },
+            )
+
+    background_tasks.add_task(_run_etl_pipeline, kbli_path, pb_umku_path)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
-        content={"message": "ETL pipeline started", "status": "accepted"},
+        content={
+            "message": "ETL pipeline started",
+            "status": "accepted",
+            "kbli_path": kbli_path,
+            "pb_umku_path": pb_umku_path,
+        },
     )
 
 
@@ -178,18 +224,31 @@ def etl_pipeline_status() -> dict:
     return dict(_etl_state)
 
 
-async def _run_etl_pipeline() -> None:
-    """Run etl_pipeline.py as a subprocess."""
-    _etl_state["running"]     = True
-    _etl_state["status"]      = "running"
-    _etl_state["started_at"]  = datetime.now(timezone.utc).isoformat()
-    _etl_state["finished_at"] = None
-    logger.info("ETL Excel pipeline subprocess started")
+async def _run_etl_pipeline(
+    kbli_path: str | None = None,
+    pb_umku_path: str | None = None,
+) -> None:
+    """Run etl_pipeline.py as a subprocess with optional per-file overrides."""
+    _etl_state["running"]        = True
+    _etl_state["status"]         = "running"
+    _etl_state["started_at"]     = datetime.now(timezone.utc).isoformat()
+    _etl_state["finished_at"]    = None
+    _etl_state["chunks_indexed"] = None
+    logger.info(
+        "ETL Excel pipeline subprocess started | kbli=%s | pb_umku=%s",
+        kbli_path,
+        pb_umku_path,
+    )
+
+    argv: list[str] = [sys.executable, "etl_pipeline.py"]
+    if kbli_path:
+        argv.extend(["--kbli-path", kbli_path])
+    if pb_umku_path:
+        argv.extend(["--pb-umku-path", pb_umku_path])
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "etl_pipeline.py",
+            *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd="/app",
@@ -200,6 +259,14 @@ async def _run_etl_pipeline() -> None:
             line = raw_line.decode(errors="replace").rstrip()
             output_lines.append(line)
             logger.info("[etl_excel] %s", line)
+
+            # Parse the chunk-count beacon as soon as it shows up.
+            m = _CHUNKS_INDEXED_RE.search(line)
+            if m:
+                try:
+                    _etl_state["chunks_indexed"] = int(m.group(1))
+                except ValueError:
+                    pass
 
         rc = await proc.wait()
         _etl_state["status"]       = "done" if rc == 0 else "error"
