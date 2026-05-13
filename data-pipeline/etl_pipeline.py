@@ -437,17 +437,39 @@ def ingest_to_chromadb(records: list[dict]) -> int:
 # ... RESTART IDENTITY is safe.
 
 
+# Laravel migrated `kblis` with VARCHAR(255) on several columns. The original
+# 94-code dataset never hit that limit, but a real KBLI export hits it on a
+# minority of `judul_kbli` / `skala_usaha` / etc. Truncate before insert so
+# the admin browser shows a (clipped) row instead of the whole sync failing.
+# ChromaDB still has the full text — the truncation is cosmetic for browsing.
+_VARCHAR_MAX = 250  # 5-char safety margin below the column cap
+
+# Columns the Laravel migration declared as VARCHAR(255), per
+# admin-api/app/models/kbli.py (model is reflective, not authoritative —
+# kept in sync with the live DB).
+_KBLI_VARCHAR_COLS = {
+    "judul_kbli", "skala_usaha", "tingkat_risiko",
+    "jangka_waktu", "kewenangan", "sektor",
+}
+
+
+def _clip(value: object, n: int = _VARCHAR_MAX) -> object:
+    """Truncate a string to n chars; leave non-strings/None alone."""
+    if isinstance(value, str) and len(value) > n:
+        return value[:n]
+    return value
+
+
 def _records_to_kbli_rows(records: list[dict]) -> list[tuple]:
     """
     Collapse the per-skala-usaha expanded records back to one row per
-    (kode_kbli, skala_usaha, tingkat_risiko) — the Laravel `kblis` table is
-    a flat denormalised mirror, same shape one row per ChromaDB chunk minus
-    the PB UMKU relational tail.
+    (kode_kbli, skala_usaha, tingkat_risiko, perizinan_berusaha) — the
+    Laravel `kblis` table is a flat denormalised mirror.
 
-    pb_umku_names is a newline-joined list of the PB UMKU nomeklatur for
-    that record (matches the prior Laravel importer's behaviour — the
-    `kblis.pb_umku_names` column is just a denormalised hint for the admin
-    browser, not used for joins).
+    String columns declared VARCHAR(255) at the DB layer are truncated to
+    250 chars; TEXT columns are passed through whole. pb_umku_names is a
+    newline-joined list of nomeklatur for the record (Laravel importer
+    convention).
     """
     rows: list[tuple] = []
     seen: set[tuple] = set()
@@ -461,19 +483,19 @@ def _records_to_kbli_rows(records: list[dict]) -> list[tuple]:
         )
         rows.append(
             (
-                r["kode_kbli"],
-                r["judul_kbli"],
-                r["ruang_lingkup"] or None,
-                r["skala_usaha"] or None,
-                r["tingkat_risiko"] or None,
-                r["perizinan_berusaha"] or None,
-                r["persyaratan"] or None,
-                r["jangka_waktu"] or None,
-                r["kewajiban"] or None,
-                pb_names or None,
-                r["parameter"] or None,
-                r["kewenangan"] or None,
-                r["sektor"] or None,
+                r["kode_kbli"],                          # VARCHAR(10) — kbli codes are 5 digits, safe
+                _clip(r["judul_kbli"]),                  # VARCHAR(255)
+                r["ruang_lingkup"] or None,              # TEXT
+                _clip(r["skala_usaha"]) or None,         # VARCHAR(255)
+                _clip(r["tingkat_risiko"]) or None,      # VARCHAR(255)
+                r["perizinan_berusaha"] or None,         # TEXT
+                r["persyaratan"] or None,                # TEXT
+                _clip(r["jangka_waktu"]) or None,        # VARCHAR(255)
+                r["kewajiban"] or None,                  # TEXT
+                pb_names or None,                        # TEXT
+                r["parameter"] or None,                  # TEXT
+                _clip(r["kewenangan"]) or None,          # VARCHAR(255)
+                _clip(r["sektor"]) or None,              # VARCHAR(255)
             )
         )
     return rows
@@ -485,6 +507,9 @@ def _lookup_to_pb_umku_rows(pb_lookup: dict[str, list[dict]]) -> list[tuple]:
     Same column order as live DB (verified May 2026): nomeklatur, persyaratan,
     jangka_waktu_penerbitan, kewajiban, masa_berlaku, parameter, kewenangan.
     Note the Excel typo `nomeklatur` (not `nomenklatur`) — preserved in the DB.
+
+    Defensive truncation to 250 chars on every column — we don't know which
+    are VARCHAR vs TEXT in the Laravel migration; clipping is safe either way.
     """
     rows: list[tuple] = []
     seen: set[tuple] = set()
@@ -504,13 +529,13 @@ def _lookup_to_pb_umku_rows(pb_lookup: dict[str, list[dict]]) -> list[tuple]:
             seen.add(key)
             rows.append(
                 (
-                    entry["nomeklatur"],
-                    entry["persyaratan"] or None,
-                    entry["jangka_waktu"] or None,
-                    entry["kewajiban"] or None,
-                    entry["masa_berlaku"] or None,
-                    entry["parameter"] or None,
-                    entry["kewenangan"] or None,
+                    _clip(entry["nomeklatur"]),
+                    _clip(entry["persyaratan"]) or None,
+                    _clip(entry["jangka_waktu"]) or None,
+                    _clip(entry["kewajiban"]) or None,
+                    _clip(entry["masa_berlaku"]) or None,
+                    _clip(entry["parameter"]) or None,
+                    _clip(entry["kewenangan"]) or None,
                 )
             )
     return rows
