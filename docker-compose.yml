@@ -71,6 +71,10 @@ services:
       # Sprint C: ingestion-upload volume. admin-api writes here as
       # /app/uploads (rw); data-pipeline reads via /app/data/uploads.
       - ingestion_uploads:/app/data/uploads:ro
+      # Shared with ai-engine. ETL writes ChromaDB chunks here; ai-engine
+      # reads them via the same volume. chromadb 0.6.3 uses SQLite WAL by
+      # default, so concurrent writer + readers across containers are safe.
+      - chroma_data:/app/chroma_db
     networks:
       - bima-internal
     depends_on:
