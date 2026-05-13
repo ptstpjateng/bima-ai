@@ -44,9 +44,12 @@ nolongin.com, www.nolongin.com {
 		}
 	}
 
-	# Root → admin (matches the nginx default behaviour)
+	# Root → public portal (admin lives at admin.nolongin.com now).
+	# Permanent redirect; the old `redir /admin 302` sent anonymous visitors to the
+	# Laravel admin login, which leaked the legacy stack to anyone who typed the bare
+	# domain. Public face is now portal.nolongin.com.
 	handle / {
-		redir /admin 302
+		redir https://portal.nolongin.com 301
 	}
 
 	# Admin API (FastAPI on internal admin-api:8001) — strips /admin-api prefix
