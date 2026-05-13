@@ -1,0 +1,11 @@
+.git
+.env
+.env.local
+.env.testing
+node_modules
+storage/logs/*
+.phpunit.cache
+tests/
+.idea
+.vscode
+*.bak

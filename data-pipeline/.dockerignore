@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.git
+.pytest_cache/
+.venv/
+venv/
+data/debug/
+data/kbli_json/
+data/qa_results.json
+*.log
