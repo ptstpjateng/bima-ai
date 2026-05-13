@@ -1,0 +1,65 @@
+# BIMA reverse proxy — replaces nginx/default.conf.
+# Caddy auto-provisions and renews a Let's Encrypt cert for nolongin.com on first request.
+#
+# Notes vs the legacy nginx config:
+# - Rate limiting (30r/m on /webhook/, 120r/m on /api|/admin) is dropped here because
+#   Caddy core has no rate limiter; needs the third-party caddy-ratelimit plugin which
+#   requires a custom build. Application-layer throttling still applies (Laravel
+#   throttle:120,1 on auth:sanctum routes; ai-engine 5 msg/min per user_id). Add the
+#   plugin via a custom Dockerfile if you want IP-level rate limits back.
+# - Security headers (HSTS, X-Frame-Options, etc.) are added here; the nginx config had none.
+# - Path-specific timeouts ported: 120s for /webhook/* (Gemma p95 latency),
+#   300s for everything backend-bound (Filament Excel imports take a while).
+
+{
+	# Replace before deploying — Let's Encrypt sends expiry-warning emails to this address.
+	email rifqi.majid29@gmail.com
+}
+
+nolongin.com, www.nolongin.com {
+	encode gzip
+
+	# Match nginx client_max_body_size 350M for Excel + PDF uploads
+	request_body {
+		max_size 350MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Hide upstream framework signal
+		-Server
+		-X-Powered-By
+	}
+
+	# AI-engine webhooks (Telegram legacy, WhatsApp/APTANA, web chat).
+	# Path prefix is preserved — ai-engine routers expect /webhook/<channel>.
+	handle /webhook/* {
+		reverse_proxy ai-engine:8000 {
+			transport http {
+				read_timeout 120s
+			}
+		}
+	}
+
+	# Root → admin (matches the nginx default behaviour)
+	handle / {
+		redir /admin 302
+	}
+
+	# Everything else (api, sanctum, admin, livewire, css, js, fonts, storage, /up …)
+	# → Laravel backend. flush_interval -1 streams responses immediately for Filament
+	# Livewire long-polling.
+	handle {
+		reverse_proxy backend:80 {
+			transport http {
+				read_timeout 300s
+				write_timeout 300s
+				dial_timeout 60s
+			}
+			flush_interval -1
+		}
+	}
+}
