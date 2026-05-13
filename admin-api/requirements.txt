@@ -12,4 +12,8 @@ pydantic-settings>=2.6.0,<3
 email-validator>=2.2.0,<3
 python-jose[cryptography]>=3.3.0,<4
 passlib[bcrypt]>=1.7.4,<2
+# passlib 1.7.4 has a known incompatibility with bcrypt 4.x:
+# AttributeError: module 'bcrypt' has no attribute '__about__'
+# Pin bcrypt to 3.x until passlib ships a fix.
+bcrypt>=3.2,<4.0
 httpx>=0.27.0,<0.28
