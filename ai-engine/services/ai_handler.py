@@ -1,15 +1,18 @@
 """
 BIMA-AI – AI Handler Service
 
-Full pipeline for every inbound message:
+Generates AI responses for inbound messages from any channel. Pipeline:
   1. analyze_user_intent – lightweight JSON call to classify phase (1/2/3) + extract KBLI
   2. fetch_user_context  – pull user's business profile + license vault from Laravel
   3. query_regulations   – semantic RAG search in ChromaDB (KBLI-targeted when detected)
   4. generate_ai_response – call hosted Gemma LLM (falls back to RAG-based response)
-  5. send_platform_reply – send reply to WhatsApp or Telegram
-  6. log_to_backend      – async POST to Laravel /api/ai-logs (fire-and-forget)
+  5. log_to_backend      – async POST to Laravel /api/ai-logs (fire-and-forget)
 
-Primary LLM: gemma-3-27b-it via Google Generative Language API (open-weights, no VPS GPU).
+Channel-specific dispatch (sending the reply back to the user) lives in:
+  - WhatsApp via APTANA: services/whatsapp_sender.py + routers/aptana.py
+  - Web chat via Next.js portal: routers/webhooks.py:web_chat
+
+Primary LLM: gemma-3-27b-it (default) via Google Generative Language API.
 Persona & lifecycle model: see BIMA_PERSONA.md in the project root.
 """
 
@@ -19,7 +22,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
@@ -42,13 +45,7 @@ _GEMINI_MODEL: str        = os.getenv("GEMINI_MODEL", "models/gemma-3-27b-it")
 # E.g. set to models/gemma-3-4b-it for ~10x faster intent calls on free tier.
 _GEMINI_INTENT_MODEL: str = os.getenv("GEMINI_INTENT_MODEL", "") or _GEMINI_MODEL
 
-_WHATSAPP_API_TOKEN: str   = os.getenv("WHATSAPP_API_TOKEN", "")
-_WHATSAPP_API_VERSION: str = os.getenv("WHATSAPP_API_VERSION", "v19.0")
-_TELEGRAM_BOT_TOKEN: str   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
 _PORTAL_URL = "https://project-5z22k.vercel.app"
-
-Platform = Literal["whatsapp", "telegram"]
 
 # ---------------------------------------------------------------------------
 # Rate limiter  (A4 — 5 messages per user per 60s, in-memory)
@@ -539,76 +536,7 @@ def _smart_placeholder(message: str, user_ctx: dict, rag_chunks: list) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 2. Platform reply dispatchers
-# ---------------------------------------------------------------------------
-
-async def _send_whatsapp_reply(
-    phone_number_id: str, recipient_wa_id: str, message: str
-) -> None:
-    url = (
-        f"https://graph.facebook.com/{_WHATSAPP_API_VERSION}"
-        f"/{phone_number_id}/messages"
-    )
-    headers = {
-        "Authorization": f"Bearer {_WHATSAPP_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": recipient_wa_id,
-        "type": "text",
-        "text": {"body": message[:4096]},
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            logger.info("WhatsApp reply sent | wa_id=%s", recipient_wa_id)
-    except Exception:
-        logger.exception("WhatsApp reply failed | wa_id=%s", recipient_wa_id)
-
-
-async def _send_telegram_reply(chat_id: str | int, message: str) -> None:
-    url = f"https://api.telegram.org/bot{_TELEGRAM_BOT_TOKEN}/sendMessage"
-
-    # If response contains Execution-phase portal link → add Telegram inline button
-    has_portal_link = _PORTAL_URL in message
-    payload: dict[str, Any] = {
-        "chat_id":    chat_id,
-        "text":       message[:4096],
-        "parse_mode": "Markdown",
-    }
-    if has_portal_link:
-        payload["reply_markup"] = {
-            "inline_keyboard": [[
-                {"text": "🚀 Buka Portal BIMA-AI", "url": _PORTAL_URL}
-            ]]
-        }
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            logger.info("Telegram reply sent | chat_id=%s", chat_id)
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 400:
-            payload.pop("parse_mode", None)
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.post(url, json=payload)
-            except Exception:
-                logger.exception("Telegram plain reply failed | chat_id=%s", chat_id)
-        else:
-            logger.warning(
-                "Telegram API error | chat_id=%s | status=%s",
-                chat_id, exc.response.status_code,
-            )
-    except Exception:
-        logger.exception("Telegram reply failed | chat_id=%s", chat_id)
-
-
-# ---------------------------------------------------------------------------
-# 3. Backend logger (fire-and-forget)
+# 2. Backend logger (fire-and-forget)
 # ---------------------------------------------------------------------------
 
 async def log_to_backend(
@@ -659,98 +587,3 @@ async def _post_log(
         logger.exception("log_to_backend failed | user_id=%s", user_id)
 
 
-# ---------------------------------------------------------------------------
-# 3b. Telegram account linking helpers
-# ---------------------------------------------------------------------------
-
-async def handle_telegram_link(chat_id: int, token: str, from_user: Any) -> None:
-    """
-    Called when a user sends /start tglink_{token} to the bot.
-    Calls the backend to bind their Telegram chat_id to the portal account.
-    """
-    url = f"{_LARAVEL_BACKEND_URL}/api/internal/telegram/link"
-    headers = {
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
-        "X-Internal-Key": _LARAVEL_API_KEY,
-    }
-    username = getattr(from_user, "username", None) if from_user else None
-    payload  = {"token": token, "chat_id": chat_id, "username": username}
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-        data = resp.json()
-
-        if resp.status_code == 200:
-            name = data.get("data", {}).get("user_name", "Anda")
-            msg = (
-                f"✅ *Akun berhasil terhubung!*\n\n"
-                f"Halo *{name}*\\! Akun portal BIMA\\-AI Anda kini terhubung dengan Telegram\\.\n\n"
-                f"Mulai sekarang Anda bisa:\n"
-                f"• Bertanya tentang izin usaha OSS RBA\n"
-                f"• Mengetahui persyaratan KBLI Anda\n"
-                f"• Menerima notifikasi status permohonan\n\n"
-                f"Coba kirim pertanyaan pertama\\!"
-            )
-        elif resp.status_code == 409:
-            msg = "⚠️ Akun Telegram ini sudah terhubung ke akun portal lain."
-        else:
-            err = data.get("message", "")
-            logger.warning("Telegram link rejected | chat_id=%s | status=%s | msg=%s",
-                           chat_id, resp.status_code, err)
-            msg = (
-                "❌ Token tidak valid atau sudah kedaluwarsa.\n\n"
-                "Silakan buat token baru melalui portal BIMA\\-AI → Profil → Hubungkan Telegram\\."
-            )
-    except Exception:
-        logger.exception("Telegram link backend call failed | chat_id=%s", chat_id)
-        msg = "❌ Terjadi kesalahan saat menghubungkan akun. Coba lagi sebentar."
-
-    await _send_telegram_reply(chat_id=chat_id, message=msg)
-
-
-async def handle_start_command(chat_id: int, from_user: Any) -> None:
-    """Generic /start welcome — no linking token present."""
-    first = getattr(from_user, "first_name", None) if from_user else None
-    name = first or "Pengguna"
-    msg = (
-        f"Halo *{name}*\\! 👋 Selamat datang di *BIMA\\-AI*\\.\n\n"
-        "Saya asisten perizinan UMKM yang membantu Anda memahami OSS RBA\\.\n\n"
-        "Tanyakan apa saja, contohnya:\n"
-        "• _'Saya mau buka warung makan, izin apa yang diperlukan?'_\n"
-        "• _'Apa itu NIB dan bagaimana cara mendapatkannya?'_\n"
-        "• _'KBLI untuk salon kecantikan apa?'_\n\n"
-        "Atau kunjungi portal untuk mengajukan izin secara online\\."
-    )
-    await _send_telegram_reply(chat_id=chat_id, message=msg)
-
-
-# ---------------------------------------------------------------------------
-# 4. Main pipeline entry point
-# ---------------------------------------------------------------------------
-
-async def process_message(
-    user_id: str,
-    message: str,
-    platform: Platform,
-    reply_context: dict[str, Any],
-) -> None:
-    logger.info("Pipeline start | platform=%s | user_id=%s", platform, user_id)
-
-    ai_response = await generate_ai_response(user_id, message)
-
-    try:
-        if platform == "whatsapp":
-            await _send_whatsapp_reply(
-                phone_number_id=reply_context["phone_number_id"],
-                recipient_wa_id=reply_context["recipient_wa_id"],
-                message=ai_response,
-            )
-        elif platform == "telegram":
-            await _send_telegram_reply(chat_id=reply_context["chat_id"], message=ai_response)
-    except Exception:
-        logger.exception("Reply dispatch failed | platform=%s | user_id=%s", platform, user_id)
-
-    await log_to_backend(user_id, message, ai_response, channel=platform)
-    logger.info("Pipeline complete | platform=%s | user_id=%s", platform, user_id)

@@ -19,7 +19,6 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from routers import aptana, vectorize, webhooks
-from services.telegram_polling import run_polling
 
 # ---------------------------------------------------------------------------
 # Logging – structured, to stdout so it flows into any log aggregator.
@@ -38,13 +37,7 @@ logger = logging.getLogger("bima_ai")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("BIMA-AI engine starting up.")
-    polling_task = asyncio.create_task(run_polling())
     yield
-    polling_task.cancel()
-    try:
-        await polling_task
-    except asyncio.CancelledError:
-        pass
     logger.info("BIMA-AI engine shutting down.")
 
 
