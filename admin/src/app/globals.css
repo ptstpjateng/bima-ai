@@ -1,0 +1,173 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/*
+ ---break---
+ */
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * BIMA "Midnight Government" brand tokens — locked in BIMA-Vault/Brand.md.
+ * Tailwind v4 @theme directive exposes these as utility classes.
+ *
+ * Brand spec uses Tailwind v3 nested color objects (e.g. surface.base, brand.navy.hover).
+ * In v4 we flatten with hyphens: surface.base -> --color-surface-base ->
+ * .bg-surface-base, .text-surface-base, etc.
+ */
+@theme {
+  /* Surfaces — dark, calm, card-rich */
+  --color-surface-base: #0a0e1a;
+  --color-surface-low: #111729;
+  --color-surface-card: #1a2138;
+  --color-surface-card-hover: #232c4d;
+  --color-surface-elevated: #2a3556;
+
+  /* Brand — navy primary, amber accent */
+  --color-brand-navy: #2e4dcc;
+  --color-brand-navy-hover: #4060e5;
+  --color-brand-navy-muted: #1e3a8a;
+  --color-brand-amber: #f59e0b;
+  --color-brand-amber-hover: #fbbf24;
+  --color-brand-amber-muted: #92400e;
+  --color-brand-emerald: #10b981;
+  --color-brand-rose: #f43f5e;
+
+  /* Text — never pure white */
+  --color-text-primary: #f1f5f9;
+  --color-text-secondary: #94a3b8;
+  --color-text-muted: #64748b;
+
+  /* Radii — soft Lord Bank vibe */
+  --radius-card: 16px;
+  --radius-pill: 9999px;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+  body {
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/*
+ ---break---
+ * shadcn/ui CSS variable mapping — Tailwind v4 inline @theme so utilities like
+ * bg-card, text-foreground, etc. resolve through our Brand palette.
+ */
+@theme inline {
+  --font-display: var(--font-display);
+  --font-sans: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/*
+ ---break---
+ * Brand-aligned shadcn variables. Admin is always dark — we set the same values
+ * on :root and .dark so the palette is identical regardless of how shadcn
+ * components flip the dark class.
+ *
+ * All values converted from the Brand hex codes to OKLCH so they mesh with
+ * shadcn's default OKLCH-based palette (shadcn 3.x switched away from HSL).
+ */
+:root,
+.dark {
+  --background: oklch(0.137 0.027 264);     /* #0A0E1A — surface base */
+  --foreground: oklch(0.965 0.005 250);     /* #F1F5F9 — text primary */
+  --card: oklch(0.214 0.039 264);           /* #1A2138 — surface card */
+  --card-foreground: oklch(0.965 0.005 250);
+  --popover: oklch(0.281 0.045 262);        /* #2A3556 — surface elevated */
+  --popover-foreground: oklch(0.965 0.005 250);
+  --primary: oklch(0.475 0.198 268);        /* #2E4DCC — brand navy */
+  --primary-foreground: oklch(0.965 0.005 250);
+  --secondary: oklch(0.262 0.057 264);      /* #232C4D — surface card-hover */
+  --secondary-foreground: oklch(0.965 0.005 250);
+  --muted: oklch(0.214 0.039 264);
+  --muted-foreground: oklch(0.704 0.026 250); /* #94A3B8 — text secondary */
+  --accent: oklch(0.737 0.171 64);          /* #F59E0B — brand amber */
+  --accent-foreground: oklch(0.137 0.027 264);
+  --destructive: oklch(0.638 0.231 16);     /* #F43F5E — brand rose */
+  --destructive-foreground: oklch(0.965 0.005 250);
+  --border: oklch(1 0 0 / 6%);              /* "ghost border" per No-Line Rule */
+  --input: oklch(0.214 0.039 264);
+  --ring: oklch(0.475 0.198 268);
+  --chart-1: oklch(0.475 0.198 268);        /* navy */
+  --chart-2: oklch(0.737 0.171 64);         /* amber */
+  --chart-3: oklch(0.696 0.169 165);        /* emerald */
+  --chart-4: oklch(0.638 0.231 16);         /* rose */
+  --chart-5: oklch(0.704 0.026 250);        /* slate */
+  --radius: 1rem;                            /* 16px card radius per Brand */
+  --sidebar: oklch(0.183 0.034 262);        /* #111729 — surface low */
+  --sidebar-foreground: oklch(0.965 0.005 250);
+  --sidebar-primary: oklch(0.475 0.198 268);
+  --sidebar-primary-foreground: oklch(0.965 0.005 250);
+  --sidebar-accent: oklch(0.262 0.057 264);
+  --sidebar-accent-foreground: oklch(0.965 0.005 250);
+  --sidebar-border: oklch(1 0 0 / 6%);
+  --sidebar-ring: oklch(0.475 0.198 268);
+}
+
+/*
+ ---break---
+ * Custom scrollbar styling for the dark surface — quiet, narrow, never flashy.
+ */
+* {
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+  scrollbar-width: thin;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.08);
+  border-radius: 9999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
