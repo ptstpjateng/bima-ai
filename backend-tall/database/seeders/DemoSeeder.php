@@ -66,9 +66,9 @@ class DemoSeeder extends Seeder
                     'name'                      => 'Warung Makan Bu Sari',
                     'primary_kbli_code'         => '56102',
                     'primary_kbli_description'  => 'Warung/Kedai Makan',
-                    'legal_entity'              => 'Perorangan',
+                    'legal_type'                => 'Perorangan',
                     'scale'                     => 'kecil',
-                    'revenue'                   => 450_000_000,  // Rp 450 juta/year
+                    'annual_revenue_estimate'   => 450_000_000,  // Rp 450 juta/year
                     'employee_count'            => 5,
                     'address'                   => 'Jl. Semarang Indah No. 12, Semarang Barat',
                 ]
@@ -85,8 +85,7 @@ class DemoSeeder extends Seeder
                     'kbli_description'          => 'Warung/Kedai Makan',
                     'kbli_section'              => 'Penyediaan Akomodasi dan Penyediaan Makan Minum',
                     'business_scale'            => 'kecil',
-                    'risk_level'                => 'Menengah Rendah',
-                    'permit_type'               => 'Sertifikat Standar',
+                    'risk_level'                => 'menengah_rendah',
                     'status'                    => 'approved',
                     'business_location_address' => 'Jl. Semarang Indah No. 12, Semarang Barat',
                     'business_location_province'=> 'Jawa Tengah',
@@ -138,8 +137,7 @@ class DemoSeeder extends Seeder
                     'kbli_description'          => 'Perdagangan Eceran Beras, Tepung dan Produk Sejenisnya',
                     'kbli_section'              => 'Perdagangan Besar dan Eceran',
                     'business_scale'            => 'mikro',
-                    'risk_level'                => 'Rendah',
-                    'permit_type'               => 'NIB',
+                    'risk_level'                => 'rendah',
                     'status'                    => 'under_review',
                     'business_location_address' => 'Jl. Semarang Indah No. 14, Semarang Barat',
                     'business_location_province'=> 'Jawa Tengah',
