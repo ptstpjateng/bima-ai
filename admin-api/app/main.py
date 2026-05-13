@@ -1,13 +1,17 @@
 """
 BIMA admin-api — FastAPI entrypoint.
 
-Phase 1 scope: scaffold + auth + health. Mirrors the structural patterns of
-`ai-engine/main.py` (request_id middleware, structured logging, central
-exception handlers) so a developer moving between the two services finds
-familiar conventions.
+Mirrors the structural patterns of `ai-engine/main.py` (request_id middleware,
+structured logging, central exception handlers) so a developer moving between
+the two services finds familiar conventions.
 
-Routers added so far: health, auth. Phase 2 lands users CRUD, ai_interactions
-list, kbli search, ingestion_sources CRUD.
+Routers wired so far:
+- health, auth (Sprint B.1)
+- dashboard, ai_interactions, kbli (Sprint B.2 — read-only resource endpoints
+  for the admin frontend)
+
+Sprint C will add ingestion_sources CRUD, users CRUD, and the unified ingest
+worker hooks.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from app.config import get_settings
-from app.routers import auth, health
+from app.routers import ai_interactions, auth, dashboard, health, kbli
 
 # ---------------------------------------------------------------------------
 # Structured logging — same shape as ai-engine so log aggregators can parse
@@ -65,10 +69,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="BIMA admin-api",
     description=(
-        "Admin API replacing the Laravel/Filament panel. Phase 1: auth + "
-        "health. Phase 2: business CRUD + ingestion sources."
+        "Admin API replacing the Laravel/Filament panel. Sprint B.1: auth + "
+        "health. Sprint B.2: dashboard, AI interactions, KBLI (read-only). "
+        "Sprint C: ingestion-sources + users CRUD."
     ),
-    version="0.1.0",
+    version="0.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -187,3 +192,10 @@ async def _on_unhandled(request: Request, exc: Exception):
 # ---------------------------------------------------------------------------
 app.include_router(health.router)
 app.include_router(auth.router)
+app.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
+app.include_router(
+    ai_interactions.router,
+    prefix="/ai-interactions",
+    tags=["AI Interactions"],
+)
+app.include_router(kbli.router, prefix="/kbli", tags=["KBLI"])
