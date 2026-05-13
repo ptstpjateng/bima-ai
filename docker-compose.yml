@@ -75,19 +75,24 @@ services:
         condition: service_healthy
 
   # ──────────────────────────────────────────────
-  # Reverse Proxy (nginx — port 80 for admin/assets)
+  # Reverse Proxy (Caddy — auto Let's Encrypt for nolongin.com)
+  # Replaces nginx; legacy config kept at nginx/default.conf for rollback.
   # ──────────────────────────────────────────────
   proxy:
-    image: nginx:1.27-alpine
+    image: caddy:2-alpine
     restart: unless-stopped
     volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     ports:
       - "80:80"
+      - "443:443"
     networks:
       - bima-public
     depends_on:
       - backend
+      - ai-engine
 
   # ──────────────────────────────────────────────
   # TALL Backend (Laravel 13 + FrankenPHP)
@@ -183,3 +188,5 @@ volumes:
   redis_data:
   chroma_data:
   backend_storage:
+  caddy_data:
+  caddy_config:
