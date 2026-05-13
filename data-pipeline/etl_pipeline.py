@@ -9,6 +9,7 @@ into ChromaDB `oss_regulations` collection for RAG retrieval.
 Author: BIMA-AI Data Engineering
 """
 
+import argparse
 import hashlib
 import logging
 import re
@@ -21,8 +22,12 @@ from sentence_transformers import SentenceTransformer
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-KBLI_PATH = Path("/app/data/raw_excel/kbli.xlsx")
-PB_UMKU_PATH = Path("/app/data/raw_excel/pb_umku.xlsx")
+# Defaults — preserved so direct CLI invocations and pre-existing callers
+# (Filament Sync ke ChromaDB button, manual `python etl_pipeline.py`) keep
+# working without flags. The Sprint C ingestion-upload feature overrides
+# these via --kbli-path / --pb-umku-path.
+DEFAULT_KBLI_PATH = Path("/app/data/raw_excel/kbli.xlsx")
+DEFAULT_PB_UMKU_PATH = Path("/app/data/raw_excel/pb_umku.xlsx")
 CHROMA_DB_PATH = "/app/chroma_db"
 COLLECTION_NAME = "oss_regulations"
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -419,21 +424,47 @@ def ingest_to_chromadb(records: list[dict]) -> int:
 # ── Phase 5: Main Execution ─────────────────────────────────────────────────
 
 
-def main():
+def _parse_args() -> argparse.Namespace:
+    """
+    Accept optional per-file path overrides. Defaults preserve legacy
+    behaviour for any non-Sprint-C caller.
+    """
+    parser = argparse.ArgumentParser(description="BIMA-AI deterministic ETL pipeline.")
+    parser.add_argument(
+        "--kbli-path",
+        type=Path,
+        default=DEFAULT_KBLI_PATH,
+        help="Override KBLI .xlsx path (default: /app/data/raw_excel/kbli.xlsx).",
+    )
+    parser.add_argument(
+        "--pb-umku-path",
+        type=Path,
+        default=DEFAULT_PB_UMKU_PATH,
+        help="Override PB UMKU .xlsx path (default: /app/data/raw_excel/pb_umku.xlsx).",
+    )
+    return parser.parse_args()
+
+
+def main(kbli_path: Path | None = None, pb_umku_path: Path | None = None):
+    kbli_path = kbli_path or DEFAULT_KBLI_PATH
+    pb_umku_path = pb_umku_path or DEFAULT_PB_UMKU_PATH
+
     log.info("=" * 60)
     log.info("BIMA-AI Deterministic ETL Pipeline — Starting")
+    log.info(f"  KBLI source:    {kbli_path}")
+    log.info(f"  PB UMKU source: {pb_umku_path}")
     log.info("=" * 60)
 
     # Validate input files
-    for path in [KBLI_PATH, PB_UMKU_PATH]:
+    for path in [kbli_path, pb_umku_path]:
         if not path.exists():
             log.error(f"Input file not found: {path}")
             sys.exit(1)
 
     # Phase 2: Load & Clean
     try:
-        df_kbli = load_kbli(KBLI_PATH)
-        df_pb_umku = load_pb_umku(PB_UMKU_PATH)
+        df_kbli = load_kbli(kbli_path)
+        df_pb_umku = load_pb_umku(pb_umku_path)
     except Exception as e:
         log.error(f"Failed to load Excel files: {e}")
         sys.exit(1)
@@ -467,6 +498,10 @@ def main():
     log.info(f"  Chunks inserted into ChromaDB:   {total_chunks}")
     log.info(f"  Collection: '{COLLECTION_NAME}'")
     log.info("=" * 60)
+    # Machine-readable beacon parsed by server.py to populate the ETL state's
+    # `chunks_indexed` field. Format is part of the contract — do not change
+    # without updating server.py's regex.
+    print(f"[etl] indexed {total_chunks} chunks", flush=True)
     log.info("Pipeline completed successfully.")
 
 
@@ -479,4 +514,5 @@ if __name__ == "__main__":
         print(f"[etl] FATAL: embedder failed to load: {e}", file=sys.stderr)
         sys.exit(1)
 
-    main()
+    args = _parse_args()
+    main(kbli_path=args.kbli_path, pb_umku_path=args.pb_umku_path)

@@ -43,3 +43,12 @@ class IngestionSourceOut(BaseModel):
     created_by: int | None
     created_at: datetime
     last_run_at: datetime | None
+
+
+class IngestionSourceList(BaseModel):
+    """Paginated list response for `GET /ingestion`."""
+
+    items: list[IngestionSourceOut]
+    total: int
+    page: int
+    limit: int
