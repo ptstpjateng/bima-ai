@@ -49,6 +49,16 @@ class Settings(BaseSettings):
         description="Comma-separated allowed origins for the admin frontend.",
     )
 
+    # ---- ai-engine cross-service ---------------------------------------
+    # Used by the dashboard + KBLI detail endpoints to fetch ChromaDB chunk
+    # counts from ai-engine's /health endpoint. Must be reachable on the
+    # internal Docker network. 2s timeout is enforced at the call site so a
+    # flapping ai-engine never blocks an admin dashboard render.
+    AI_ENGINE_URL: str = Field(
+        default="http://ai-engine:8000",
+        description="Base URL of ai-engine for internal cross-service queries.",
+    )
+
     # ---- Logging --------------------------------------------------------
     LOG_LEVEL: str = Field(default="INFO")
 
