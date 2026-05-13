@@ -1,0 +1,50 @@
+[project]
+name = "bima-admin-api"
+version = "0.1.0"
+description = "BIMA admin API — FastAPI service that replaces Laravel/Filament for DPMPTSP staff."
+requires-python = ">=3.12"
+readme = "README.md"
+
+# Dependency philosophy: pin minor versions to avoid silent breaks. Keep this
+# list lean — Phase 1 is auth + health only. Heavy deps (boto3 for MinIO,
+# pandas for ETL, arq for the worker) land in Phase 2/3.
+dependencies = [
+    "fastapi>=0.115.0,<0.116",
+    "uvicorn[standard]>=0.32.0,<0.33",
+
+    # SQLAlchemy 2.x async + asyncpg driver (Postgres).
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.30.0,<0.31",
+
+    # Migrations.
+    "alembic>=1.14.0,<1.15",
+
+    # Pydantic v2 + settings (env loading, validation).
+    "pydantic>=2.9.0,<3",
+    "pydantic-settings>=2.6.0,<3",
+    "email-validator>=2.2.0,<3",
+
+    # Auth: JWT + bcrypt password hashing (must verify Laravel-issued bcrypt
+    # hashes, hence passlib + bcrypt — Laravel's `'password' => 'hashed'`
+    # cast uses bcrypt by default).
+    "python-jose[cryptography]>=3.3.0,<4",
+    "passlib[bcrypt]>=1.7.4,<2",
+
+    # Service-to-service HTTP (used by Phase 2 endpoints; pinned now so the
+    # image is built once).
+    "httpx>=0.27.0,<0.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0,<9",
+    "pytest-asyncio>=0.24.0,<0.25",
+    "ruff>=0.7.0,<0.8",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
