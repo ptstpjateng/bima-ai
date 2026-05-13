@@ -187,6 +187,40 @@ Jawaban ini menggunakan basis pengetahuan AI umum."
 
 
 # ---------------------------------------------------------------------------
+# Trivial-message detection — skip the intent classifier on greetings + acks.
+# Saves ~3-5s of Gemma latency per "halo" / "hai" / "p" message.
+# ---------------------------------------------------------------------------
+
+# Common Indonesian + English greetings, acks, and tiny tests. Word-bounded so
+# "halo" matches "halo" and "halo bima" but NOT "halo, saya mau buka usaha".
+_TRIVIAL_PATTERN = re.compile(
+    r"^(halo|hai|hello|hi|hey|hii+|halo+|p|test|tes|tess|tesst|"
+    r"assalamualaikum|assalam|wassalam|salam|"
+    r"ok|oke|okey|okay|sip|mantap|"
+    r"makasih|terima\s*kasih|thanks|thx|thank\s*you|tq|"
+    r"halo\s+bima|hai\s+bima|hello\s+bima)$",
+    re.IGNORECASE,
+)
+
+
+def _is_trivial_message(message: str) -> bool:
+    """Return True for greetings / acks / tiny tests that don't need a Gemma intent call.
+
+    Two cases match:
+      1. Length < 4 chars (e.g. "p", "ok", "ya") — skip
+      2. The whole stripped message matches the trivial-pattern regex
+         (e.g. "halo", "Halo Bima", "terima kasih") — skip
+
+    Anything containing real content like "halo, saya mau buka warung" returns
+    False because the regex is anchored end-to-end.
+    """
+    msg = message.strip()
+    if len(msg) < 4:
+        return True
+    return bool(_TRIVIAL_PATTERN.match(msg))
+
+
+# ---------------------------------------------------------------------------
 # 1. Intent classification + LLM call (hosted Gemma) with graceful fallback
 # ---------------------------------------------------------------------------
 
@@ -213,12 +247,20 @@ async def generate_ai_response(user_id: str, message: str) -> str:
     try:
         import asyncio
 
-        # Step 1 — intent classification + user context fetch run concurrently
-        intent_task   = asyncio.create_task(analyze_user_intent(message))
-        user_ctx_task = asyncio.create_task(fetch_user_context(user_id))
+        # SPEED: skip the ~3-5s intent classifier call for trivial messages
+        # (greetings, ack words, very short tests). Default to Phase 1 with no
+        # KBLI — that's the right behaviour for these messages anyway.
+        if _is_trivial_message(message):
+            logger.info("Trivial message — skipping intent classifier | user_id=%s", user_id)
+            intent = {"phase": 1, "kbli_code": None, "detected_scale": None}
+            user_ctx = await fetch_user_context(user_id)
+        else:
+            # Step 1 — intent classification + user context fetch run concurrently
+            intent_task   = asyncio.create_task(analyze_user_intent(message))
+            user_ctx_task = asyncio.create_task(fetch_user_context(user_id))
 
-        intent   = await intent_task
-        user_ctx = await user_ctx_task
+            intent   = await intent_task
+            user_ctx = await user_ctx_task
 
         # A1 — normalise KBLI: strip non-digits, accept only 4–6 digit codes
         raw_kbli = intent.get("kbli_code")
