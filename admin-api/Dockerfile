@@ -31,6 +31,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Now copy source.
 COPY --chown=bima:bima . ./
 
+# Pre-create the uploads mountpoint with the correct ownership BEFORE the
+# volume gets mounted at runtime. Docker's "copy on first use" semantics for
+# named volumes preserve this chown onto a fresh `ingestion_uploads` volume,
+# so admin-api (running as uid 1001) can write without a host-side chmod.
+# Without this, a brand-new volume comes up as root:root 0755 and every
+# upload 500s until someone manually `chmod 777`s the host bind path.
+RUN mkdir -p /app/uploads && chown bima:bima /app/uploads
+
 USER bima
 
 EXPOSE 8001

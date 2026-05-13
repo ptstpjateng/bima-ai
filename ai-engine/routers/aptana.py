@@ -38,6 +38,11 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from services.ai_handler import generate_ai_response, log_to_backend
 from services.whatsapp_sender import acknowledge_received, send_text
 
+# Indonesian apology shown when Gemma fails (rate-limited / 5xx / timeout) AFTER
+# the user has already seen the "💭 Sebentar ya…" acknowledgment. Without this
+# fallback they're stranded with no reply at all — worse UX than a polite error.
+_GEMMA_FAILURE_APOLOGY = "Maaf, sistem BIMA sedang sibuk sekali. Silakan coba lagi sebentar lagi 🙏"
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -135,6 +140,13 @@ async def _process_inbound(
         reply = await generate_ai_response(user_id, text)
     except Exception:
         logger.exception("AI generation failed | user=%s", _mask(msisdn))
+        # Send a polite Indonesian apology so the user isn't stranded after the
+        # "Sebentar ya…" acknowledgment. Don't log_to_backend — that path
+        # expects a real reply, not a fallback string.
+        try:
+            await send_text(recipient_phone=msisdn, body=_GEMMA_FAILURE_APOLOGY)
+        except Exception:
+            logger.exception("Apology send failed | user=%s", _mask(msisdn))
         return
 
     delivered = await send_text(recipient_phone=msisdn, body=reply)
@@ -145,6 +157,77 @@ async def _process_inbound(
         await log_to_backend(user_id, text, reply, channel="whatsapp")
     except Exception:
         logger.exception("Backend log failed | user=%s", _mask(msisdn))
+
+
+# ---------------------------------------------------------------------------
+# Greeting: first-contact welcome (APTANA Worker `Receive a Greeting Request from Meta`)
+# ---------------------------------------------------------------------------
+#
+# WhatsApp fires a "greeting request" the first time a brand-new user opens
+# a chat with the bot, BEFORE they type anything. APTANA exposes this as its
+# own Worker trigger; configure a Worker pointing at this endpoint to get a
+# proactive welcome bubble.
+#
+# The payload shape isn't documented in APTANA's Postman docs. We probe the
+# same shapes _extract_text_from_payload uses; in practice the trigger only
+# carries `phoneNumber` (the user) — `payload` may be empty or omitted.
+
+# Static welcome — no AI generation, no per-user RAG. Indonesian, Midnight
+# Government tone (calm, helpful, government-appropriate). One emoji max.
+_GREETING_BODY = (
+    "Halo! 👋 Saya BIMA, asisten AI perizinan UMKM dari DPMPTSP Jawa Tengah.\n\n"
+    "Tanyakan saja apapun tentang KBLI, syarat NIB, atau alur OSS RBA — saya "
+    "siap bantu 24 jam, dalam Bahasa Indonesia.\n\n"
+    "Coba mulai dengan:\n"
+    "• \"Saya mau buka warung makan, KBLI berapa?\"\n"
+    "• \"Apa syarat NIB untuk usaha mikro?\"\n"
+    "• \"Berapa lama proses izin OSS RBA?\""
+)
+
+
+@router.post("/webhook/aptana/greeting/{path_secret}")
+async def aptana_greeting(path_secret: str, request: Request, background: BackgroundTasks):
+    """Receive WhatsApp first-contact greeting and send a proactive welcome.
+
+    Configure the matching APTANA Worker:
+        Trigger: WhatsApp → Receive a Greeting Request from Meta
+        Action:  HTTP POST → https://nolongin.com/webhook/aptana/greeting/<APTANA_PATH_SECRET>
+        Body:    {"phoneNumber": "{{phoneNumber}}", "name": "{{name}}"}
+    """
+    _check_path_secret(path_secret)
+
+    try:
+        data = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_json")
+
+    msisdn = data.get("phoneNumber")
+    name = data.get("name")
+
+    logger.info("APTANA greeting | from=%s name=%s", _mask(msisdn or ""), name)
+
+    if not msisdn:
+        # 200 so APTANA doesn't retry — payload bug, not transient.
+        return {"ok": True, "skipped": "missing_phone"}
+
+    # Fire-and-forget so APTANA gets a fast 200. The welcome itself is the
+    # only side-effect — no DB log, no AI call. Cheap.
+    background.add_task(_send_greeting, msisdn=msisdn, name=name)
+    return {"ok": True}
+
+
+async def _send_greeting(msisdn: str, name: str | None = None) -> None:
+    """Send the static welcome message; never raises."""
+    body = _GREETING_BODY
+    if name:
+        # Personalise the first line with the user's WhatsApp display name.
+        # Keep the rest verbatim.
+        first_name = name.strip().split(" ")[0][:30]
+        body = body.replace("Halo! 👋", f"Halo {first_name}! 👋", 1)
+
+    delivered = await send_text(recipient_phone=msisdn, body=body)
+    if not delivered:
+        logger.error("APTANA greeting send failed | user=%s", _mask(msisdn))
 
 
 # ---------------------------------------------------------------------------

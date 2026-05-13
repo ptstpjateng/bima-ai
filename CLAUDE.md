@@ -1,10 +1,22 @@
 # BIMA-AI Global Project Rules
 
+> **Operations:** for live deploy commands, common errors, rollback, and the
+> pre-demo checklist see [`BIMA-Vault/Operations Runbook.md`](../BIMA-Vault/Operations%20Runbook.md).
+> This file documents conventions; the runbook documents commands.
+
 ## 🎯 Project Context
 We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bureaucracy.
 *   **Pillar 1:** Python/FastAPI + ChromaDB (AI Engine & RAG Pipeline)
-*   **Pillar 2 & 3:** Next.js + React Native (Licensing Wizard & Super App UI)
-*   **Core Backend:** Laravel 13 + Filament v.4 + PostgreSQL (TALL Stack)
+*   **Pillar 2:** Next.js 16 admin (`admin/`) + Next.js 16 portal (`portal/`) — both on Vercel
+*   **Pillar 3:** Admin-API (FastAPI + SQLAlchemy 2 async, `admin-api/`) — replacing the Laravel admin surface page-by-page
+*   **Legacy Core Backend:** Laravel 13 + Filament v.4 + PostgreSQL (TALL Stack) — still running, being migrated out
+
+### 📊 Current state (as of 2026-05-14, Sprint C.5 shipped)
+
+*   **Sprints completed:** A (stabilize), B.1 (admin-api scaffold + admin shell), B.2 (read-only resource pages), C.4 (ingestion upload UI + reconciler), C.5 (architecture-flows visualizer). **Sprint D (rehearsals + backup video) is next.**
+*   **Live data:** 1,405 KBLI codes / 6,211 kblis rows / 319 pb_umkus rows / 6,340 ChromaDB chunks / 11 live UMKM users.
+*   **Live URLs:** see Service Map below.
+*   **WhatsApp UX:** sub-second typing acknowledgment (text bubble; APTANA doesn't expose Meta's native indicator — see [[Decisions]] §9). Final reply ~9–13 s.
 
 ### 🧠 Primary LLM: Hosted Gemma via Google AI Studio
 *   **Model:** `gemma-3-27b-it` accessed via the Google Generative Language REST API
@@ -60,13 +72,19 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 ### Service Map
 | Service | Internal | Public | Notes |
 |---|---|---|---|
-| **nginx** | — | `:80` | Sole public entry point |
-| **backend** (FrankenPHP) | `backend:80` | `:8000` (direct debug) | Laravel 13 + Filament |
-| **ai-engine** (FastAPI) | `ai-engine:8000` | via `/webhook/` only | ChromaDB embedded
-| **postgres** | `postgres:5432` | — | internal only |
-| **redis** | `redis:6379` | — | internal only |
-| **frontend** | — | Vercel | decoupled, git auto-deploy |
-| **data-pipeline** (FastAPI) | `data-pipeline:9000` | — | ETL + Playwright scraper |
+| **proxy** (Caddy 2) | — | `:80`, `:443` | Sole public entry point. Auto Let's Encrypt for `nolongin.com`. Replaces `nginx` (legacy config archived in `nginx/`). |
+| **backend** (FrankenPHP) | `backend:80` | `:8000` (direct debug) | Laravel 13 + Filament. Legacy admin at `nolongin.com/admin`. Being migrated out page-by-page. |
+| **ai-engine** (FastAPI) | `ai-engine:8000` | via Caddy `/webhook/*` | ChromaDB embedded. Reads `chroma_data` named volume (shared with data-pipeline). APTANA WhatsApp inbound + outbound sender. |
+| **admin-api** (FastAPI) | `admin-api:8001` | via Caddy `/admin-api/*` | NEW — replaces Laravel admin. Auth + dashboard + KBLI + AI interactions + ingestion. Status reconciler loop polls data-pipeline every 5 s. |
+| **data-pipeline** (FastAPI) | `data-pipeline:9000` | — internal only — | ETL (`etl_pipeline.py` deterministic Pandas) + Playwright OSS scraper. Writes to ChromaDB AND mirrors to PostgreSQL `kblis`/`pb_umkus`. |
+| **postgres** (16-alpine) | `postgres:5432` | — | Internal only. Single DB `bima_ai`. |
+| **redis** (7-alpine) | `redis:6379` | — | Internal only. Sessions/cache/queue for Laravel. |
+| **queue** (Laravel worker) | — | — | Same image as backend; runs `artisan queue:work`. |
+| **bima-admin** (Next 16) | — | `admin.nolongin.com` (Vercel) | NEW — Next.js 16 + shadcn/ui + Midnight Government brand. Pages: `/dashboard`, `/ai-interactions`, `/kbli`, `/data` (ingestion), `/architecture` (system-flows visualizer). |
+| **bima-portal** (Next 16) | — | `portal.nolongin.com` (Vercel) | NEW — Public landing in `portal/` dir. Next 16 + Tailwind 4 + Framer Motion. Replaces broken legacy `frontend/`. |
+| **legacy `frontend/`** | — | — | Deprecated. Builds broken; do not deploy. Will be deleted in Sprint D cleanup. |
+
+> **Vercel Hobby gotcha:** `bima-admin` and `bima-portal` are on team `pusdatindpmptspjateng-3132` (Hobby plan). Commits authored by anyone NOT on the team are auto-blocked. See [[Decisions]] §10 — local git author identity for the BIMA repo MUST be `pusdatin.dpmptspjateng@gmail.com`, and PRs that touch `admin/` or `portal/` MUST be **rebase-merged**, not squashed.
 
 ### KBLI / PB UMKU Data Architecture
 *   **Source of truth:** PostgreSQL tables `kblis` (14 columns incl. `sektor`) and `pb_umkus` (7 columns)
@@ -77,16 +95,21 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 *   **ETL script:** `data-pipeline/etl_pipeline.py` — deterministic Pandas pipeline, no LLM calls. Handles merged-cell forward-fill, multi-value Skala Usaha expansion, PB UMKU relational merge, semantic chunking, ChromaDB upsert with metadata filters.
 *   **Raw Excel files on VPS:** `data-pipeline/data/raw_excel/kbli.xlsx` and `pb_umku.xlsx` (mounted at `/app/data/raw_excel/` inside container)
 
-### Nginx Routing (port 80)
-*   `/webhook/` → `ai-engine:8000`
-*   `/api`, `/sanctum`, `/admin`, `/livewire`, `/css`, `/js`, `/fonts`, `/storage` → `backend:80`
-*   `/` → `302 /admin`
+### Caddy Routing (`caddy/Caddyfile`, ports 80 + 443)
+*   `/webhook/*` → `ai-engine:8000` (read_timeout 120s for Gemma latency)
+*   `/admin-api/*` → `admin-api:8001` (handle_path strips the prefix)
+*   `/` (bare root) → `301 https://portal.nolongin.com` (anonymous visitors land on the public portal, not the legacy admin login)
+*   everything else (`/api`, `/sanctum`, `/admin`, `/livewire`, `/css`, `/js`, `/fonts`, `/storage`, `/up`, …) → `backend:80` (read_timeout 300s for Filament Excel imports)
 
-### URLs
-*   **Filament Admin:** `http://116.254.113.81/admin` ✅ styled & confirmed
-*   **Backend direct:** `http://116.254.113.81:8000`
-*   **Frontend:** `https://project-5z22k.vercel.app` — auto-deploy on push to `main`, repo `ptstpjateng/bima-ai`, root dir `frontend/`
-*   **CORS / API links:** always use `https://project-5z22k.vercel.app` as the frontend origin, never the old IP or localhost
+### URLs (current)
+*   **Public portal:** `https://portal.nolongin.com` (Vercel `bima-portal`)
+*   **Admin console:** `https://admin.nolongin.com` (Vercel `bima-admin`) — login `admin@bima.ai` / `BimaAdmin2026!`
+*   **Admin API:** `https://nolongin.com/admin-api/*` (FastAPI on VPS)
+*   **WhatsApp webhook:** `https://nolongin.com/webhook/aptana/inbound/{secret}` (APTANA Autopilot Worker target)
+*   **Legacy Filament admin:** `https://nolongin.com/admin` (still up; being migrated)
+*   **Bare domain:** `https://nolongin.com` → 301 → portal
+*   **Live WhatsApp:** `+62 851 1755 7091` (APTANA-provisioned)
+*   **CORS:** `admin-api` allows `https://admin.nolongin.com` + `https://nolongin.com` (TrustedHostMiddleware needs both because Caddy proxies preserve `Host: nolongin.com`)
 
 ---
 
@@ -151,10 +174,20 @@ DB_PASSWORD=<see VPS>
 
 > **Note on table name:** The scrape queue is `kbli_scrape_targets` (not `knowledge_bases`). The `scraped_content TEXT` column was added manually via `ALTER TABLE`.
 
-### Frontend — `frontend/.env.local` (local) / Vercel dashboard (production)
+### Admin (`admin/.env.local` local / Vercel `bima-admin` production)
 | Key | Local | Production |
 |---|---|---|
-| `NEXT_PUBLIC_API_URL` | `http://backend-tall.test` | `http://116.254.113.81` |
+| `NEXT_PUBLIC_ADMIN_API_URL` | `http://localhost:8001` | `https://nolongin.com/admin-api` |
+| `NEXTAUTH_URL` | `http://localhost:3000` | `https://admin.nolongin.com` |
+| `NEXTAUTH_SECRET` | dev value | strong random; in Vercel env |
+
+### Portal (`portal/.env.local` local / Vercel `bima-portal` production)
+| Key | Local | Production |
+|---|---|---|
+| (mostly static; no API calls today) | — | — |
+
+### Legacy frontend (`frontend/`) — DEPRECATED
+The old Next.js portal at `frontend/` is not built or deployed anywhere. Replaced by `portal/`. Will be removed in Sprint D cleanup. Do not edit.
 
 > Set production env vars in **Vercel Dashboard → Project → Settings → Environment Variables**. Never commit `.env.local`.
 

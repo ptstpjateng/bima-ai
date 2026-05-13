@@ -139,35 +139,32 @@ async def send_text(recipient_phone: str, body: str, *, preview_url: bool = Fals
 
 
 # ---------------------------------------------------------------------------
-# Typing acknowledgment (Option C — try native, fall back to text).
+# Typing acknowledgment — text bubble (locked, May 2026).
 # ---------------------------------------------------------------------------
 #
-# WhatsApp Cloud API supports a "read + typing" status update that turns the
-# user's checkmarks blue and shows "BIMA is typing…" for ~25s. Whether APTANA
-# passes that field through to Meta is undocumented; we try it once, and on
-# any non-2xx response fall back to a short interim text message.
+# We probed APTANA's /api/v1/messages with Meta's native read+typing status
+# fields (status, message_id, typing_indicator) and got HTTP 422 with explicit
+# rejection of all three field names — APTANA's wrapper enforces a payload
+# whitelist of message TYPES (text, template, document, image, …) and does
+# NOT expose Meta's status-update channel. So we send a short Indonesian text
+# bubble as the acknowledgment.
 #
-# Either path is fire-and-forget — the caller doesn't await the result and
-# never sees an exception. Goal is a faster perceived response, not a
-# guaranteed delivery.
+# See BIMA-Vault/Decisions.md for the full reasoning. Re-test if APTANA
+# upgrades their wrapper.
+#
+# Fire-and-forget — caller doesn't await; never raises.
 
-# Meta's typing indicator times out at 25s; our RAG+Gemma path is 5–10s, so
-# we have plenty of headroom. Short timeout on the request itself so a slow
-# APTANA endpoint can't delay the real reply.
-_ACK_TIMEOUT_SECONDS = 4.0
-
-# Indonesian-language interim text — used only when the native typing call
-# is rejected by APTANA. Kept short so it doesn't dominate the chat.
-_ACK_FALLBACK_BODY = "💭 Sebentar ya, BIMA sedang mencarikan info untukmu…"
+# Indonesian-language interim text. Kept short so it doesn't dominate the chat.
+_ACK_BODY = "💭 Sebentar ya, BIMA sedang mencarikan info untukmu…"
 
 
 async def acknowledge_received(message_id: str | None, recipient_phone: str) -> None:
     """Best-effort acknowledgment so the user sees activity within ~1s.
 
-    Tries the Meta-style typing indicator payload via APTANA first — if APTANA
-    passes it through, the user gets a native "BIMA is typing…" with no extra
-    bubble. On any rejection (or if we don't have a message_id to ack), falls
-    back to sending a short interim text. Never raises.
+    Sends a short interim text via APTANA. The `message_id` argument is kept
+    for forward compatibility — if APTANA ever exposes native typing, the
+    handler can branch on it without changing the call site. Today it's
+    unused.
 
     Call as fire-and-forget:
         asyncio.create_task(acknowledge_received(msg_id, msisdn))
@@ -180,68 +177,9 @@ async def acknowledge_received(message_id: str | None, recipient_phone: str) -> 
         if len(recipient_phone) >= 8
         else "<short>"
     )
-
-    if message_id:
-        if await _try_native_typing(message_id, recipient_phone, masked):
-            return  # native indicator accepted; we're done.
-
-    # Either no message_id, or APTANA rejected the native call. Send a short
-    # interim text so the user knows BIMA heard them.
     try:
-        await send_text(recipient_phone=recipient_phone, body=_ACK_FALLBACK_BODY)
+        await send_text(recipient_phone=recipient_phone, body=_ACK_BODY)
     except Exception:
-        # send_text already swallows network errors; this guard catches anything
-        # else so a broken acknowledge can't kill the inbound handler.
-        logger.exception("Acknowledgment fallback raised | to=%s", masked)
-
-
-async def _try_native_typing(
-    message_id: str, recipient_phone: str, masked: str
-) -> bool:
-    """POST a Meta-style read+typing status to APTANA. Return True on 2xx.
-
-    APTANA's API for status updates isn't documented in their Postman
-    collection. We try the payload shape Meta uses, wrapped in APTANA's
-    standard envelope. First successful response observed in production
-    becomes the reference; first 4xx body teaches us the right shape.
-    """
-    url = f"{_API_BASE}/api/v1/messages"
-    headers = {
-        "Api-Token": _API_TOKEN,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    payload = {
-        "channel": "wa",
-        "sender": _SENDER_NUMBER,
-        "recipient": normalize_phone(recipient_phone),
-        # Speculative APTANA passthrough of Meta's status-update fields.
-        # If APTANA rejects, the rejection body tells us which field is wrong.
-        "type": "status",
-        "status": "read",
-        "message_id": message_id,
-        "typing_indicator": {"type": "text"},
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=_ACK_TIMEOUT_SECONDS) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-    except (httpx.RequestError, asyncio.TimeoutError) as exc:
-        logger.info(
-            "ack native typing network error → falling back | to=%s err=%s",
-            masked, exc.__class__.__name__,
-        )
-        return False
-
-    if resp.status_code < 300:
-        logger.info(
-            "ack native typing accepted | to=%s status=%d", masked, resp.status_code
-        )
-        return True
-
-    # Non-2xx — log enough body to teach us the right shape, then fall back.
-    logger.info(
-        "ack native typing rejected → falling back to text | to=%s status=%d body=%s",
-        masked, resp.status_code, resp.text[:300],
-    )
-    return False
+        # send_text already swallows network errors; this guard catches
+        # anything else so a broken acknowledge can't kill the inbound handler.
+        logger.exception("Acknowledgment send raised | to=%s", masked)
