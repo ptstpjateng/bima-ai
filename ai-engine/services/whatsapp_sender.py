@@ -136,3 +136,112 @@ async def send_text(recipient_phone: str, body: str, *, preview_url: bool = Fals
                 logger.error("APTANA send exhausted retries | to=%s err=%s", masked_to, exc)
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Typing acknowledgment (Option C — try native, fall back to text).
+# ---------------------------------------------------------------------------
+#
+# WhatsApp Cloud API supports a "read + typing" status update that turns the
+# user's checkmarks blue and shows "BIMA is typing…" for ~25s. Whether APTANA
+# passes that field through to Meta is undocumented; we try it once, and on
+# any non-2xx response fall back to a short interim text message.
+#
+# Either path is fire-and-forget — the caller doesn't await the result and
+# never sees an exception. Goal is a faster perceived response, not a
+# guaranteed delivery.
+
+# Meta's typing indicator times out at 25s; our RAG+Gemma path is 5–10s, so
+# we have plenty of headroom. Short timeout on the request itself so a slow
+# APTANA endpoint can't delay the real reply.
+_ACK_TIMEOUT_SECONDS = 4.0
+
+# Indonesian-language interim text — used only when the native typing call
+# is rejected by APTANA. Kept short so it doesn't dominate the chat.
+_ACK_FALLBACK_BODY = "💭 Sebentar ya, BIMA sedang mencarikan info untukmu…"
+
+
+async def acknowledge_received(message_id: str | None, recipient_phone: str) -> None:
+    """Best-effort acknowledgment so the user sees activity within ~1s.
+
+    Tries the Meta-style typing indicator payload via APTANA first — if APTANA
+    passes it through, the user gets a native "BIMA is typing…" with no extra
+    bubble. On any rejection (or if we don't have a message_id to ack), falls
+    back to sending a short interim text. Never raises.
+
+    Call as fire-and-forget:
+        asyncio.create_task(acknowledge_received(msg_id, msisdn))
+    """
+    if not _API_TOKEN or not _SENDER_NUMBER:
+        return  # send_text would log the same warning; stay silent here.
+
+    masked = (
+        recipient_phone[:4] + "…" + recipient_phone[-4:]
+        if len(recipient_phone) >= 8
+        else "<short>"
+    )
+
+    if message_id:
+        if await _try_native_typing(message_id, recipient_phone, masked):
+            return  # native indicator accepted; we're done.
+
+    # Either no message_id, or APTANA rejected the native call. Send a short
+    # interim text so the user knows BIMA heard them.
+    try:
+        await send_text(recipient_phone=recipient_phone, body=_ACK_FALLBACK_BODY)
+    except Exception:
+        # send_text already swallows network errors; this guard catches anything
+        # else so a broken acknowledge can't kill the inbound handler.
+        logger.exception("Acknowledgment fallback raised | to=%s", masked)
+
+
+async def _try_native_typing(
+    message_id: str, recipient_phone: str, masked: str
+) -> bool:
+    """POST a Meta-style read+typing status to APTANA. Return True on 2xx.
+
+    APTANA's API for status updates isn't documented in their Postman
+    collection. We try the payload shape Meta uses, wrapped in APTANA's
+    standard envelope. First successful response observed in production
+    becomes the reference; first 4xx body teaches us the right shape.
+    """
+    url = f"{_API_BASE}/api/v1/messages"
+    headers = {
+        "Api-Token": _API_TOKEN,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "channel": "wa",
+        "sender": _SENDER_NUMBER,
+        "recipient": normalize_phone(recipient_phone),
+        # Speculative APTANA passthrough of Meta's status-update fields.
+        # If APTANA rejects, the rejection body tells us which field is wrong.
+        "type": "status",
+        "status": "read",
+        "message_id": message_id,
+        "typing_indicator": {"type": "text"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=_ACK_TIMEOUT_SECONDS) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+    except (httpx.RequestError, asyncio.TimeoutError) as exc:
+        logger.info(
+            "ack native typing network error → falling back | to=%s err=%s",
+            masked, exc.__class__.__name__,
+        )
+        return False
+
+    if resp.status_code < 300:
+        logger.info(
+            "ack native typing accepted | to=%s status=%d", masked, resp.status_code
+        )
+        return True
+
+    # Non-2xx — log enough body to teach us the right shape, then fall back.
+    logger.info(
+        "ack native typing rejected → falling back to text | to=%s status=%d body=%s",
+        masked, resp.status_code, resp.text[:300],
+    )
+    return False
