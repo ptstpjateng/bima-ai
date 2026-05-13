@@ -21,6 +21,7 @@ class KbliScrapeTarget extends Model
         'scrape_duration_seconds',
         'chroma_chunks',
         'scrape_error',
+        'scraped_content',
         'created_by',
     ];
 
