@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { motion, useMotionValue, useTransform, animate } from "framer-motion";
 import type { LucideIcon } from "lucide-react";
 import { Card } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 
 /**
  * Dashboard stat tile per Brand spec.
@@ -13,21 +14,29 @@ import { Card } from "@/components/ui/card";
  * - Label below in text-secondary
  * - Card hover: scale 1.01 + soft navy shadow lift (150ms)
  * - Count-up: 0 → value over 800ms easeOut cubic
+ * - Skeleton shimmer while `loading`
  */
 export function StatTile({
   label,
   value,
   icon: Icon,
+  loading = false,
+  hint,
 }: {
   label: string;
   value: number;
   icon: LucideIcon;
+  loading?: boolean;
+  hint?: string;
 }) {
   const count = useMotionValue(0);
-  const rounded = useTransform(count, (latest) => Math.round(latest).toLocaleString("id-ID"));
+  const rounded = useTransform(count, (latest) =>
+    Math.round(latest).toLocaleString("id-ID")
+  );
   const [display, setDisplay] = useState("0");
 
   useEffect(() => {
+    if (loading) return;
     const controls = animate(count, value, {
       duration: 0.8,
       ease: [0.16, 1, 0.3, 1], // ease-out cubic-ish
@@ -37,7 +46,7 @@ export function StatTile({
       controls.stop();
       unsub();
     };
-  }, [count, rounded, value]);
+  }, [count, rounded, value, loading]);
 
   return (
     <motion.div
@@ -51,10 +60,15 @@ export function StatTile({
           </div>
         </div>
         <div className="mt-6">
-          <motion.div className="font-display text-3xl font-semibold text-text-primary tracking-tight">
-            {display}
-          </motion.div>
+          {loading ? (
+            <Skeleton className="h-9 w-24 bg-surface-card-hover" />
+          ) : (
+            <motion.div className="font-display text-3xl font-semibold text-text-primary tracking-tight tabular-nums">
+              {display}
+            </motion.div>
+          )}
           <div className="mt-1 text-sm text-text-secondary">{label}</div>
+          {hint && <div className="mt-0.5 text-[11px] text-text-muted">{hint}</div>}
         </div>
       </Card>
     </motion.div>
