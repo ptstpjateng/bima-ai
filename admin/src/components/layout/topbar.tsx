@@ -118,7 +118,7 @@ export function TopBar() {
       <CommandDialog open={paletteOpen} onOpenChange={setPaletteOpen}>
         <CommandInput placeholder="Search admin…" />
         <CommandList>
-          <CommandEmpty>No results yet — resource pages land Phase 2.</CommandEmpty>
+          <CommandEmpty>Tidak ada hasil.</CommandEmpty>
           <CommandGroup heading="Navigation">
             <CommandItem
               onSelect={() => {
@@ -139,10 +139,10 @@ export function TopBar() {
             <CommandItem
               onSelect={() => {
                 setPaletteOpen(false);
-                router.push("/ingestion");
+                router.push("/kbli");
               }}
             >
-              Ingestion
+              KBLI
             </CommandItem>
           </CommandGroup>
         </CommandList>

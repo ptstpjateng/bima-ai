@@ -5,9 +5,7 @@ import { usePathname } from "next/navigation";
 import {
   LayoutDashboard,
   MessageCircle,
-  Database,
   FileText,
-  Users,
   Settings,
   type LucideIcon,
 } from "lucide-react";
@@ -17,15 +15,17 @@ type NavItem = {
   label: string;
   href: string;
   icon: LucideIcon;
+  disabled?: boolean;
 };
 
+// Sprint B.2 nav set per brief:
+//   Dashboard, AI Interactions, KBLI (live) + Settings (placeholder, disabled).
+// Users CRUD + Ingestion CRUD are Sprint C scope — intentionally absent.
 const NAV_ITEMS: NavItem[] = [
   { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
   { label: "AI Interactions", href: "/ai-interactions", icon: MessageCircle },
-  { label: "Ingestion", href: "/ingestion", icon: Database },
   { label: "KBLI", href: "/kbli", icon: FileText },
-  { label: "Users", href: "/users", icon: Users },
-  { label: "Settings", href: "/settings", icon: Settings },
+  { label: "Settings", href: "/settings", icon: Settings, disabled: true },
 ];
 
 export function Sidebar() {
@@ -52,6 +52,19 @@ export function Sidebar() {
           const active =
             pathname === item.href || pathname?.startsWith(`${item.href}/`);
           const Icon = item.icon;
+          if (item.disabled) {
+            return (
+              <span
+                key={item.href}
+                aria-disabled="true"
+                title="Sprint C"
+                className="flex items-center gap-3 px-4 py-2 rounded-pill text-sm text-text-muted cursor-not-allowed"
+              >
+                <Icon className="size-4" aria-hidden />
+                <span>{item.label}</span>
+              </span>
+            );
+          }
           return (
             <Link
               key={item.href}
@@ -62,6 +75,7 @@ export function Sidebar() {
                   ? "bg-brand-navy text-white"
                   : "text-text-secondary hover:text-text-primary hover:bg-surface-card-hover"
               )}
+              aria-current={active ? "page" : undefined}
             >
               <Icon className="size-4" aria-hidden />
               <span>{item.label}</span>
