@@ -49,6 +49,15 @@ nolongin.com, www.nolongin.com {
 		redir /admin 302
 	}
 
+	# Admin API (FastAPI on internal admin-api:8001) — strips /admin-api prefix
+	handle_path /admin-api/* {
+		reverse_proxy admin-api:8001 {
+			transport http {
+				read_timeout 60s
+			}
+		}
+	}
+
 	# Everything else (api, sanctum, admin, livewire, css, js, fonts, storage, /up …)
 	# → Laravel backend. flush_interval -1 streams responses immediately for Filament
 	# Livewire long-polling.

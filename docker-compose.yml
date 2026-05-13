@@ -75,6 +75,35 @@ services:
         condition: service_healthy
 
   # ──────────────────────────────────────────────
+  # Admin API (FastAPI + SQLAlchemy — replaces Laravel admin)
+  # Sprint B foundation; resource endpoints land in Phase 2.
+  # ──────────────────────────────────────────────
+  admin-api:
+    build:
+      context: ./admin-api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ./admin-api/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${DB_USERNAME:-bima}:${DB_PASSWORD:-secret}@postgres:5432/${DB_DATABASE:-bima_ai}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-me-in-production}
+      ADMIN_FRONTEND_URL: https://admin.nolongin.com
+      LOG_LEVEL: INFO
+    networks:
+      - bima-internal
+      - bima-public
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────────
   # Reverse Proxy (Caddy — auto Let's Encrypt for nolongin.com)
   # Replaces nginx; legacy config kept at nginx/default.conf for rollback.
   # ──────────────────────────────────────────────
