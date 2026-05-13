@@ -85,9 +85,15 @@ services:
     restart: unless-stopped
     env_file: ./admin-api/.env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${DB_USERNAME:-bima}:${DB_PASSWORD:-secret}@postgres:5432/${DB_DATABASE:-bima_ai}
+      # NOTE: DATABASE_URL deliberately NOT overridden here — env_file owns it.
+      # The compose-side `${DB_PASSWORD:-secret}` substitution doesn't URL-encode
+      # special chars (the actual password contains @), which breaks asyncpg.
+      # admin-api/.env contains a properly-encoded URL.
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-me-in-production}
-      ADMIN_FRONTEND_URL: https://admin.nolongin.com
+      # admin-api's TrustedHostMiddleware derives allowed hosts from this list.
+      # Include nolongin.com so requests proxied via Caddy (Host: nolongin.com)
+      # are accepted, in addition to admin.nolongin.com (the eventual Vercel host).
+      ADMIN_FRONTEND_URL: https://admin.nolongin.com,https://nolongin.com
       LOG_LEVEL: INFO
     networks:
       - bima-internal
