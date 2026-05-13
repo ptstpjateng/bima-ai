@@ -9,6 +9,7 @@ This endpoint is called by the Laravel Observer after an admin publishes or
 updates a KnowledgeBaseArticle.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -18,6 +19,7 @@ import httpx
 from fastapi import APIRouter, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger("bima_ai.vectorize")
 
@@ -25,6 +27,21 @@ router = APIRouter()
 
 _CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "/app/chroma_db")
 _COLLECTION_NAME = "oss_regulations"  # unified with rag_service.py
+
+# BUG-002 FIX — load the same multilingual embedder used by rag_service.py and
+# the data-pipeline ETL. Without pre-embedding here, ChromaDB falls back to its
+# default all-MiniLM-L6-v2 (English-only), so admin-vectorized articles end up
+# in a different semantic space than the query-time vectors and never match.
+_EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_EMBEDDER: SentenceTransformer | None = None
+
+
+def _get_embedder() -> SentenceTransformer:
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        logger.info("Loading embedding model: %s", _EMBED_MODEL_NAME)
+        _EMBEDDER = SentenceTransformer(_EMBED_MODEL_NAME)
+    return _EMBEDDER
 
 
 def _get_collection() -> chromadb.Collection:
@@ -44,13 +61,18 @@ class VectorizeRequest(BaseModel):
     kbli_codes: list[str] = []
     tags: list[str] = []
     article_id: int | None = None
+    source_url: str | None = None
 
 
 @router.post("/vectorize", status_code=status.HTTP_200_OK)
 async def vectorize_article(body: VectorizeRequest) -> JSONResponse:
     """
     Store a regulation article as a ChromaDB embedding for RAG retrieval.
-    ChromaDB's default embedding function (all-MiniLM-L6-v2) is used.
+
+    Pre-embeds with paraphrase-multilingual-MiniLM-L12-v2 (the same model used
+    by rag_service.py and the data-pipeline ETL) and writes metadata under the
+    canonical schema (kbli_code, section, skala, source_url) that the RAG query
+    expects — see services/rag_service.py:80-83.
     """
     try:
         collection = _get_collection()
@@ -64,26 +86,46 @@ async def vectorize_article(body: VectorizeRequest) -> JSONResponse:
             f"{body.content}"
         )
 
+        # BUG-002 FIX — pre-embed with the multilingual model BEFORE upserting,
+        # then pass embeddings= so ChromaDB cannot fall back to its English-only
+        # default. encode() is CPU-bound; offload to the default executor.
+        loop = asyncio.get_event_loop()
+        embedding = await loop.run_in_executor(
+            None,
+            lambda: _get_embedder()
+            .encode([full_text], convert_to_numpy=True, normalize_embeddings=True)
+            .tolist(),
+        )
+
+        # BUG-001 FIX — write the canonical metadata schema that rag_service.py
+        # reads (kbli_code, section, skala, source_url). The inbound payload
+        # carries kbli_codes (a list, multi-KBLI articles); we collapse to the
+        # first code as the primary kbli_code and stash the comma-joined list
+        # in a dedicated field for completeness. regulation_type maps to section
+        # (it's the closest semantic equivalent — the kind/category of the
+        # chunk). skala is not in the inbound payload, so leave it blank rather
+        # than None (ChromaDB rejects None metadata values).
+        primary_kbli = body.kbli_codes[0] if body.kbli_codes else ""
         metadata: dict[str, Any] = {
-            "title":           body.title,
-            "regulation_type": body.regulation_type,
-            "region":          body.region or "",
-            "kbli_codes":      ",".join(body.kbli_codes),
-            "tags":            ",".join(body.tags),
-            "article_id":      str(body.article_id or ""),
+            "kbli_code":  primary_kbli,
+            "section":    body.regulation_type or "",
+            "skala":      "",
+            "source_url": body.source_url or "",
         }
 
         collection.upsert(
             ids=[body.doc_id],
+            embeddings=embedding,
             documents=[full_text],
             metadatas=[metadata],
         )
 
         logger.info(
-            "Vectorized article | doc_id=%s | title=%s | chars=%s",
+            "Vectorized article | doc_id=%s | title=%s | chars=%s | kbli=%s",
             body.doc_id,
             body.title[:60],
             len(full_text),
+            primary_kbli or "—",
         )
         return JSONResponse(
             status_code=status.HTTP_200_OK,
