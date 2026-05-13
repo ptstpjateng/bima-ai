@@ -7,6 +7,7 @@ import {
   MessageCircle,
   FileText,
   Database,
+  Network,
   Settings,
   type LucideIcon,
 } from "lucide-react";
@@ -27,6 +28,7 @@ const NAV_ITEMS: NavItem[] = [
   { label: "AI Interactions", href: "/ai-interactions", icon: MessageCircle },
   { label: "KBLI", href: "/kbli", icon: FileText },
   { label: "Sumber Data", href: "/data", icon: Database },
+  { label: "Arsitektur", href: "/architecture", icon: Network },
   { label: "Settings", href: "/settings", icon: Settings, disabled: true },
 ];
 

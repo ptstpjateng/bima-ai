@@ -1,0 +1,356 @@
+{
+  "snapshots": [
+    {
+      "id": "v1-2026-05-13",
+      "label": "Phase 1 baseline",
+      "date": "2026-05-13",
+      "summary": "Post-ingestion. WhatsApp bot live via APTANA, admin panel with KBLI/AI Interactions/Sumber Data pages, public landing on Vercel. 306 OSS regulation chunks in ChromaDB.",
+      "components": [
+        {
+          "id": "whatsapp",
+          "label": "WhatsApp",
+          "kind": "external",
+          "subtitle": "via APTANA BSP",
+          "x": 50,
+          "y": 320
+        },
+        {
+          "id": "browser",
+          "label": "Browser",
+          "kind": "external",
+          "subtitle": "desktop / mobile",
+          "x": 50,
+          "y": 60
+        },
+        {
+          "id": "vercel-portal",
+          "label": "bima-portal",
+          "kind": "frontend",
+          "subtitle": "portal.nolongin.com",
+          "x": 320,
+          "y": 60
+        },
+        {
+          "id": "vercel-admin",
+          "label": "bima-admin",
+          "kind": "frontend",
+          "subtitle": "admin.nolongin.com",
+          "x": 320,
+          "y": 540
+        },
+        {
+          "id": "caddy",
+          "label": "Caddy",
+          "kind": "edge",
+          "subtitle": "nolongin.com TLS",
+          "x": 600,
+          "y": 320
+        },
+        {
+          "id": "ai-engine",
+          "label": "ai-engine",
+          "kind": "service",
+          "subtitle": "FastAPI · port 8000",
+          "x": 900,
+          "y": 120
+        },
+        {
+          "id": "admin-api",
+          "label": "admin-api",
+          "kind": "service",
+          "subtitle": "FastAPI · port 8001",
+          "x": 900,
+          "y": 520
+        },
+        {
+          "id": "data-pipeline",
+          "label": "data-pipeline",
+          "kind": "service",
+          "subtitle": "ETL · port 9000",
+          "x": 1200,
+          "y": 320
+        },
+        {
+          "id": "postgres",
+          "label": "Postgres",
+          "kind": "data",
+          "subtitle": "bima_ai",
+          "x": 1500,
+          "y": 120
+        },
+        {
+          "id": "redis",
+          "label": "Redis",
+          "kind": "data",
+          "subtitle": "sessions / queue",
+          "x": 1500,
+          "y": 320
+        },
+        {
+          "id": "chromadb",
+          "label": "ChromaDB",
+          "kind": "data",
+          "subtitle": "oss_regulations (306 chunks)",
+          "x": 1500,
+          "y": 520
+        },
+        {
+          "id": "gemma",
+          "label": "Gemma 3 27b",
+          "kind": "llm",
+          "subtitle": "Google AI Studio",
+          "x": 900,
+          "y": 720
+        }
+      ],
+      "flows": [
+        {
+          "id": "chat-inbound",
+          "label": "Chat Inbound",
+          "summary": "UMKM mengirim pesan WhatsApp; BIMA membalas dengan jawaban ber-RAG dari Gemma 3.",
+          "steps": [
+            {
+              "from": "whatsapp",
+              "to": "caddy",
+              "label": "POST /webhook/aptana/wa",
+              "payload": "POST /webhook/aptana/wa { sender_number, body, message_id, timestamp }"
+            },
+            {
+              "from": "caddy",
+              "to": "ai-engine",
+              "label": "reverse proxy",
+              "payload": "Caddy forwards request to ai-engine:8000 (TLS terminated, original headers preserved)"
+            },
+            {
+              "from": "ai-engine",
+              "to": "chromadb",
+              "label": "RAG: vector search",
+              "payload": "collection.query(query_embeddings, n_results=5, where={collection: 'oss_regulations'})"
+            },
+            {
+              "from": "ai-engine",
+              "to": "postgres",
+              "label": "INSERT chat_log",
+              "payload": "INSERT INTO chat_logs (sender, body, msg_id, direction='inbound') RETURNING id"
+            },
+            {
+              "from": "ai-engine",
+              "to": "gemma",
+              "label": "generateContent (RAG)",
+              "payload": "POST /v1beta/models/gemma-3-27b-it:generateContent { contents: [system + 5 chunks + user] }"
+            },
+            {
+              "from": "gemma",
+              "to": "ai-engine",
+              "label": "completion",
+              "payload": "{ candidates: [{ content: { parts: [{ text: '...' }] }, finishReason: 'STOP' }] }"
+            },
+            {
+              "from": "ai-engine",
+              "to": "caddy",
+              "label": "POST APTANA /api/v1/messages",
+              "payload": "POST https://api.aptana.id/api/v1/messages { to: sender_number, type: 'text', body: reply }"
+            },
+            {
+              "from": "caddy",
+              "to": "whatsapp",
+              "label": "delivered to user",
+              "payload": "APTANA hands message to Meta Cloud API → WhatsApp delivers to recipient"
+            }
+          ]
+        },
+        {
+          "id": "rag-lookup",
+          "label": "RAG Lookup",
+          "summary": "ai-engine menyusun jawaban dengan 5 potongan regulasi paling relevan sebelum memanggil Gemma.",
+          "steps": [
+            {
+              "from": "ai-engine",
+              "to": "chromadb",
+              "label": "embed + query top_k=5",
+              "payload": "collection.query(query_texts=[user_question], n_results=5, where={collection: 'oss_regulations'})"
+            },
+            {
+              "from": "chromadb",
+              "to": "ai-engine",
+              "label": "5 chunks + metadata",
+              "payload": "{ documents: [chunk1..chunk5], metadatas: [{kbli, sektor, ...}], distances: [...] }"
+            },
+            {
+              "from": "ai-engine",
+              "to": "ai-engine",
+              "label": "assemble prompt",
+              "payload": "system_prompt + '\\nContext:\\n' + chunks.join('\\n---\\n') + '\\nUser: ' + question"
+            },
+            {
+              "from": "ai-engine",
+              "to": "gemma",
+              "label": "generateContent",
+              "payload": "POST /v1beta/models/gemma-3-27b-it:generateContent { contents, generationConfig }"
+            }
+          ]
+        },
+        {
+          "id": "admin-login",
+          "label": "Admin Login",
+          "summary": "Admin masuk ke panel BIMA — verifikasi bcrypt, JWT, cookie httpOnly.",
+          "steps": [
+            {
+              "from": "browser",
+              "to": "vercel-admin",
+              "label": "submit /login form",
+              "payload": "POST /login (Next.js Server Action) { email, password }"
+            },
+            {
+              "from": "vercel-admin",
+              "to": "admin-api",
+              "label": "POST /auth/login",
+              "payload": "POST admin-api:8001/auth/login { email, password }"
+            },
+            {
+              "from": "admin-api",
+              "to": "postgres",
+              "label": "SELECT users",
+              "payload": "SELECT id, email, password_hash, role FROM users WHERE email = $1 LIMIT 1"
+            },
+            {
+              "from": "postgres",
+              "to": "admin-api",
+              "label": "user row",
+              "payload": "{ id, email, password_hash, role: 'admin' }"
+            },
+            {
+              "from": "admin-api",
+              "to": "admin-api",
+              "label": "bcrypt verify + sign JWT",
+              "payload": "bcrypt.checkpw(plain, hash) → jwt.encode({sub: id, role, exp}, SECRET, HS256)"
+            },
+            {
+              "from": "admin-api",
+              "to": "vercel-admin",
+              "label": "200 { access_token }",
+              "payload": "{ access_token: '<jwt>', token_type: 'bearer', expires_in: 3600 }"
+            },
+            {
+              "from": "vercel-admin",
+              "to": "browser",
+              "label": "Set-Cookie admin_token",
+              "payload": "Set-Cookie: admin_token=<jwt>; HttpOnly; Secure; SameSite=Lax; Path=/"
+            }
+          ]
+        },
+        {
+          "id": "xlsx-ingestion",
+          "label": "XLSX Ingestion",
+          "summary": "Admin mengunggah Excel KBLI; admin-api memicu data-pipeline yang membangun ulang koleksi ChromaDB.",
+          "steps": [
+            {
+              "from": "browser",
+              "to": "vercel-admin",
+              "label": "drag & drop kbli.xlsx",
+              "payload": "POST /api/proxy/ingestion/upload (multipart) file=kbli.xlsx, kind=excel_kbli, display_name=..."
+            },
+            {
+              "from": "vercel-admin",
+              "to": "admin-api",
+              "label": "forward multipart",
+              "payload": "POST admin-api:8001/ingestion/upload (multipart, Bearer JWT)"
+            },
+            {
+              "from": "admin-api",
+              "to": "admin-api",
+              "label": "write to ingestion_uploads volume",
+              "payload": "fs.write('/var/ingestion_uploads/<uuid>-kbli.xlsx', file.bytes)"
+            },
+            {
+              "from": "admin-api",
+              "to": "postgres",
+              "label": "INSERT ingestion_sources",
+              "payload": "INSERT INTO ingestion_sources (kind, display_name, object_key, status) VALUES (..., 'pending') RETURNING *"
+            },
+            {
+              "from": "admin-api",
+              "to": "data-pipeline",
+              "label": "trigger ETL",
+              "payload": "POST data-pipeline:9000/pipeline/etl-excel { kbli_path: '/app/uploads/<uuid>-kbli.xlsx' }"
+            },
+            {
+              "from": "data-pipeline",
+              "to": "data-pipeline",
+              "label": "subprocess etl_pipeline.py",
+              "payload": "python etl_pipeline.py --kbli /app/uploads/<uuid>-kbli.xlsx (Pandas, deterministic, no LLM)"
+            },
+            {
+              "from": "data-pipeline",
+              "to": "chromadb",
+              "label": "rebuild oss_regulations",
+              "payload": "collection.delete(where={collection: 'oss_regulations'}) → collection.upsert(ids, docs, metas)"
+            },
+            {
+              "from": "data-pipeline",
+              "to": "admin-api",
+              "label": "ETL done",
+              "payload": "200 { status: 'done', chunks_indexed: N, duration_ms }"
+            },
+            {
+              "from": "admin-api",
+              "to": "postgres",
+              "label": "UPDATE status=done",
+              "payload": "UPDATE ingestion_sources SET status='done', chunks_indexed=$1, last_run_at=NOW() WHERE id=$2"
+            }
+          ]
+        },
+        {
+          "id": "public-landing",
+          "label": "Public Landing",
+          "summary": "Pengunjung membuka portal publik dan klik tombol “Chat dengan BIMA” ke WhatsApp.",
+          "steps": [
+            {
+              "from": "browser",
+              "to": "vercel-portal",
+              "label": "GET portal.nolongin.com",
+              "payload": "GET https://portal.nolongin.com/ (Vercel Edge, SSG, no backend call)"
+            },
+            {
+              "from": "vercel-portal",
+              "to": "browser",
+              "label": "200 static HTML",
+              "payload": "200 OK — prerendered Next.js page, no API roundtrip"
+            },
+            {
+              "from": "browser",
+              "to": "whatsapp",
+              "label": "click → wa.me deeplink",
+              "payload": "window.location = 'https://wa.me/6285117557091?text=Halo%20BIMA'"
+            }
+          ]
+        },
+        {
+          "id": "bare-domain-redirect",
+          "label": "Bare Domain Redirect",
+          "summary": "Pengunjung mengetik nolongin.com dan diarahkan ke portal.",
+          "steps": [
+            {
+              "from": "browser",
+              "to": "caddy",
+              "label": "GET nolongin.com/",
+              "payload": "GET https://nolongin.com/ (TLS via Caddy auto-cert)"
+            },
+            {
+              "from": "caddy",
+              "to": "browser",
+              "label": "301 → portal.nolongin.com",
+              "payload": "HTTP/1.1 301 Moved Permanently\\nLocation: https://portal.nolongin.com/"
+            },
+            {
+              "from": "browser",
+              "to": "vercel-portal",
+              "label": "follow redirect",
+              "payload": "GET https://portal.nolongin.com/ (Vercel Edge)"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
