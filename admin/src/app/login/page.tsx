@@ -85,16 +85,17 @@ function LoginForm() {
         return;
       }
 
-      const data = (await res.json()) as { token?: string };
-      if (!data?.token) {
-        toast.error("Respons admin-api tidak valid (tidak ada token).");
+      // admin-api follows OAuth2 RFC 6749: returns { access_token, token_type, user }
+      const data = (await res.json()) as { access_token?: string };
+      if (!data?.access_token) {
+        toast.error("Respons admin-api tidak valid (tidak ada access_token).");
         return;
       }
 
       const setRes = await fetch("/api/auth/set-token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: data.token }),
+        body: JSON.stringify({ token: data.access_token }),
       });
 
       if (!setRes.ok) {
