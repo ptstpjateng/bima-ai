@@ -162,20 +162,58 @@ def _pipeline_path_for(filename: str) -> str:
     return str(PIPELINE_UPLOAD_DIR / filename)
 
 
-async def _trigger_pipeline(
-    kind: UploadKind, pipeline_path: str
-) -> tuple[int, dict]:
+async def _resolve_active_paths(db: AsyncSession) -> dict[str, str]:
     """
-    Best-effort POST to data-pipeline /pipeline/etl-excel with the per-kind
-    path. Returns (status_code, response_json_or_empty). Network errors
-    surface as status_code=0 so the caller can fall through to pending.
-    """
-    body: dict[str, str] = {}
-    if kind == "excel_kbli":
-        body["kbli_path"] = pipeline_path
-    elif kind == "excel_pb_umku":
-        body["pb_umku_path"] = pipeline_path
+    Return the most-recent uploaded path for each excel kind that has any
+    source.
 
+    Result shape:
+        {"kbli_path": "/app/data/uploads/<file>",
+         "pb_umku_path": "/app/data/uploads/<file>"}
+
+    Keys are omitted when no upload of that kind exists yet — the pipeline
+    falls back to its hardcoded baseline (DEFAULT_KBLI_PATH /
+    DEFAULT_PB_UMKU_PATH in etl_pipeline.py) for the omitted side.
+
+    Invariant: this MUST be called inside the same session/transaction as
+    the row that just got upserted, so that the just-inserted/rerun row is
+    visible and naturally wins the "most-recent" ordering for its kind. We
+    deliberately do NOT gate on status — the file lands on disk during the
+    upload step, well before the pipeline reports back, so even a
+    `pending` row is a valid source of truth for the file path.
+    """
+    paths: dict[str, str] = {}
+    for kind, body_key in (
+        ("excel_kbli", "kbli_path"),
+        ("excel_pb_umku", "pb_umku_path"),
+    ):
+        stmt = (
+            select(IngestionSource)
+            .where(
+                IngestionSource.kind == kind,
+                IngestionSource.object_key.isnot(None),
+            )
+            .order_by(
+                IngestionSource.created_at.desc(),
+                IngestionSource.id.desc(),
+            )
+            .limit(1)
+        )
+        row = (await db.execute(stmt)).scalar_one_or_none()
+        if row and row.object_key:
+            paths[body_key] = _pipeline_path_for(row.object_key)
+    return paths
+
+
+async def _trigger_pipeline(body: dict[str, str]) -> tuple[int, dict]:
+    """
+    Best-effort POST to data-pipeline /pipeline/etl-excel with the assembled
+    body (may include `kbli_path`, `pb_umku_path`, both, or neither — in
+    which case the pipeline runs against its hardcoded defaults).
+
+    Returns (status_code, response_json_or_empty). Network errors surface as
+    status_code=0 so the caller can fall through to pending.
+    """
     url = DATA_PIPELINE_URL.rstrip("/") + "/pipeline/etl-excel"
     try:
         async with httpx.AsyncClient(timeout=_PIPELINE_TIMEOUT_SECONDS) as client:
@@ -277,9 +315,13 @@ async def upload_ingestion_source(
         admin_path,
     )
 
-    # 3) Best-effort trigger; if pipeline says 202, flip to processing.
-    pipeline_path = _pipeline_path_for(filename)
-    code, _payload = await _trigger_pipeline(kind, pipeline_path)
+    # 3) Best-effort trigger; pass BOTH paths so the other kind's prior
+    #    upload isn't silently reverted to the pipeline's hardcoded default.
+    #    _resolve_active_paths sees the just-inserted row (via db.flush()
+    #    above) and wins the most-recent ordering for `kind`.
+    await db.flush()  # make the new object_key visible to the lookup
+    body = await _resolve_active_paths(db)
+    code, _payload = await _trigger_pipeline(body)
     if code == 202:
         row.status = "processing"
         row.last_run_at = datetime.now(timezone.utc)
@@ -400,8 +442,11 @@ async def rerun_ingestion_source(
             detail=f"Re-run tidak didukung untuk kind={row.kind!r}.",
         )
 
-    pipeline_path = _pipeline_path_for(row.object_key)
-    code, payload = await _trigger_pipeline(row.kind, pipeline_path)  # type: ignore[arg-type]
+    # Pass BOTH paths so re-running one kind doesn't silently revert the
+    # other to the pipeline's hardcoded baseline. The row being rerun is
+    # (by construction) the most-recent for its kind, so it's included.
+    body = await _resolve_active_paths(db)
+    code, payload = await _trigger_pipeline(body)
     if code == 409:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

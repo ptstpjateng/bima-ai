@@ -12,12 +12,14 @@ Author: BIMA-AI Data Engineering
 import argparse
 import hashlib
 import logging
+import os
 import re
 import sys
 from pathlib import Path
 
 import chromadb
 import pandas as pd
+import psycopg2
 from sentence_transformers import SentenceTransformer
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -421,6 +423,174 @@ def ingest_to_chromadb(records: list[dict]) -> int:
     return total_inserted
 
 
+# ── Phase 4b: PostgreSQL Sync ───────────────────────────────────────────────
+#
+# Bug-Fix (May 2026): the ETL previously wrote ChromaDB only, so the AI bot
+# answered correctly via RAG but admin-api's /kbli browser + dashboard
+# active_kbli_codes stat (which read from PostgreSQL `kblis` / `pb_umkus`)
+# silently lagged behind. We now mirror the freshly-built records back into
+# Postgres in the same run, wrapped in a single transaction so a mid-write
+# failure leaves the prior state intact.
+#
+# These tables are Laravel-owned (no Alembic migration here) and have no
+# incoming FKs — verified on prod via `pg_constraint` lookup — so TRUNCATE
+# ... RESTART IDENTITY is safe.
+
+
+def _records_to_kbli_rows(records: list[dict]) -> list[tuple]:
+    """
+    Collapse the per-skala-usaha expanded records back to one row per
+    (kode_kbli, skala_usaha, tingkat_risiko) — the Laravel `kblis` table is
+    a flat denormalised mirror, same shape one row per ChromaDB chunk minus
+    the PB UMKU relational tail.
+
+    pb_umku_names is a newline-joined list of the PB UMKU nomeklatur for
+    that record (matches the prior Laravel importer's behaviour — the
+    `kblis.pb_umku_names` column is just a denormalised hint for the admin
+    browser, not used for joins).
+    """
+    rows: list[tuple] = []
+    seen: set[tuple] = set()
+    for r in records:
+        key = (r["kode_kbli"], r["skala_usaha"], r["tingkat_risiko"], r["perizinan_berusaha"])
+        if key in seen:
+            continue
+        seen.add(key)
+        pb_names = "\n".join(
+            sorted({pb["nomeklatur"] for pb in r["pb_umku"] if pb.get("nomeklatur")})
+        )
+        rows.append(
+            (
+                r["kode_kbli"],
+                r["judul_kbli"],
+                r["ruang_lingkup"] or None,
+                r["skala_usaha"] or None,
+                r["tingkat_risiko"] or None,
+                r["perizinan_berusaha"] or None,
+                r["persyaratan"] or None,
+                r["jangka_waktu"] or None,
+                r["kewajiban"] or None,
+                pb_names or None,
+                r["parameter"] or None,
+                r["kewenangan"] or None,
+                r["sektor"] or None,
+            )
+        )
+    return rows
+
+
+def _lookup_to_pb_umku_rows(pb_lookup: dict[str, list[dict]]) -> list[tuple]:
+    """
+    Flatten the PB UMKU lookup into rows for the `pb_umkus` table.
+    Same column order as live DB (verified May 2026): nomeklatur, persyaratan,
+    jangka_waktu_penerbitan, kewajiban, masa_berlaku, parameter, kewenangan.
+    Note the Excel typo `nomeklatur` (not `nomenklatur`) — preserved in the DB.
+    """
+    rows: list[tuple] = []
+    seen: set[tuple] = set()
+    for entries in pb_lookup.values():
+        for entry in entries:
+            key = (
+                entry["nomeklatur"],
+                entry["persyaratan"],
+                entry["jangka_waktu"],
+                entry["kewajiban"],
+                entry["masa_berlaku"],
+                entry["parameter"],
+                entry["kewenangan"],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                (
+                    entry["nomeklatur"],
+                    entry["persyaratan"] or None,
+                    entry["jangka_waktu"] or None,
+                    entry["kewajiban"] or None,
+                    entry["masa_berlaku"] or None,
+                    entry["parameter"] or None,
+                    entry["kewenangan"] or None,
+                )
+            )
+    return rows
+
+
+def sync_to_postgres(
+    records: list[dict], pb_lookup: dict[str, list[dict]]
+) -> tuple[int, int]:
+    """
+    Truncate `kblis` + `pb_umkus` and re-insert the freshly-built records in a
+    single transaction. Returns (n_kbli, n_pb).
+
+    Env vars (from data-pipeline/.env, see BIMA/CLAUDE.md § Data Pipeline env):
+      DB_HOST, DB_PORT (default 5432), DB_DATABASE, DB_USERNAME, DB_PASSWORD.
+
+    The two TRUNCATEs share the same `with conn:` block, so either both tables
+    flip to the new content or neither does — psycopg2 commits on context exit
+    and rolls back on any exception. There are no incoming FKs to either
+    table (verified via pg_constraint), so the plain TRUNCATE form is safe.
+    """
+    kbli_rows = _records_to_kbli_rows(records)
+    pb_rows = _lookup_to_pb_umku_rows(pb_lookup)
+
+    log.info(
+        f"PostgreSQL sync: prepared {len(kbli_rows)} kbli rows, {len(pb_rows)} pb_umku rows"
+    )
+
+    conn = psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        port=os.environ.get("DB_PORT", "5432"),
+        dbname=os.environ["DB_DATABASE"],
+        user=os.environ["DB_USERNAME"],
+        password=os.environ["DB_PASSWORD"],
+    )
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE kblis RESTART IDENTITY")
+                cur.executemany(
+                    """
+                    INSERT INTO kblis (
+                        kode_kbli, judul_kbli, ruang_lingkup, skala_usaha,
+                        tingkat_risiko, perizinan_berusaha, persyaratan,
+                        jangka_waktu_penerbitan, kewajiban, pb_umku_names,
+                        parameter, kewenangan, sektor,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s,
+                        NOW(), NOW()
+                    )
+                    """,
+                    kbli_rows,
+                )
+
+                cur.execute("TRUNCATE pb_umkus RESTART IDENTITY")
+                cur.executemany(
+                    """
+                    INSERT INTO pb_umkus (
+                        nomeklatur, persyaratan, jangka_waktu_penerbitan,
+                        kewajiban, masa_berlaku, parameter, kewenangan,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s,
+                        %s, %s, %s, %s,
+                        NOW(), NOW()
+                    )
+                    """,
+                    pb_rows,
+                )
+        log.info(
+            f"PostgreSQL kblis + pb_umkus synced: {len(kbli_rows)} kblis / {len(pb_rows)} pb_umkus"
+        )
+        return len(kbli_rows), len(pb_rows)
+    finally:
+        conn.close()
+
+
 # ── Phase 5: Main Execution ─────────────────────────────────────────────────
 
 
@@ -485,6 +655,19 @@ def main(kbli_path: Path | None = None, pb_umku_path: Path | None = None):
         log.error(f"Failed during ChromaDB ingestion: {e}")
         sys.exit(1)
 
+    # Phase 4b: Mirror to PostgreSQL. Best-effort — if this fails the RAG
+    # update is still live, so the bot benefits even if the admin browser
+    # doesn't refresh. We log loudly and keep going.
+    pg_kbli_count = 0
+    pg_pb_count = 0
+    try:
+        pg_kbli_count, pg_pb_count = sync_to_postgres(records, pb_lookup)
+    except Exception as e:
+        log.error(
+            f"PostgreSQL sync failed (ChromaDB already updated; admin browser "
+            f"will be stale until next successful run): {e}"
+        )
+
     # Summary
     log.info("=" * 60)
     log.info("ETL PIPELINE SUMMARY")
@@ -496,12 +679,21 @@ def main(kbli_path: Path | None = None, pb_umku_path: Path | None = None):
     log.info(f"  Expanded records (after merge):  {len(records)}")
     log.info(f"  PB UMKU matches found:           {pb_match_count}")
     log.info(f"  Chunks inserted into ChromaDB:   {total_chunks}")
+    log.info(f"  PostgreSQL kblis rows:           {pg_kbli_count}")
+    log.info(f"  PostgreSQL pb_umkus rows:        {pg_pb_count}")
     log.info(f"  Collection: '{COLLECTION_NAME}'")
     log.info("=" * 60)
     # Machine-readable beacon parsed by server.py to populate the ETL state's
     # `chunks_indexed` field. Format is part of the contract — do not change
     # without updating server.py's regex.
     print(f"[etl] indexed {total_chunks} chunks", flush=True)
+    # Companion beacon for postgres sync — same convention so admin-api can
+    # parse for stats later if it wants. Only emitted when the sync succeeded.
+    if pg_kbli_count or pg_pb_count:
+        print(
+            f"[etl] postgres synced {pg_kbli_count} kblis / {pg_pb_count} pb_umkus",
+            flush=True,
+        )
     log.info("Pipeline completed successfully.")
 
 
