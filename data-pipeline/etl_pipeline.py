@@ -17,6 +17,7 @@ from pathlib import Path
 
 import chromadb
 import pandas as pd
+from sentence_transformers import SentenceTransformer
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -24,6 +25,22 @@ KBLI_PATH = Path("/app/data/raw_excel/kbli.xlsx")
 PB_UMKU_PATH = Path("/app/data/raw_excel/pb_umku.xlsx")
 CHROMA_DB_PATH = "/app/chroma_db"
 COLLECTION_NAME = "oss_regulations"
+EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+
+# ── Embedder singleton (BUG-002 fix) ─────────────────────────────────────────
+# MUST match ai-engine/services/rag_service.py:23-32 so write-side and read-side
+# share the same semantic space. ChromaDB's default (all-MiniLM-L6-v2) is
+# English-only and silently corrupts Indonesian retrieval.
+
+_EMBEDDER: SentenceTransformer | None = None
+
+
+def _get_embedder() -> SentenceTransformer:
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        print(f"[etl] loading embedder {EMBEDDING_MODEL}...")
+        _EMBEDDER = SentenceTransformer(EMBEDDING_MODEL)
+    return _EMBEDDER
 
 # Columns that need forward-fill due to Excel merged cells
 KBLI_FFILL_COLS = ["Kode KBLI", "Judul KBLI", "Ruang Lingkup", "Sektor"]
@@ -374,13 +391,25 @@ def ingest_to_chromadb(records: list[dict]) -> int:
         batch_metas.append(metadata)
 
         if len(batch_ids) >= BATCH_SIZE:
-            collection.upsert(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
+            embeddings = _get_embedder().encode(batch_docs, convert_to_numpy=True).tolist()
+            collection.upsert(
+                ids=batch_ids,
+                documents=batch_docs,
+                embeddings=embeddings,
+                metadatas=batch_metas,
+            )
             total_inserted += len(batch_ids)
             batch_ids, batch_docs, batch_metas = [], [], []
 
     # Flush remaining
     if batch_ids:
-        collection.upsert(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
+        embeddings = _get_embedder().encode(batch_docs, convert_to_numpy=True).tolist()
+        collection.upsert(
+            ids=batch_ids,
+            documents=batch_docs,
+            embeddings=embeddings,
+            metadatas=batch_metas,
+        )
         total_inserted += len(batch_ids)
 
     log.info(f"ChromaDB ingestion complete: {total_inserted} chunks upserted")
@@ -442,4 +471,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # Startup self-test: fail fast if the embedder cannot load, rather than
+    # silently falling back to ChromaDB's default model mid-ingest.
+    try:
+        _get_embedder()
+    except Exception as e:
+        print(f"[etl] FATAL: embedder failed to load: {e}", file=sys.stderr)
+        sys.exit(1)
+
     main()
