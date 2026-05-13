@@ -26,6 +26,7 @@ Required env vars (see .env.example):
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -35,7 +36,7 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from services.ai_handler import generate_ai_response, log_to_backend
-from services.whatsapp_sender import send_text
+from services.whatsapp_sender import acknowledge_received, send_text
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -95,6 +96,7 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
     logger.debug("APTANA inbound full | %s", data)
 
     text = _extract_text_from_payload(raw_payload)
+    message_id = _extract_message_id_from_payload(raw_payload)
 
     if not msisdn or not text:
         logger.warning(
@@ -106,16 +108,28 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
         # not a transient failure. Investigate from logs.
         return {"ok": True, "skipped": "missing_fields"}
 
-    background.add_task(_process_inbound, msisdn=msisdn, text=text, name=name)
+    background.add_task(
+        _process_inbound, msisdn=msisdn, text=text, name=name, message_id=message_id
+    )
     return {"ok": True}
 
 
-async def _process_inbound(msisdn: str, text: str, name: str | None = None) -> None:
+async def _process_inbound(
+    msisdn: str, text: str, name: str | None = None, message_id: str | None = None
+) -> None:
     """End-to-end pipeline for one inbound message: AI reply + send back + log."""
     # Channel-namespaced user_id avoids the cross-tenant collision noted in
     # ai_handler.py:81 (flat in-memory dict keyed by stringified user_id).
     user_id = f"wa-{msisdn}"
-    logger.info("APTANA processing | user=%s name=%s text=%r", _mask(msisdn), name, text[:80])
+    logger.info(
+        "APTANA processing | user=%s name=%s msg_id=%s text=%r",
+        _mask(msisdn), name, message_id or "<none>", text[:80],
+    )
+
+    # Fire-and-forget acknowledgment so the user sees activity within ~1s.
+    # Tries native WhatsApp typing indicator via APTANA; falls back to a short
+    # interim text. Never blocks the slow generation path below.
+    asyncio.create_task(acknowledge_received(message_id, msisdn))
 
     try:
         reply = await generate_ai_response(user_id, text)
@@ -246,6 +260,64 @@ def _extract_text_from_payload(payload: Any) -> str | None:
                             body = text_obj.get("body")
                             if isinstance(body, str) and body.strip():
                                 return body.strip()
+
+    return None
+
+
+def _extract_message_id_from_payload(payload: Any) -> str | None:
+    """Pull the Meta `message_id` (wamid.xxx) out of APTANA's `payload` field.
+
+    Mirrors the probing logic of `_extract_text_from_payload` — APTANA wraps
+    Meta's webhook envelope and we don't know the exact shape, so try the
+    common ones. Returns None if no id is found; the acknowledgment falls
+    back to plain text in that case.
+    """
+    if payload is None or payload == "":
+        return None
+
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                payload = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        else:
+            return None  # plain text inbound has no message id
+
+    if not isinstance(payload, dict):
+        return None
+
+    # Shape 1: flat dict with id directly under known keys.
+    for key in ("id", "message_id", "messageId", "wamid"):
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # Shape 2: Meta-style {"messages": [{"id": "wamid.xxx", ...}]}
+    msgs = payload.get("messages")
+    if isinstance(msgs, list) and msgs:
+        first = msgs[0] if isinstance(msgs[0], dict) else None
+        if first:
+            mid = first.get("id") or first.get("message_id")
+            if isinstance(mid, str) and mid.strip():
+                return mid.strip()
+
+    # Shape 3: full Meta envelope {"entry":[{"changes":[{"value":{"messages":[...]}}]}]}
+    entries = payload.get("entry")
+    if isinstance(entries, list) and entries:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for change in entry.get("changes", []):
+                value = change.get("value", {}) if isinstance(change, dict) else {}
+                msgs = value.get("messages")
+                if isinstance(msgs, list) and msgs:
+                    first = msgs[0]
+                    if isinstance(first, dict):
+                        mid = first.get("id") or first.get("message_id")
+                        if isinstance(mid, str) and mid.strip():
+                            return mid.strip()
 
     return None
 
