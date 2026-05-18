@@ -58,6 +58,38 @@ def create_access_token(*, subject: str | int, settings: Settings) -> str:
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
+def create_token_with_claims(
+    *,
+    subject: str | int,
+    extra_claims: dict,
+    settings: Settings,
+) -> str:
+    """
+    Like `create_access_token` but accepts extra (non-reserved) claims.
+
+    Used by `routers/sso.py` to embed citizen identity in the token (nik,
+    name, kind='pemohon') so `/sso/me` is a stateless reads from the JWT
+    instead of another SIAP DB round-trip.
+
+    `extra_claims` MUST NOT contain `sub`, `iat`, or `exp` — those are
+    managed here. We assert rather than silently overwrite so a typo in a
+    caller surfaces immediately.
+    """
+    reserved = {"sub", "iat", "exp"}
+    overlap = reserved & set(extra_claims)
+    if overlap:
+        raise ValueError(f"extra_claims cannot contain reserved keys: {overlap}")
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        **extra_claims,
+        "sub": str(subject),
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=settings.JWT_EXPIRY_DAYS)).timestamp()),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
 # ---------------------------------------------------------------------------
 # Current admin user
 # ---------------------------------------------------------------------------
