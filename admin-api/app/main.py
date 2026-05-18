@@ -31,7 +31,15 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from app.config import get_settings
-from app.routers import ai_interactions, auth, dashboard, health, ingestion, kbli
+from app.routers import (
+    ai_interactions,
+    auth,
+    dashboard,
+    health,
+    ingestion,
+    kbli,
+    tracking,
+)
 from app.services.status_reconciler import (
     POLL_INTERVAL_SECONDS as _RECONCILER_INTERVAL,
     run_reconciler_loop,
@@ -222,3 +230,4 @@ app.include_router(
 )
 app.include_router(kbli.router, prefix="/kbli", tags=["KBLI"])
 app.include_router(ingestion.router, prefix="/ingestion", tags=["Ingestion"])
+app.include_router(tracking.router, prefix="/tracking", tags=["Tracking"])

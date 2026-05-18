@@ -59,6 +59,21 @@ class Settings(BaseSettings):
         description="Base URL of ai-engine for internal cross-service queries.",
     )
 
+    # ---- SIAP Jateng (read-only Sanctum API) ---------------------------
+    # DPMPTSP Central Java production licensing system. Used by the
+    # /tracking/{ticket} endpoint to render permit status on the portal.
+    # Token issued by SIAP via POST /api/v1/login. Leave SIAP_API_TOKEN
+    # blank to disable the integration (endpoint returns 503 cleanly).
+    SIAP_API_BASE: str = Field(
+        default="",
+        description="SIAP base URL, e.g. https://perizinan.jatengprov.go.id. Empty = disabled.",
+    )
+    SIAP_API_TOKEN: str = Field(
+        default="",
+        description="Sanctum bearer for BIMA service account. Empty = disabled.",
+    )
+    SIAP_TIMEOUT_SECONDS: float = Field(default=8.0, ge=1.0, le=30.0)
+
     # ---- Logging --------------------------------------------------------
     LOG_LEVEL: str = Field(default="INFO")
 
