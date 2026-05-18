@@ -29,7 +29,7 @@ import os
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 from deps import require_internal_key
@@ -150,7 +150,12 @@ class ValidateResponse(BaseModel):
 )
 async def validate_submission_endpoint(
     _internal: Annotated[bool, Depends(require_internal_key)],
-    body: Optional[ValidateRequest] = None,
+    # `Body(default=None, embed=False)` is the explicit form that tells
+    # FastAPI/Pydantic v2 the body is genuinely optional — without `embed`,
+    # an empty body with `Content-Type: application/json` would trigger the
+    # global RequestValidationError handler before the demo short-circuit
+    # could run. Per QA finding H1 (2026-05-19).
+    body: Annotated[Optional[ValidateRequest], Body(embed=False)] = None,
     demo_fixture: Optional[DemoFixtureName] = Query(
         default=None,
         description=(

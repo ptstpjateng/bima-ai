@@ -68,7 +68,7 @@ class ValidatorClient:
 
     async def validate(
         self,
-        documents: list[dict],
+        documents: Optional[list[dict]] = None,
         demo_fixture: Optional[str] = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
@@ -76,9 +76,11 @@ class ValidatorClient:
 
         Args:
           documents: list of `{doc_type, filename, mime_type, content_base64}`
-            dicts, matching ai-engine's `DocumentInput` schema. When
-            `demo_fixture` is set, ai-engine ignores documents but the request
-            still requires `min_length=1` — pass a one-element stub list.
+            dicts, matching ai-engine's `DocumentInput` schema. Optional in
+            demo mode — ai-engine's validator router now accepts a
+            body-less call when `demo_fixture` is set (per QA fix H1+H2,
+            2026-05-19). When `documents` is None and `demo_fixture` is
+            None, ai-engine returns 422.
           demo_fixture: optional fixture name (`clean` | `name_mismatch` |
             `nik_typo`). Passed as `?demo_fixture=...` query param; ai-engine
             short-circuits to a pre-baked response. Used in Sprint D demos.
@@ -96,7 +98,10 @@ class ValidatorClient:
 
         url = f"{self.base}/v1/validator/submission"
         params = {"demo_fixture": demo_fixture} if demo_fixture else None
-        body = {"documents": documents}
+        # In demo mode the body is omitted entirely — no stub documents,
+        # no empty array. ai-engine accepts a body-less POST when
+        # demo_fixture is set in the query string (QA fix H1+H2).
+        body = {"documents": documents} if documents else None
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:

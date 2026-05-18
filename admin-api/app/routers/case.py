@@ -235,19 +235,12 @@ async def validate_case(
             detail="Validator (ai-engine) is not configured on this environment.",
         )
 
-    if body.demo_fixture is not None:
-        # ai-engine requires min_length=1 even in demo mode. Stub satisfies
-        # the schema without doing any real upload/decoding.
-        docs_to_send: list[dict] = [
-            {
-                "doc_type": "ktp",
-                "filename": "_demo_stub.bin",
-                "mime_type": "application/octet-stream",
-                "content_base64": "",
-            }
-        ]
-    else:
-        docs_to_send = body.documents or []
+    # In demo mode, send no documents at all — ai-engine accepts a body-less
+    # POST when `?demo_fixture=` is set (QA fix H1+H2, 2026-05-19). This
+    # removes the former empty-base64 stub workaround.
+    docs_to_send: Optional[list[dict]] = (
+        None if body.demo_fixture is not None else (body.documents or [])
+    )
 
     ok, payload = await validator.validate(
         documents=docs_to_send,
