@@ -1,0 +1,50 @@
+{
+  "score": 0.84,
+  "score_percent": 84,
+  "status": "needs_minor_corrections",
+  "summary": "Kelengkapan 84%. Ada 1 catatan yang sebaiknya diperbaiki sebelum berkas dikirim — NIK pada KTP terdeteksi kurang dari 16 digit.",
+  "per_document": {
+    "ktp": {
+      "nik": "337401234567890",
+      "nama": "BUDI SANTOSO",
+      "tempat_lahir": "SEMARANG",
+      "tanggal_lahir": "12-04-1988",
+      "jenis_kelamin": "LAKI-LAKI",
+      "alamat": "JL. PANDANARAN NO. 45",
+      "rt_rw": "003/005",
+      "kelurahan_desa": "PEKUNDEN",
+      "kecamatan": "SEMARANG TENGAH",
+      "agama": "ISLAM",
+      "status_perkawinan": "KAWIN",
+      "pekerjaan": "WIRASWASTA",
+      "kewarganegaraan": "WNI",
+      "berlaku_hingga": "SEUMUR HIDUP",
+      "kabupaten_kota": "KOTA SEMARANG",
+      "provinsi": "JAWA TENGAH"
+    },
+    "nib": {
+      "nib": "1234567890123",
+      "nama_pelaku_usaha": "BUDI SANTOSO",
+      "alamat": "JL. PANDANARAN NO. 45, KOTA SEMARANG, JAWA TENGAH",
+      "kbli_codes": ["47711", "47712"],
+      "skala_usaha": "USAHA MIKRO",
+      "status_modal": "PMDN",
+      "tanggal_penerbitan": "2025-08-14",
+      "npwp": "123456789012345"
+    },
+    "npwp": {
+      "npwp": "12.345.678.9-012.345",
+      "nama": "BUDI SANTOSO",
+      "alamat": "JL. PANDANARAN NO. 45, KOTA SEMARANG",
+      "tanggal_terdaftar": "2024-03-10"
+    }
+  },
+  "issues": [
+    {
+      "severity": "high",
+      "field": "nik_format",
+      "message": "NIK di KTP tidak sesuai format 16 digit (terdeteksi hanya 15 digit). Pastikan foto KTP jelas dan NIK terbaca dengan baik.",
+      "related_docs": ["ktp.jpg"]
+    }
+  ]
+}

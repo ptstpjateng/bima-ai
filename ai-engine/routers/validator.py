@@ -9,16 +9,27 @@ POST /v1/validator/submission
   the core logic and [[BIMA Vision]] req #6 for the product framing.
 
 Auth: gated by X-Internal-Key. Mirrors admin-api's /tracking pattern.
+
+Demo mode:
+  When `ENABLE_DEMO_FIXTURES=true` (default), callers can pass
+  `?demo_fixture=clean|name_mismatch|nik_typo` to skip Gemini Vision
+  entirely and return a canned ValidateResponse from
+  `ai-engine/tests/fixtures/<name>.json`. Used by the bima-admin case
+  page for stage rehearsals — no PII, no quota burn, no flaky OCR.
+  Flip the env flag to false before the production cutover; with it off,
+  demo_fixture requests return 403 and the real path is unaffected.
 """
 
 from __future__ import annotations
 
 import base64
+import json
 import logging
-from typing import Annotated, Any
+import os
+from pathlib import Path
+from typing import Annotated, Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 from deps import require_internal_key
@@ -37,6 +48,38 @@ router = APIRouter(prefix="/v1/validator", tags=["Validator"])
 # user uploads a 250 MB shapefile here, reject at the door.
 _MAX_BYTES_PER_DOC = 8 * 1024 * 1024
 _MAX_DOCS_PER_REQUEST = 10
+
+# Demo fixtures live next to the validator agent tests. Resolved at import
+# time so the path lookup happens once. The directory is checked in to git
+# under `ai-engine/tests/fixtures/` — see that folder's README for the
+# fixture contents and the prod-rollout flag-flip checklist.
+_FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+DemoFixtureName = Literal["clean", "name_mismatch", "nik_typo"]
+
+
+def _demo_fixtures_enabled() -> bool:
+    """Read at call-time, not import-time — lets tests/admin-api flip the env."""
+    return os.getenv("ENABLE_DEMO_FIXTURES", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_fixture(name: DemoFixtureName) -> dict[str, Any]:
+    """Load a fixture JSON from disk. Raises 500 on missing/malformed file."""
+    path = _FIXTURES_DIR / f"{name}.json"
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error("Demo fixture not found | path=%s", path)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Demo fixture '{name}' not found on server.",
+        )
+    except json.JSONDecodeError as e:
+        logger.error("Demo fixture malformed | path=%s | err=%s", path, e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Demo fixture '{name}' is malformed JSON.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +144,44 @@ class ValidateResponse(BaseModel):
     summary="Validate a permit submission and return a completion score",
 )
 async def validate_submission_endpoint(
-    body: ValidateRequest,
     _internal: Annotated[bool, Depends(require_internal_key)],
+    body: Optional[ValidateRequest] = None,
+    demo_fixture: Optional[DemoFixtureName] = Query(
+        default=None,
+        description=(
+            "If set (and ENABLE_DEMO_FIXTURES=true), return a canned "
+            "ValidateResponse from disk and skip Gemini Vision entirely. "
+            "One of: clean, name_mismatch, nik_typo."
+        ),
+    ),
 ) -> ValidateResponse:
+    # --- Demo fixture short-circuit -------------------------------------
+    # Runs BEFORE body validation so the caller can hit the endpoint with
+    # only a query param — useful for the bima-admin case page demo where
+    # no real upload exists.
+    if demo_fixture is not None:
+        if not _demo_fixtures_enabled():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Demo fixtures are disabled in this environment "
+                    "(ENABLE_DEMO_FIXTURES=false). Submit a real document instead."
+                ),
+            )
+        logger.warning(
+            "Demo fixture mode | fixture=%s | bypassing Gemini Vision",
+            demo_fixture,
+        )
+        payload = _load_fixture(demo_fixture)
+        return ValidateResponse(**payload)
+
+    # --- Real path: body is required ------------------------------------
+    if body is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Request body is required when demo_fixture is not set.",
+        )
+
     if len(body.documents) > _MAX_DOCS_PER_REQUEST:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
