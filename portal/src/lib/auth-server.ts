@@ -84,6 +84,12 @@ export async function getServerUserFromClaims(): Promise<SsoUser | null> {
     const json = Buffer.from(padded, "base64").toString("utf-8");
     const claims = JSON.parse(json) as {
       sub?: string;
+      // New identity claims (post-NPWP support). Backward-compat with old
+      // `nik` claim for tokens issued before the SSO refactor — once all
+      // citizen sessions have rotated through a fresh login the `nik` field
+      // can be removed.
+      identity_number?: string;
+      identity_type?: "KTP" | "NPWP";
       nik?: string;
       name?: string;
       kind?: string;
@@ -91,13 +97,15 @@ export async function getServerUserFromClaims(): Promise<SsoUser | null> {
     };
 
     if (claims.kind !== "pemohon") return null;
-    if (!claims.sub || !claims.nik || !claims.name) return null;
+    const identityNumber = claims.identity_number || claims.nik;
+    if (!claims.sub || !identityNumber || !claims.name) return null;
     // Soft expiry check — admin-api's signature verification is authoritative.
     if (claims.exp && claims.exp * 1000 < Date.now()) return null;
 
     return {
       profile_id: parseInt(claims.sub, 10),
-      nik: claims.nik,
+      identity_number: identityNumber,
+      identity_type: claims.identity_type ?? "KTP",
       name: claims.name,
       mobile: null,
       kabupaten: null,

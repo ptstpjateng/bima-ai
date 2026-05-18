@@ -11,10 +11,15 @@
  * tradeoff: ~10 lines of duplication for explicit error handling per call.
  */
 
+/** Identity types citizens can use for SSO. KTP for individuals, NPWP for businesses. */
+export type IdentityType = "KTP" | "NPWP";
+
 /** Citizen identity returned by admin-api /sso/me + carried in JWT claims. */
 export type SsoUser = {
   profile_id: number;
-  nik: string;
+  /** Raw digits — 16 for NIK, 15 for NPWP. Format/mask only at render time. */
+  identity_number: string;
+  identity_type: IdentityType;
   name: string;
   mobile: string | null;
   kabupaten: string | null;
@@ -39,22 +44,22 @@ export type SsoLoginErr = {
 export type SsoLoginResult = SsoLoginOk | SsoLoginErr;
 
 /**
- * Send NIK to the Route Handler, which forwards to admin-api and sets the
- * httpOnly auth cookie on success.
+ * Send identity number (NIK or NPWP) to the Route Handler, which forwards
+ * to admin-api and sets the httpOnly auth cookie on success.
  *
- * Pre-strips spaces/dashes from the NIK so the wire format matches the
- * admin-api regex (\d{16}). Server-side validation is still authoritative —
- * this is just to avoid a guaranteed 422 round-trip.
+ * Pre-strips spaces/dashes/dots so the wire format is bare digits matching
+ * admin-api's regex (16=NIK, 15=NPWP). Server-side validation is still
+ * authoritative — this is just to avoid a guaranteed 422 round-trip.
  */
-export async function loginByNik(nik: string): Promise<SsoLoginResult> {
-  const cleaned = nik.replace(/[\s-]/g, "");
+export async function loginByIdentity(identityNumber: string): Promise<SsoLoginResult> {
+  const cleaned = identityNumber.replace(/[\s\-.]/g, "");
 
   let resp: Response;
   try {
     resp = await fetch("/api/sso/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ nik: cleaned }),
+      body: JSON.stringify({ identity_number: cleaned }),
     });
   } catch {
     // Network failure — DNS, offline, timeout. Same copy regardless.
@@ -74,9 +79,9 @@ export async function loginByNik(nik: string): Promise<SsoLoginResult> {
   // status through unchanged, so the mapping lives in one place — here.
   let message: string;
   if (resp.status === 404) {
-    message = "NIK tidak terdaftar di SIAP Jateng.";
+    message = "NIK atau NPWP tidak terdaftar di SIAP Jateng.";
   } else if (resp.status === 422) {
-    message = "NIK harus 16 digit angka.";
+    message = "Harus 16 digit (NIK) atau 15 digit (NPWP).";
   } else if (resp.status === 503) {
     message = "Layanan login sementara tidak tersedia. Coba lagi nanti.";
   } else {

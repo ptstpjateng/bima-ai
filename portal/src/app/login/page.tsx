@@ -6,14 +6,15 @@ import Link from "next/link";
 import { ArrowLeft, ShieldCheck } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { loginByNik } from "@/lib/auth-client";
+import { loginByIdentity } from "@/lib/auth-client";
 
 /**
  * Citizen login page.
  *
- * Single field (NIK), single button, single error region. NIK-only because
- * SIAP doesn't expose a password verification endpoint we can call yet —
- * see `BIMA Vision.md` open items for the SMS-OTP follow-up.
+ * Single field (NIK or NPWP — auto-detected by length), single button,
+ * single error region. No password yet because SIAP doesn't expose a
+ * password-verification endpoint we can call — see `BIMA Vision.md` open
+ * items for the SMS-OTP follow-up.
  *
  * Client Component because we need form state + redirect-on-success. The
  * brand wrapper around it is the same dark surface used by the landing
@@ -27,16 +28,20 @@ export default function LoginPage() {
   const search = useSearchParams();
   const next = search.get("next") || "/me";
 
-  const [nik, setNik] = useState("");
+  const [identityNumber, setIdentityNumber] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+
+  // Accept NIK (16 digits) or NPWP (15 digits) after stripping formatting.
+  const cleanedDigits = identityNumber.replace(/\D/g, "");
+  const canSubmit = cleanedDigits.length === 15 || cleanedDigits.length === 16;
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
     setPending(true);
 
-    const result = await loginByNik(nik);
+    const result = await loginByIdentity(identityNumber);
 
     if (!result.ok) {
       setError(result.message);
@@ -81,33 +86,39 @@ export default function LoginPage() {
         >
           <div className="flex flex-col gap-2">
             <label
-              htmlFor="nik"
+              htmlFor="identity-number"
               className="text-xs font-medium uppercase tracking-wide text-text-secondary"
             >
-              Nomor Induk Kependudukan (NIK)
+              NIK atau NPWP
             </label>
             <input
-              id="nik"
-              name="nik"
+              id="identity-number"
+              name="identity_number"
               type="text"
               inputMode="numeric"
               autoComplete="off"
               autoFocus
               required
-              minLength={16}
-              maxLength={19}
-              placeholder="Masukkan 16 digit NIK"
-              value={nik}
-              onChange={(e) => setNik(e.target.value)}
+              minLength={15}
+              maxLength={20}
+              placeholder="16 digit NIK atau 15 digit NPWP"
+              value={identityNumber}
+              onChange={(e) => setIdentityNumber(e.target.value)}
               aria-invalid={error ? true : undefined}
-              aria-describedby={error ? "nik-error" : undefined}
+              aria-describedby={error ? "identity-error" : "identity-hint"}
               className="w-full rounded-pill bg-surface-base px-5 py-3 font-mono text-base tracking-wide text-text-primary outline-none ring-1 ring-white/10 transition placeholder:font-sans placeholder:text-text-muted focus:ring-2 focus:ring-brand-navy"
             />
+            <p
+              id="identity-hint"
+              className="text-xs text-text-muted"
+            >
+              NIK untuk akun pribadi (16 digit), NPWP untuk akun badan usaha (15 digit).
+            </p>
           </div>
 
           {error && (
             <p
-              id="nik-error"
+              id="identity-error"
               role="alert"
               className="rounded-card bg-brand-rose/10 px-4 py-3 text-sm text-text-primary"
             >
@@ -119,7 +130,7 @@ export default function LoginPage() {
             type="submit"
             variant="primary"
             size="lg"
-            disabled={pending || nik.replace(/\D/g, "").length !== 16}
+            disabled={pending || !canSubmit}
           >
             {pending ? "Memverifikasi…" : "Lanjutkan"}
           </Button>
@@ -140,7 +151,7 @@ export default function LoginPage() {
             >
               perizinan.jatengprov.go.id
             </a>
-            . Setelah punya akun, NIK Anda otomatis bisa dipakai login di sini.
+            . Setelah punya akun, NIK atau NPWP Anda otomatis bisa dipakai login di sini.
           </p>
         </div>
       </div>

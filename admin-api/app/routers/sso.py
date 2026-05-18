@@ -1,23 +1,25 @@
 """
-Citizen SSO — NIK-only handshake against SIAP Jateng.
+Citizen SSO — NIK or NPWP handshake against SIAP Jateng.
 
 This is the demo-grade authentication path for the public portal:
-  - Citizen types their 16-digit NIK on `/login`
+  - Citizen types their identity number on `/login` (16-digit NIK for
+    individuals, 15-digit NPWP for businesses — both stored in SIAP's
+    `ptsp.person_profile` JSONB)
   - Portal SSR forwards it here (`POST /sso/login`)
-  - We look up `ptsp.person_profile` in SIAP's DB
+  - We auto-detect the type by length, look up against SIAP's DB
   - On hit, we issue a short-lived JWT marked `kind='pemohon'` (NOT admin)
   - Portal stores the JWT in an httpOnly cookie
 
 What this is NOT:
-  - Real authentication. A NIK is publicly knowable. The post-hackathon plan
-    is to layer SMS OTP on top (open item in BIMA Vision §"end-state").
+  - Real authentication. A NIK / NPWP is publicly knowable. The post-hackathon
+    plan is to layer SMS OTP on top (open item in BIMA Vision §"end-state").
   - A route to admin-api admin endpoints. The 'pemohon' kind is intentionally
     distinct from the 'admin'/'dpmptsp_staff' roles enforced by
     `deps.get_current_admin_user` — citizen tokens cannot reach admin
     routes even if a bug lets them through CORS.
 
 Endpoints:
-  POST /sso/login   — body {nik} → {access_token, user}
+  POST /sso/login   — body {identity_number} → {access_token, user}
   GET  /sso/me      — bearer → current user (from token claims; no DB read)
   POST /sso/logout  — stateless ack (JWT is bearer-only; client clears cookie)
 """
@@ -36,7 +38,10 @@ from pydantic import BaseModel, Field, field_validator
 from app.config import Settings, get_settings
 from app.db import is_siap_db_configured
 from app.deps import create_token_with_claims
-from app.services.siap_user_client import lookup_pemohon_by_nik
+from app.services.siap_user_client import (
+    IdentityType,
+    lookup_pemohon_by_identity,
+)
 
 logger = logging.getLogger("bima_admin_api.sso")
 
@@ -46,24 +51,41 @@ router = APIRouter()
 # distinct OAuth2 flow for citizen tokens vs admin tokens.
 _sso_bearer = OAuth2PasswordBearer(tokenUrl="/sso/login", auto_error=False)
 
-# Strict NIK shape: 16 digits, no spaces/dashes. The portal strips both
-# before posting so the wire format is canonical.
-_NIK_PATTERN = re.compile(r"^\d{16}$")
+# Identity-format regexes. The portal strips any user-typed separators
+# (dots, dashes, spaces) before posting so the wire format is just digits.
+_NIK_PATTERN = re.compile(r"^\d{16}$")   # KTP (Indonesian National ID)
+_NPWP_PATTERN = re.compile(r"^\d{15}$")  # NPWP (business tax ID)
+
+
+def _detect_identity_type(cleaned: str) -> Optional[IdentityType]:
+    """Auto-detect KTP vs NPWP by length. Returns None for invalid lengths."""
+    if _NIK_PATTERN.match(cleaned):
+        return "KTP"
+    if _NPWP_PATTERN.match(cleaned):
+        return "NPWP"
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Schemas (local — they're SSO-only so not worth a separate schemas/sso.py)
 # ---------------------------------------------------------------------------
 class SsoLoginRequest(BaseModel):
-    nik: str = Field(..., description="16-digit Nomor Induk Kependudukan.")
+    # Single generic field — accepts both NIK and NPWP. We detect the type
+    # server-side. Field name kept generic so the contract reads cleanly
+    # regardless of which type the user actually provides.
+    identity_number: str = Field(
+        ...,
+        description="16-digit NIK (KTP) or 15-digit NPWP. Separators are stripped server-side.",
+    )
 
-    @field_validator("nik")
+    @field_validator("identity_number")
     @classmethod
-    def _validate_nik(cls, v: str) -> str:
-        # Strip any user-typed separators before validating.
-        cleaned = re.sub(r"[\s\-]", "", v)
-        if not _NIK_PATTERN.match(cleaned):
-            raise ValueError("NIK harus 16 digit angka.")
+    def _validate_identity(cls, v: str) -> str:
+        # Strip any user-typed separators (dots, dashes, spaces) so the wire
+        # format is just digits before matching against the length regexes.
+        cleaned = re.sub(r"[\s\-.]", "", v)
+        if _detect_identity_type(cleaned) is None:
+            raise ValueError("Harus 16 digit (NIK) atau 15 digit (NPWP).")
         return cleaned
 
 
@@ -71,7 +93,9 @@ class SsoUser(BaseModel):
     """Public-shaped citizen identity. Carried in JWT claims and /me responses."""
 
     profile_id: int
-    nik: str
+    # Generic pair — type tells the UI which label to render ("NIK" or "NPWP").
+    identity_number: str
+    identity_type: IdentityType
     name: str
     mobile: Optional[str] = None
     kabupaten: Optional[str] = None
@@ -123,17 +147,28 @@ async def sso_login(
             detail="SSO SIAP belum dikonfigurasi pada lingkungan ini.",
         )
 
-    person = await lookup_pemohon_by_nik(payload.nik)
+    # Identity type is implied by length (15=NPWP, 16=KTP). The Pydantic
+    # validator above guarantees one of the two; this assertion is for the
+    # type checker.
+    identity_type = _detect_identity_type(payload.identity_number)
+    assert identity_type is not None  # validator would have raised otherwise
+
+    person = await lookup_pemohon_by_identity(
+        identity_number=payload.identity_number,
+        identity_type=identity_type,
+    )
     if person is None:
         # Indonesian copy — this string surfaces directly to the portal user.
+        label = "NIK" if identity_type == "KTP" else "NPWP"
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="NIK tidak terdaftar di SIAP Jateng.",
+            detail=f"{label} tidak terdaftar di SIAP Jateng.",
         )
 
     user = SsoUser(
         profile_id=person["profile_id"],
-        nik=payload.nik,
+        identity_number=payload.identity_number,
+        identity_type=identity_type,
         name=person["full_name"] or "—",
         mobile=person["mobile"],
         kabupaten=person["kab"],
@@ -143,7 +178,8 @@ async def sso_login(
     token = create_token_with_claims(
         subject=user.profile_id,
         extra_claims={
-            "nik": user.nik,
+            "identity_number": user.identity_number,
+            "identity_type": user.identity_type,
             "name": user.name,
             "kind": user.kind,
         },
@@ -151,9 +187,10 @@ async def sso_login(
     )
 
     logger.info(
-        "sso_login_ok | profile_id=%s | nik=***%s",
+        "sso_login_ok | profile_id=%s | type=%s | id=***%s",
         user.profile_id,
-        user.nik[-4:],
+        user.identity_type,
+        user.identity_number[-4:],
     )
 
     return SsoLoginResponse(access_token=token, user=user)
@@ -218,9 +255,20 @@ async def _get_current_pemohon(
             detail="Token subject malformed.",
         ) from None
 
+    # Read identity claims with backward-compatible fallback for older JWTs
+    # that may still carry the legacy `nik` claim instead of the new
+    # `identity_number` + `identity_type` pair. Once all citizen sessions
+    # have rotated through a fresh login, the fallback can be removed.
+    identity_type_claim = payload.get("identity_type", "KTP")
+    if identity_type_claim not in ("KTP", "NPWP"):
+        identity_type_claim = "KTP"
+
     return SsoUser(
         profile_id=profile_id,
-        nik=str(payload.get("nik", "")),
+        identity_number=str(
+            payload.get("identity_number") or payload.get("nik") or ""
+        ),
+        identity_type=identity_type_claim,
         name=str(payload.get("name", "")),
         kind="pemohon",
     )

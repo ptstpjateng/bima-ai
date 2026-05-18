@@ -22,10 +22,15 @@ export const metadata: Metadata = {
   robots: { index: false },
 };
 
-/** Mask all but the last 4 digits of a NIK. PII surface hygiene. */
-function maskNik(nik: string): string {
-  if (nik.length !== 16) return nik;
-  return `${"•".repeat(12)} ${nik.slice(-4)}`;
+/**
+ * Mask all but the last 4 digits of a credential. Works for both NIK (16)
+ * and NPWP (15). PII surface hygiene.
+ */
+function maskIdentity(value: string): string {
+  if (value.length < 5) return value;
+  const visible = value.slice(-4);
+  const hidden = "•".repeat(value.length - 4);
+  return `${hidden} ${visible}`;
 }
 
 export default async function MePage() {
@@ -70,8 +75,8 @@ export default async function MePage() {
           <dl className="grid gap-x-6 gap-y-5 sm:grid-cols-2">
             <ProfileField
               icon={UserIcon}
-              label="NIK"
-              value={maskNik(user.nik)}
+              label={user.identity_type === "NPWP" ? "NPWP" : "NIK"}
+              value={maskIdentity(user.identity_number)}
               valueClassName="font-mono"
             />
             <ProfileField
@@ -104,7 +109,7 @@ export default async function MePage() {
           </div>
 
           <p className="mt-4 text-sm text-text-secondary sm:text-base">
-            Belum ada permohonan aktif yang ter-link dengan NIK ini di SIAP
+            Belum ada permohonan aktif yang ter-link dengan akun ini di SIAP
             Jateng. Ajukan izin lewat OSS RBA — BIMA akan memandu di WhatsApp.
           </p>
         </section>
