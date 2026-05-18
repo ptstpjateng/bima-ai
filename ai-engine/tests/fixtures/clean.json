@@ -1,0 +1,43 @@
+{
+  "score": 0.96,
+  "score_percent": 96,
+  "status": "ready",
+  "summary": "Kelengkapan 96%. Semua dokumen terverifikasi dan konsisten. Siap untuk dikirim ke PTSP.",
+  "per_document": {
+    "ktp": {
+      "nik": "3374012345678901",
+      "nama": "BUDI SANTOSO",
+      "tempat_lahir": "SEMARANG",
+      "tanggal_lahir": "12-04-1988",
+      "jenis_kelamin": "LAKI-LAKI",
+      "alamat": "JL. PANDANARAN NO. 45",
+      "rt_rw": "003/005",
+      "kelurahan_desa": "PEKUNDEN",
+      "kecamatan": "SEMARANG TENGAH",
+      "agama": "ISLAM",
+      "status_perkawinan": "KAWIN",
+      "pekerjaan": "WIRASWASTA",
+      "kewarganegaraan": "WNI",
+      "berlaku_hingga": "SEUMUR HIDUP",
+      "kabupaten_kota": "KOTA SEMARANG",
+      "provinsi": "JAWA TENGAH"
+    },
+    "nib": {
+      "nib": "1234567890123",
+      "nama_pelaku_usaha": "BUDI SANTOSO",
+      "alamat": "JL. PANDANARAN NO. 45, KOTA SEMARANG, JAWA TENGAH",
+      "kbli_codes": ["47711", "47712"],
+      "skala_usaha": "USAHA MIKRO",
+      "status_modal": "PMDN",
+      "tanggal_penerbitan": "2025-08-14",
+      "npwp": "123456789012345"
+    },
+    "npwp": {
+      "npwp": "12.345.678.9-012.345",
+      "nama": "BUDI SANTOSO",
+      "alamat": "JL. PANDANARAN NO. 45, KOTA SEMARANG",
+      "tanggal_terdaftar": "2024-03-10"
+    }
+  },
+  "issues": []
+}

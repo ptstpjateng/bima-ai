@@ -1,0 +1,50 @@
+{
+  "score": 0.73,
+  "score_percent": 73,
+  "status": "needs_major_corrections",
+  "summary": "Kelengkapan 73%. Ditemukan 1 masalah penting yang perlu diperbaiki sebelum dikirim — jika dibiarkan, kemungkinan besar berkas akan ditolak di tahap verifikasi.",
+  "per_document": {
+    "ktp": {
+      "nik": "3374012345678901",
+      "nama": "BUDI SANTOSO",
+      "tempat_lahir": "SEMARANG",
+      "tanggal_lahir": "12-04-1988",
+      "jenis_kelamin": "LAKI-LAKI",
+      "alamat": "JL. PANDANARAN NO. 45",
+      "rt_rw": "003/005",
+      "kelurahan_desa": "PEKUNDEN",
+      "kecamatan": "SEMARANG TENGAH",
+      "agama": "ISLAM",
+      "status_perkawinan": "KAWIN",
+      "pekerjaan": "WIRASWASTA",
+      "kewarganegaraan": "WNI",
+      "berlaku_hingga": "SEUMUR HIDUP",
+      "kabupaten_kota": "KOTA SEMARANG",
+      "provinsi": "JAWA TENGAH"
+    },
+    "nib": {
+      "nib": "1234567890123",
+      "nama_pelaku_usaha": "BUDIE PRATAMA",
+      "alamat": "JL. PANDANARAN NO. 45, KOTA SEMARANG, JAWA TENGAH",
+      "kbli_codes": ["47711", "47712"],
+      "skala_usaha": "USAHA MIKRO",
+      "status_modal": "PMDN",
+      "tanggal_penerbitan": "2025-08-14",
+      "npwp": "123456789012345"
+    },
+    "npwp": {
+      "npwp": "12.345.678.9-012.345",
+      "nama": "BUDI SANTOSO",
+      "alamat": "JL. PANDANARAN NO. 45, KOTA SEMARANG",
+      "tanggal_terdaftar": "2024-03-10"
+    }
+  },
+  "issues": [
+    {
+      "severity": "high",
+      "field": "name_ktp_vs_nib",
+      "message": "Nama di KTP ('BUDI SANTOSO') tidak konsisten dengan nama pelaku usaha di NIB ('BUDIE PRATAMA'). Kemiripan: 54%. Pastikan dokumen atas nama orang yang sama.",
+      "related_docs": ["ktp.jpg", "nib.pdf"]
+    }
+  ]
+}
