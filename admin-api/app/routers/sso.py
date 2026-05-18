@@ -30,7 +30,7 @@ import logging
 import re
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel, Field, field_validator
@@ -301,13 +301,19 @@ async def sso_me(
 @router.post(
     "/logout",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
     summary="Best-effort logout (stateless)",
 )
-async def sso_logout() -> None:
+async def sso_logout() -> Response:
     """
     No-op server side — the JWT is bearer-only, so logging out means the
     client clearing its httpOnly cookie. We keep the endpoint so the portal
     can centralize logout traffic for future server-side session tracking
     (e.g. a JWT denylist when we introduce SMS OTP).
+
+    Returns an explicit `Response(status_code=204)` with no body. The
+    `-> None` annotation that originally existed here caused FastAPI's
+    strict 204 body-allowed check to fail at app import time
+    (AssertionError: Status code 204 must not have a response body).
     """
-    return None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
