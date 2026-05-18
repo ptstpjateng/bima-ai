@@ -218,6 +218,33 @@ services:
         condition: service_healthy
 
 
+  # Beta-SIAP Jateng — staging clone of DPMPTSP licensing system at
+  # beta-siap.nolongin.com. Used by BIMA for end-to-end integration testing
+  # (validator + officer copilot + portal SSO + WA status fast-path) without
+  # touching real production SIAP. PII risk explicitly accepted by user on
+  # 2026-05-19. Built from FrankenPHP image mirroring backend-tall pattern.
+  siap-beta:
+    build:
+      context: /home/wdnsds/siap
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: /home/wdnsds/siap/.env
+    environment:
+      DB_PASSWORD: ${DB_PASSWORD:-secret}
+    volumes:
+      - siap_beta_storage:/var/www/html/storage/app
+    networks:
+      - bima-internal
+      - bima-public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:80/admin/login || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
 # ──────────────────────────────────────────────
 # Networks
 # ──────────────────────────────────────────────
@@ -244,3 +271,5 @@ volumes:
   # and data-pipeline (ro, /app/data/uploads). Admins drop XLSX files via
   # the /data page; data-pipeline reads them by absolute path.
   ingestion_uploads:
+  # Beta-SIAP Laravel storage/app dir (PII uploads from the dump\'s ptsp.files refs)
+  siap_beta_storage:

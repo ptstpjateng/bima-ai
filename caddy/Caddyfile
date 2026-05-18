@@ -75,3 +75,35 @@ nolongin.com, www.nolongin.com {
 		}
 	}
 }
+
+# ──────────────────────────────────────────────
+# Beta-SIAP Jateng (staging clone for BIMA integration testing).
+# Lives behind beta-siap.nolongin.com. Same Let's Encrypt auto-provisioning
+# Caddy handles for nolongin.com. PII risk on this subdomain explicitly
+# accepted by user on 2026-05-19 (real SIAP dump restored).
+# ──────────────────────────────────────────────
+beta-siap.nolongin.com {
+	encode gzip
+
+	# Match nginx client_max_body_size 350M for SIAP's Excel + PDF + shapefile uploads
+	request_body {
+		max_size 350MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	reverse_proxy siap-beta:80 {
+		transport http {
+			# Match backend: 300s for Filament Excel imports + SHP scans
+			read_timeout 300s
+			write_timeout 300s
+			dial_timeout 60s
+		}
+		flush_interval -1
+	}
+}
