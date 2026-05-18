@@ -470,7 +470,11 @@ async def _call_gemma(
     user_message: str,
     *,
     max_tokens: int = 2048,
-    temperature: float = 0.7,
+    # Default 0.5: tight enough to stay on-brand and on-fact (Indonesian
+    # persona consistency, fewer "let me elaborate" tokens) while still
+    # warm. Intent classifier overrides to 0.0 for deterministic JSON.
+    # See [[LLM Performance & UX]] §"6. Increase temperature 0.7→0.4".
+    temperature: float = 0.5,
     history: list[dict] | None = None,
     model_override: str | None = None,
 ) -> str:
