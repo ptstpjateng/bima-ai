@@ -247,6 +247,45 @@ async def generate_ai_response(user_id: str, message: str) -> str:
     try:
         import asyncio
 
+        # FAST-PATH 1 — SIAP permit-status lookup.
+        # Detect a ticket pattern in the message ("status 000077591", bare
+        # 9-digit number, "lacak izin 77591", etc.). When found, hit SIAP's
+        # read-only monitoring-berkas endpoint and render a data-driven reply
+        # without invoking Gemma at all. Benefits:
+        #   - <2s total round-trip (vs ~10s through Gemma)
+        #   - zero hallucination risk on the permit details
+        #   - graceful degradation: missing-ticket and SIAP-down both reply
+        # See services/siap_client.py + vault [[SIAP Integration]] §"What this changes".
+        from services.siap_client import (
+            extract_ticket,
+            format_not_found_reply,
+            format_service_down_reply,
+            format_status_reply,
+            get_siap_client,
+        )
+
+        siap_ticket = extract_ticket(message)
+        if siap_ticket:
+            siap = get_siap_client()
+            if siap.is_configured():
+                logger.info(
+                    "SIAP status-check fast path | ticket=%s user_id=%s",
+                    siap_ticket, user_id,
+                )
+                record = await siap.get_status_by_ticket(siap_ticket)
+                if record:
+                    reply = format_status_reply(record)
+                else:
+                    reply = format_not_found_reply(siap_ticket)
+                _append_history(user_id, message, reply)
+                return reply
+            else:
+                logger.info(
+                    "SIAP ticket pattern detected but client not configured — "
+                    "falling through to Gemma | ticket=%s user_id=%s",
+                    siap_ticket, user_id,
+                )
+
         # SPEED: skip the ~3-5s intent classifier call for trivial messages
         # (greetings, ack words, very short tests). Default to Phase 1 with no
         # KBLI — that's the right behaviour for these messages anyway.
