@@ -264,4 +264,52 @@ async def validate_case(
             },
         )
 
+    # Bridge the per_document contract: ai-engine returns a dict keyed by
+    # doc_type (ktp/nib/npwp) → extracted fields; the bima-admin client
+    # expects an array of {filename, fields_extracted, fields_expected}.
+    # We transform here so neither side has to know about the other's
+    # natural shape. See QA finding C2 (2026-05-19) for the original
+    # drift incident.
+    payload = {
+        **payload,
+        "per_document": _transform_per_document(payload.get("per_document")),
+    }
+
     return CaseWithValidation(case=case_record, validation=payload)
+
+
+# Field counts per doc type — kept in sync with the schemas declared in
+# ai-engine/services/agents/validator.py (_KTP_SCHEMA, _NIB_SCHEMA, _NPWP_SCHEMA).
+# Used to compute fields_extracted / fields_expected for the UI gauge.
+_EXPECTED_FIELDS_BY_DOC_TYPE: dict[str, int] = {"ktp": 16, "nib": 8, "npwp": 4}
+_DOC_TYPE_LABEL: dict[str, str] = {
+    "ktp": "Kartu Tanda Penduduk (KTP)",
+    "nib": "Nomor Induk Berusaha (NIB)",
+    "npwp": "Nomor Pokok Wajib Pajak (NPWP)",
+}
+
+
+def _transform_per_document(per_doc: dict[str, dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Reshape ai-engine's dict-keyed-by-doc-type into the array the client wants.
+
+    Returns one item per uploaded doc type with the count of non-empty
+    fields, total expected fields, and a human label for the chip row.
+    """
+    if not per_doc:
+        return []
+    result: list[dict[str, Any]] = []
+    for doc_type, extracted in per_doc.items():
+        if not isinstance(extracted, dict):
+            continue
+        filled = sum(1 for v in extracted.values() if v not in (None, "", [], {}))
+        result.append(
+            {
+                "filename": _DOC_TYPE_LABEL.get(doc_type, doc_type.upper()),
+                "fields_extracted": filled,
+                "fields_expected": _EXPECTED_FIELDS_BY_DOC_TYPE.get(
+                    doc_type, len(extracted)
+                ),
+                "notes": None,
+            }
+        )
+    return result

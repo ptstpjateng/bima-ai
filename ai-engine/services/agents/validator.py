@@ -427,14 +427,18 @@ def score_from_issues(issues: list[Issue], docs_attempted: int) -> tuple[float, 
     deficit = min(deficit, MAX_DEFICIT)
     score = (100 - deficit) / 100
 
+    # Status enum values are the canonical contract shared with the bima-admin
+    # TS client (admin/src/lib/case-types.ts:46-61). Do NOT rename without
+    # also updating the client AND the JSON fixtures under tests/fixtures/ —
+    # see QA finding C1 (2026-05-19) for the original drift incident.
     if any(i.severity == IssueLevel.CRITICAL for i in issues):
-        status = "needs_major_corrections"
+        status = "major_issues"
     elif any(i.severity == IssueLevel.HIGH for i in issues):
-        status = "needs_major_corrections"
+        status = "major_issues"
     elif any(i.severity == IssueLevel.MEDIUM for i in issues):
-        status = "needs_minor_corrections"
+        status = "minor_issues"
     elif issues:
-        status = "needs_minor_corrections"
+        status = "minor_issues"
     else:
         status = "ready"
 
@@ -449,12 +453,12 @@ def build_summary(score: float, status: str, issue_count: int, docs_attempted: i
             f"Kelengkapan {pct}%. Semua dokumen terverifikasi dan konsisten. "
             f"Siap untuk dikirim ke PTSP."
         )
-    if status == "needs_minor_corrections":
+    if status == "minor_issues":
         return (
             f"Kelengkapan {pct}%. Ada {issue_count} catatan kecil yang sebaiknya "
             f"diperbaiki, tapi tidak menghambat pengiriman."
         )
-    if status == "needs_major_corrections":
+    if status == "major_issues":
         return (
             f"Kelengkapan {pct}%. Ditemukan {issue_count} masalah penting yang "
             f"perlu diperbaiki sebelum dikirim — jika dibiarkan, kemungkinan "

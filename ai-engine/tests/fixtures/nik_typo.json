@@ -1,7 +1,7 @@
 {
   "score": 0.84,
   "score_percent": 84,
-  "status": "needs_minor_corrections",
+  "status": "minor_issues",
   "summary": "Kelengkapan 84%. Ada 1 catatan yang sebaiknya diperbaiki sebelum berkas dikirim — NIK pada KTP terdeteksi kurang dari 16 digit.",
   "per_document": {
     "ktp": {

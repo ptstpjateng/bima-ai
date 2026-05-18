@@ -124,10 +124,15 @@ class PerDocOut(BaseModel):
     extracted: dict[str, Any]
 
 
+ValidationStatus = Literal["ready", "minor_issues", "major_issues", "unverified"]
+
+
 class ValidateResponse(BaseModel):
     score: float = Field(..., ge=0.0, le=1.0)
     score_percent: int = Field(..., ge=0, le=100)
-    status: str
+    # Locked enum — must match admin/src/lib/case-types.ts ValidationStatus.
+    # See QA finding C1 (2026-05-19) for the original drift incident.
+    status: ValidationStatus
     summary: str
     per_document: dict[str, dict[str, Any]]
     issues: list[IssueOut]

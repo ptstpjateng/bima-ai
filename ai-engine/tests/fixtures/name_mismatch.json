@@ -1,7 +1,7 @@
 {
   "score": 0.73,
   "score_percent": 73,
-  "status": "needs_major_corrections",
+  "status": "major_issues",
   "summary": "Kelengkapan 73%. Ditemukan 1 masalah penting yang perlu diperbaiki sebelum dikirim — jika dibiarkan, kemungkinan besar berkas akan ditolak di tahap verifikasi.",
   "per_document": {
     "ktp": {

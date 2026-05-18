@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
@@ -124,17 +125,47 @@ async def copilot_chat_endpoint(
         body.ticket, len(body.message), len(history_payload),
     )
 
+    # Narrow exception handling per QA finding H4 (2026-05-19) — the prior
+    # blanket `except Exception → 502` was hiding real programming bugs as
+    # if they were upstream failures, making stage-rehearsal debugging
+    # blind. Now we map by failure kind:
+    #   503 — config missing (no API key, no model name)
+    #   504 — Gemini timed out
+    #   502 — Gemini returned a non-2xx or network error
+    #   500 — agent threw an unexpected Python exception (real bug)
     try:
         result = await get_copilot().chat(
             message=body.message,
             ticket=body.ticket,
             history=history_payload,
         )
-    except Exception:
-        logger.exception("Copilot chat raised | ticket=%s", body.ticket)
+    except httpx.TimeoutException as exc:
+        logger.warning("Copilot timeout | ticket=%s | err=%s", body.ticket, exc)
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Copilot upstream (Gemini) timed out.",
+        )
+    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+        logger.warning("Copilot upstream error | ticket=%s | err=%s", body.ticket, exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Copilot agent failed — see server logs.",
+            detail="Copilot upstream (Gemini) returned an error.",
+        )
+    except (RuntimeError, ValueError) as exc:
+        # OfficerCopilot raises these for predictable config / contract issues
+        # (e.g. missing GEMINI_API_KEY surfaced via gemini_vision.is_configured()).
+        logger.error("Copilot configuration error | ticket=%s | err=%s", body.ticket, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Copilot agent not ready: {exc}",
+        )
+    except Exception:
+        # Genuine programming bug — surface as 500 so it's not confused with
+        # an upstream failure, and emit full traceback for debugging.
+        logger.exception("Copilot unexpected error | ticket=%s", body.ticket)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Copilot agent crashed — see server logs.",
         )
 
     return CopilotChatResponse(
