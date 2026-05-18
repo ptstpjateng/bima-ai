@@ -14,7 +14,7 @@ const STEPS = [
  */
 export function HowItWorks() {
   return (
-    <section className="px-6 py-20 sm:py-28">
+    <section className="px-4 py-16 sm:px-6 sm:py-20 md:py-28 lg:px-8">
       <div className="mx-auto max-w-6xl">
         <motion.div
           initial={{ opacity: 0, y: 4 }}
@@ -26,7 +26,7 @@ export function HowItWorks() {
           <p className="text-xs font-medium uppercase tracking-[0.18em] text-brand-amber">
             Cara kerja
           </p>
-          <h2 className="mt-3 font-display text-3xl font-semibold tracking-tight text-text-primary sm:text-4xl">
+          <h2 className="mt-3 font-display text-2xl font-semibold tracking-tight text-text-primary sm:text-3xl md:text-4xl">
             Tiga langkah, selesai.
           </h2>
         </motion.div>

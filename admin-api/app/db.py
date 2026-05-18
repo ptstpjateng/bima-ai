@@ -66,3 +66,56 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+
+
+# ---------------------------------------------------------------------------
+# SIAP Jateng read-only engine.
+#
+# This is a SECOND, independently-pooled engine pointed at SIAP's database
+# (dbsiapjateng). It exists for the citizen-SSO router (`routers/sso.py`)
+# which needs to look up `ptsp.person_profile` rows by NIK.
+#
+# Why a separate engine (not a second schema on the bima engine)?
+#   - SIAP runs on a different host (and, in some envs, a different Postgres
+#     instance). It must not share a connection pool with bima_ai.
+#   - It is read-only from BIMA's perspective. No models, no Alembic, no
+#     transactions worth speaking of — a single `await conn.fetchrow(...)`
+#     per request.
+#   - Keeping it isolated means a SIAP outage cannot starve the bima_ai pool.
+#
+# Lazy init: the engine is only constructed on first use AND only if
+# SIAP_DATABASE_URL is set. Callers should check `is_siap_db_configured()`
+# first and return 503 rather than letting NoneType crash.
+# ---------------------------------------------------------------------------
+_siap_engine: AsyncEngine | None = None
+
+
+def is_siap_db_configured() -> bool:
+    """Cheap precheck without instantiating the engine."""
+    return bool(_settings.SIAP_DATABASE_URL)
+
+
+def get_siap_engine() -> AsyncEngine:
+    """
+    Return the lazily-constructed SIAP read-only engine.
+
+    Raises RuntimeError if SIAP_DATABASE_URL is empty — callers should guard
+    with `is_siap_db_configured()` and surface a 503 to the user.
+    """
+    global _siap_engine
+    if not _settings.SIAP_DATABASE_URL:
+        raise RuntimeError(
+            "SIAP_DATABASE_URL is not configured; cannot open SIAP engine."
+        )
+    if _siap_engine is None:
+        # Tighter pool than the primary bima_ai engine — citizen SSO is low
+        # volume and we don't want to exhaust SIAP's connection slots.
+        _siap_engine = create_async_engine(
+            _settings.SIAP_DATABASE_URL,
+            echo=False,
+            pool_pre_ping=True,
+            pool_size=2,
+            max_overflow=3,
+            pool_recycle=1800,
+        )
+    return _siap_engine

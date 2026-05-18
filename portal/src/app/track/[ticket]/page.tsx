@@ -137,7 +137,7 @@ export default async function TrackingPage({
   const result = await fetchTracking(padded);
 
   return (
-    <main className="min-h-screen px-6 py-12">
+    <main className="min-h-screen px-4 py-10 sm:px-6 sm:py-12 lg:px-8">
       <div className="mx-auto flex w-full max-w-2xl flex-col gap-6">
         <Link
           href="/"
@@ -151,9 +151,9 @@ export default async function TrackingPage({
           <p className="text-xs font-medium uppercase tracking-[0.18em] text-brand-amber">
             Lacak Permohonan Izin
           </p>
-          <h1 className="mt-3 font-display text-3xl font-semibold leading-tight tracking-tight text-text-primary sm:text-4xl">
+          <h1 className="mt-3 font-display text-2xl font-semibold leading-tight tracking-tight text-text-primary sm:text-3xl md:text-4xl">
             Tiket{" "}
-            <span className="font-mono text-brand-amber">{padded}</span>
+            <span className="font-mono text-brand-amber break-all">{padded}</span>
           </h1>
         </header>
 
@@ -225,7 +225,7 @@ function NotFoundCard({ ticket }: { ticket: string }) {
 
 function ServiceDownCard({ ticket, reason }: { ticket: string; reason: string }) {
   return (
-    <section className="rounded-2xl border border-amber-300/20 bg-amber-300/[0.04] p-6 backdrop-blur-sm sm:p-8">
+    <section className="rounded-2xl border border-brand-amber/20 bg-brand-amber/[0.04] p-6 backdrop-blur-sm sm:p-8">
       <h2 className="font-display text-xl font-semibold text-text-primary">
         Sementara tidak dapat memeriksa
       </h2>

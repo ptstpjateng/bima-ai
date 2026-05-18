@@ -39,6 +39,7 @@ from app.routers import (
     health,
     ingestion,
     kbli,
+    sso,
     tracking,
 )
 from app.services.status_reconciler import (
@@ -233,3 +234,4 @@ app.include_router(kbli.router, prefix="/kbli", tags=["KBLI"])
 app.include_router(ingestion.router, prefix="/ingestion", tags=["Ingestion"])
 app.include_router(tracking.router, prefix="/tracking", tags=["Tracking"])
 app.include_router(case.router, prefix="/case", tags=["Case"])
+app.include_router(sso.router, prefix="/sso", tags=["SSO"])

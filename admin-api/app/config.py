@@ -74,6 +74,21 @@ class Settings(BaseSettings):
     )
     SIAP_TIMEOUT_SECONDS: float = Field(default=8.0, ge=1.0, le=30.0)
 
+    # ---- SIAP Jateng (direct DB read for citizen SSO) -------------------
+    # NIK-only handshake against ptsp.person_profile (Phase 1 demo-grade
+    # auth — to be tightened post-hackathon with SMS OTP). Leave empty to
+    # disable the SSO endpoint (it returns 503 cleanly).
+    #
+    # Local dev: postgresql+asyncpg://siapjateng@127.0.0.1:5432/dbsiapjateng
+    # Production: the equivalent network-reachable SIAP DSN.
+    SIAP_DATABASE_URL: str = Field(
+        default="",
+        description=(
+            "Async DSN to SIAP's dbsiapjateng. Empty = SSO disabled. "
+            "Must use the +asyncpg driver."
+        ),
+    )
+
     # ---- Logging --------------------------------------------------------
     LOG_LEVEL: str = Field(default="INFO")
 
@@ -90,6 +105,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DATABASE_URL must start with `postgresql+asyncpg://`. "
                 f"Got: {v.split('://', 1)[0]}://..."
+            )
+        return v
+
+    @field_validator("SIAP_DATABASE_URL")
+    @classmethod
+    def _siap_url_optional_asyncpg(cls, v: str) -> str:
+        # Empty string is allowed (disables SSO); anything else MUST use the
+        # async driver. Same fail-fast posture as DATABASE_URL.
+        if v and not v.startswith("postgresql+asyncpg://"):
+            raise ValueError(
+                "SIAP_DATABASE_URL must start with `postgresql+asyncpg://` "
+                "or be left empty."
             )
         return v
 
