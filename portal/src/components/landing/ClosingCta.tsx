@@ -12,15 +12,15 @@ import { WHATSAPP_URL } from "@/lib/constants";
  */
 export function ClosingCta() {
   return (
-    <section className="px-6 py-20 sm:py-24">
+    <section className="px-4 py-16 sm:px-6 sm:py-20 md:py-24 lg:px-8">
       <motion.div
         initial={{ opacity: 0, y: 4 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: "-80px" }}
         transition={{ duration: 0.2, ease: "easeOut" }}
-        className="mx-auto flex max-w-4xl flex-col items-center gap-8 rounded-card bg-brand-navy/10 px-8 py-14 text-center sm:px-12"
+        className="mx-auto flex max-w-4xl flex-col items-center gap-6 rounded-card bg-brand-navy/10 px-6 py-12 text-center sm:gap-8 sm:px-12 sm:py-14"
       >
-        <h2 className="font-display text-2xl font-semibold tracking-tight text-text-primary sm:text-3xl">
+        <h2 className="font-display text-xl font-semibold tracking-tight text-text-primary sm:text-2xl md:text-3xl">
           Siap mulai? Chat BIMA sekarang.
         </h2>
         <Button asChild variant="primary" size="lg">

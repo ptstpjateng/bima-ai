@@ -13,7 +13,7 @@ import { WHATSAPP_URL } from "@/lib/constants";
  */
 export function Hero() {
   return (
-    <section className="relative flex min-h-[calc(100svh-4rem)] items-center px-6 py-20">
+    <section className="relative flex min-h-[calc(100svh-4rem)] items-center px-4 py-16 sm:px-6 sm:py-20 lg:px-8">
       <motion.div
         initial={{ opacity: 0, y: 4 }}
         animate={{ opacity: 1, y: 0 }}
@@ -24,7 +24,7 @@ export function Hero() {
           DPMPTSP Jawa Tengah · Asisten AI Perizinan UMKM
         </p>
 
-        <h1 className="mt-6 font-display text-4xl font-semibold leading-[1.05] tracking-tight text-text-primary sm:text-5xl md:text-6xl">
+        <h1 className="mt-6 font-display text-3xl font-semibold leading-[1.05] tracking-tight text-text-primary sm:text-5xl md:text-6xl">
           Perizinan UMKM.
           <br />
           <span className="text-brand-navy-hover">Tanpa Bingung.</span>

@@ -70,10 +70,8 @@ export function TopBarClient({ initialUser }: TopBarClientProps) {
               aria-label="Mulai percakapan dengan BIMA di WhatsApp"
             >
               <MessageCircle aria-hidden="true" />
-              <span className="hidden xs:inline sm:inline">
-                Mulai di WhatsApp
-              </span>
-              <span className="xs:hidden sm:hidden">WhatsApp</span>
+              <span className="hidden sm:inline">Mulai di WhatsApp</span>
+              <span className="sm:hidden">WhatsApp</span>
             </a>
           </Button>
         </div>
