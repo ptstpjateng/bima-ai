@@ -273,6 +273,15 @@ async def _run_etl_pipeline(
         _etl_state["last_message"] = output_lines[-1] if output_lines else f"exit={rc}"
         logger.info("ETL Excel pipeline finished | returncode=%d", rc)
 
+        # Beacon-drift guard: if the ETL succeeded but our regex never matched,
+        # the admin's live counter will silently render 0. Loud-warn so the
+        # next deploy catches a beacon format change before demo day.
+        if rc == 0 and _etl_state["chunks_indexed"] is None:
+            logger.warning(
+                "ETL completed but chunks_indexed beacon missing — "
+                "admin live counter will show 0"
+            )
+
     except Exception as exc:
         logger.exception("ETL Excel pipeline raised an exception")
         _etl_state["status"]       = "error"

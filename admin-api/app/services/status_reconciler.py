@@ -33,10 +33,16 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.db import SessionFactory
 from app.models import IngestionSource
+
+# Excel ETL kinds — a single data-pipeline run can ingest BOTH the KBLI and
+# PB UMKU files together (PR #26's `_resolve_active_paths`). When we flip ONE
+# kind's row to `done`, the OTHER kind's pending row must follow, otherwise
+# the admin UI shows it stuck on `pending` forever even though it was indexed.
+_EXCEL_ETL_KINDS: frozenset[str] = frozenset({"excel_kbli", "excel_pb_umku"})
 
 logger = logging.getLogger("bima_admin_api.reconciler")
 
@@ -100,6 +106,24 @@ async def _reconcile_once() -> None:
         if new_status == "done" and isinstance(chunks, int):
             values["chunks_indexed"] = chunks
 
+        # Capture which Excel-ETL kinds we just flipped this tick — used below
+        # to back-fill the OTHER kind's still-`pending` siblings that rode
+        # along on the same data-pipeline run. Done BEFORE the UPDATE so the
+        # SELECT still sees them as `processing`.
+        flipped_excel_kinds: set[str] = set()
+        if new_status == "done":
+            sibling_lookup = await db.execute(
+                select(IngestionSource.kind)
+                .where(
+                    IngestionSource.status == "processing",
+                    IngestionSource.last_run_at.isnot(None),
+                    IngestionSource.last_run_at >= window_start,
+                    IngestionSource.last_run_at <= finished_at,
+                    IngestionSource.kind.in_(_EXCEL_ETL_KINDS),
+                )
+            )
+            flipped_excel_kinds = {row for row in sibling_lookup.scalars().all()}
+
         stmt = (
             update(IngestionSource)
             .where(
@@ -119,6 +143,41 @@ async def _reconcile_once() -> None:
                 new_status,
                 chunks if new_status == "done" else "n/a",
             )
+
+        # Back-fill stale `pending` rows of the OTHER Excel kind. Context:
+        # data-pipeline's `_resolve_active_paths` runs kbli + pb_umku in the
+        # SAME ETL invocation. Admin-api creates one ingestion_sources row per
+        # Excel file but only stamps `processing` on the one whose upload
+        # triggered the run; the sibling row stays `pending` forever and the
+        # admin UI shows it as untouched. Inference: if we just flipped one
+        # excel_* kind to done, scan for `pending` rows of the OTHER excel_*
+        # kind whose `created_at` falls in the same window — those rode along.
+        if new_status == "done" and flipped_excel_kinds:
+            other_kinds = list(_EXCEL_ETL_KINDS - flipped_excel_kinds)
+            if other_kinds:
+                backfill_values: dict = {"status": "done", "error": None}
+                if isinstance(chunks, int):
+                    backfill_values["chunks_indexed"] = chunks
+                backfill_stmt = (
+                    update(IngestionSource)
+                    .where(
+                        IngestionSource.status == "pending",
+                        IngestionSource.kind.in_(other_kinds),
+                        IngestionSource.created_at >= window_start,
+                        IngestionSource.created_at <= finished_at,
+                    )
+                    .values(**backfill_values)
+                )
+                backfill_result = await db.execute(backfill_stmt)
+                await db.commit()
+                if backfill_result.rowcount:
+                    logger.info(
+                        "reconciler back-filled %d stale pending row(s) "
+                        "(kinds=%s, chunks=%s)",
+                        backfill_result.rowcount,
+                        ",".join(other_kinds),
+                        chunks if isinstance(chunks, int) else "n/a",
+                    )
 
 
 async def run_reconciler_loop(stop_event: asyncio.Event) -> None:
