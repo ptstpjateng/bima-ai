@@ -34,6 +34,7 @@ from app.config import get_settings
 from app.routers import (
     ai_interactions,
     auth,
+    case,
     dashboard,
     health,
     ingestion,
@@ -231,3 +232,4 @@ app.include_router(
 app.include_router(kbli.router, prefix="/kbli", tags=["KBLI"])
 app.include_router(ingestion.router, prefix="/ingestion", tags=["Ingestion"])
 app.include_router(tracking.router, prefix="/tracking", tags=["Tracking"])
+app.include_router(case.router, prefix="/case", tags=["Case"])
