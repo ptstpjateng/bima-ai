@@ -45,6 +45,21 @@ _GEMINI_MODEL: str        = os.getenv("GEMINI_MODEL", "models/gemma-3-27b-it")
 # E.g. set to models/gemma-3-4b-it for ~10x faster intent calls on free tier.
 _GEMINI_INTENT_MODEL: str = os.getenv("GEMINI_INTENT_MODEL", "") or _GEMINI_MODEL
 
+# Model-fallback ladder for the citizen-chat path. When the primary model
+# returns 429/503/network errors and exhausts its per-model retries, we walk
+# this list and try each fallback in order. Default ladder: Gemini Pro then
+# hosted Gemma 3 27b — both run on the same Google Generative Language API
+# key so no extra credentials. Override via the GEMINI_FALLBACK_MODELS env
+# (comma-separated). Set to empty string to disable (single-model behavior).
+_GEMINI_FALLBACK_MODELS: list[str] = [
+    m.strip()
+    for m in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "models/gemini-2.5-pro,models/gemma-3-27b-it",
+    ).split(",")
+    if m.strip()
+]
+
 _PORTAL_URL = "https://portal.nolongin.com"
 
 # ---------------------------------------------------------------------------
@@ -460,12 +475,12 @@ async def generate_ai_response(user_id: str, message: str) -> str:
         # history was already fetched above for SIAP-context extraction; reuse.
         if _GEMINI_API_KEY:
             try:
-                ai_response = await _call_gemma_with_retry(
+                ai_response = await _call_gemma_with_fallback(
                     system_instruction, message, history=history
                 )
             except Exception:
                 logger.warning(
-                    "Gemma unavailable after retries — using RAG-based fallback | user_id=%s",
+                    "Gemma ladder exhausted — using RAG-based fallback | user_id=%s",
                     user_id,
                 )
                 return _rag_fallback_response(message, rag_chunks)
@@ -610,6 +625,78 @@ async def _call_gemma_with_retry(
                 await asyncio.sleep(2 ** attempt)
                 continue
             raise
+    raise last_exc  # type: ignore[misc]
+
+
+async def _call_gemma_with_fallback(
+    system_prompt: str,
+    user_message: str,
+    *,
+    history: list[dict] | None = None,
+    per_model_attempts: int = 2,
+    **kwargs,
+) -> str:
+    """Walk the model ladder: primary first, then each fallback in order.
+
+    Each model gets its own retry budget (`per_model_attempts`, default 2).
+    On 429/503 from the primary, we switch models rather than hammering a
+    Google capacity hiccup — a different model (or sometimes the same model
+    via a different infrastructure pool) is often available within seconds.
+
+    Errors that aren't retriable (4xx other than 429) propagate immediately
+    so we don't waste budget on something that won't work elsewhere either.
+
+    Logs which fallback won so we can tune the ladder over time.
+
+    Raises the final exception only if EVERY model in the ladder fails.
+    Callers should still wrap this in a try/except that returns a graceful
+    fallback message to the user.
+    """
+    models = [_GEMINI_MODEL] + _GEMINI_FALLBACK_MODELS
+    last_exc: Exception | None = None
+
+    for idx, model in enumerate(models):
+        try:
+            result = await _call_gemma_with_retry(
+                system_prompt,
+                user_message,
+                max_attempts=per_model_attempts,
+                history=history,
+                model_override=model,
+                **kwargs,
+            )
+            if idx > 0:
+                logger.warning(
+                    "Gemma fallback succeeded | primary=%s fallback=%s idx=%d",
+                    _GEMINI_MODEL, model, idx,
+                )
+            return result
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status not in (429, 503):
+                # Non-capacity error (bad request, auth, etc) — won't be
+                # solved by switching models. Bail.
+                raise
+            last_exc = exc
+            logger.warning(
+                "Model %s exhausted on %d — trying next in ladder (idx=%d/%d)",
+                model, status, idx + 1, len(models),
+            )
+            continue
+        except Exception as exc:
+            # Network/timeout — try next model.
+            last_exc = exc
+            logger.warning(
+                "Model %s raised %s — trying next in ladder (idx=%d/%d)",
+                model, exc.__class__.__name__, idx + 1, len(models),
+            )
+            continue
+
+    # Exhausted the entire ladder.
+    logger.error(
+        "All Gemini models exhausted | ladder=%s | last_exc=%s",
+        models, last_exc,
+    )
     raise last_exc  # type: ignore[misc]
 
 
