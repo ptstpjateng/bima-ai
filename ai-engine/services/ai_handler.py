@@ -83,6 +83,41 @@ def _get_history(user_id: str) -> list[dict]:
     return list(_history.get(user_id, []))
 
 
+# Matches the SIAP fast-path reply pattern emitted by format_status_reply:
+#   "Permohonan *<license name>*"
+#   sometimes followed by:
+#   "_(Bidang: <sector>)_"
+# We extract these out of prior model turns so the next user message
+# inherits the right corpus context — e.g. "apa syaratnya?" after a
+# status lookup should retrieve chunks for the SPECIFIC license, not
+# a generic top-k search on "apa syaratnya?".
+_SIAP_LICENSE_PATTERN = re.compile(r"Permohonan\s+\*(.+?)\*", re.MULTILINE)
+_SIAP_SECTOR_PATTERN  = re.compile(r"_\(Bidang:\s+(.+?)\)_", re.MULTILINE)
+
+
+def _extract_siap_context_from_history(history: list[dict]) -> dict | None:
+    """Look at the most recent model turn for SIAP fast-path output.
+
+    Returns {license_name, sector} if found, None otherwise. The pattern
+    matches the exact strings emitted by `siap_client.format_status_reply`.
+    Walking history newest-first keeps us aligned with the user's most
+    recent ticket context.
+    """
+    for turn in reversed(history):
+        if turn.get("role") != "model":
+            continue
+        text = "".join(p.get("text", "") for p in turn.get("parts", []))
+        license_match = _SIAP_LICENSE_PATTERN.search(text)
+        if not license_match:
+            continue
+        sector_match = _SIAP_SECTOR_PATTERN.search(text)
+        return {
+            "license_name": license_match.group(1).strip(),
+            "sector":       sector_match.group(1).strip() if sector_match else None,
+        }
+    return None
+
+
 def _append_history(user_id: str, user_msg: str, model_reply: str) -> None:
     """Append a completed turn and keep only the last _MAX_TURNS turns."""
     turns = _history.get(user_id, [])
@@ -354,18 +389,56 @@ async def generate_ai_response(user_id: str, message: str) -> str:
         else:
             detected_kbli = None
 
-        # A1 — KBLI-prefixed RAG query for tighter results when a code is known
-        rag_query = f"KBLI {detected_kbli} {message}" if detected_kbli else message
-        n_results = 8 if detected_kbli else 4
+        # Pull prior-turn SIAP context (the user's in-flight license) so a
+        # follow-up like "apa syaratnya?" inherits the right corpus query.
+        history = _get_history(user_id)
+        siap_ctx = _extract_siap_context_from_history(history)
+
+        # Retrieval routing per audit finding (2026-05-19):
+        #   scope=sectoral_non_oss → skip ChromaDB ENTIRELY. The corpus only
+        #     covers OSS RBA; retrieving on a sectoral query returns wrong
+        #     KBLI 41xxx/42xxx construction chunks with passing similarity
+        #     (false confidence). The IZIN SEKTORAL NON-OSS branch of the
+        #     system prompt handles the response without RAG.
+        #   scope=oss_rba (or unknown) → standard retrieval, optionally
+        #     enriched with the prior-turn SIAP license name so "apa
+        #     syaratnya?" searches for THAT license, not the literal text.
+        scope = intent.get("scope", "unknown")
+        if scope == "sectoral_non_oss":
+            logger.info(
+                "Scope=sectoral_non_oss — skipping RAG retrieval | user_id=%s",
+                user_id,
+            )
+            rag_chunks: list = []
+            rag_query = None
+            n_results = 0
+        else:
+            # A1 — KBLI-prefixed RAG query when a code is known; else enrich
+            # the raw query with prior-turn license name so follow-ups inherit
+            # the right corpus context.
+            if detected_kbli:
+                rag_query = f"KBLI {detected_kbli} {message}"
+                n_results = 8
+            elif siap_ctx:
+                # The license name from a prior turn beats the user's terse
+                # follow-up ("apa syaratnya?") as a retrieval query — same
+                # license, much better embedding.
+                rag_query = f"{siap_ctx['license_name']} {message}"
+                if siap_ctx.get("sector"):
+                    rag_query = f"{rag_query} bidang {siap_ctx['sector']}"
+                n_results = 6
+            else:
+                rag_query = message
+                n_results = 4
+
+            rag_chunks = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: query_regulations(rag_query, n_results=n_results)
+            )
 
         logger.info(
-            "Intent | phase=%s kbli=%s scale=%s | rag_query=%r | n_results=%d | user_id=%s",
-            intent.get("phase"), detected_kbli, intent.get("detected_scale"),
-            rag_query, n_results, user_id,
-        )
-
-        rag_chunks = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: query_regulations(rag_query, n_results=n_results)
+            "Intent | phase=%s scope=%s kbli=%s scale=%s siap_ctx=%s | rag_query=%r | n_results=%d | user_id=%s",
+            intent.get("phase"), scope, detected_kbli, intent.get("detected_scale"),
+            bool(siap_ctx), rag_query, n_results, user_id,
         )
 
         user_ctx_str = format_user_context(user_ctx)
@@ -384,9 +457,7 @@ async def generate_ai_response(user_id: str, message: str) -> str:
             system_parts.append(rag_ctx_str)
         system_instruction = "\n\n".join(system_parts)
 
-        # A3 — pass last 2 conversation turns so follow-up questions have context
-        history = _get_history(user_id)
-
+        # history was already fetched above for SIAP-context extraction; reuse.
         if _GEMINI_API_KEY:
             try:
                 ai_response = await _call_gemma_with_retry(
@@ -421,16 +492,32 @@ async def generate_ai_response(user_id: str, message: str) -> str:
 _INTENT_SCHEMA = """{
   "phase": <integer 1, 2, or 3>,
   "kbli_code": <string like "56102" or null if not mentioned>,
-  "detected_scale": <string like "Mikro", "Kecil", "Menengah", "Besar" or null>
+  "detected_scale": <string like "Mikro", "Kecil", "Menengah", "Besar" or null>,
+  "scope": <"oss_rba" | "sectoral_non_oss" | "unknown">
 }"""
 
 _INTENT_SYSTEM = (
     "You are a JSON-only API. You must output valid JSON and absolutely nothing else. "
     "Do not use Markdown code blocks, backticks, or any surrounding text. "
-    "Classify the user message into one of three business licensing phases:\n"
+    "Classify the user message along two axes:\n"
+    "\n"
+    "AXIS 1 — Business licensing phase (1, 2, or 3):\n"
     "  Phase 1 (Pra-Perizinan): exploring, planning, asking what permits are needed\n"
     "  Phase 2 (Eksekusi): ready to apply, asking for step-by-step, mentions a KBLI code\n"
     "  Phase 3 (Pasca-Perizinan): already has permit, asking about obligations or growth\n"
+    "\n"
+    "AXIS 2 — Scope (oss_rba | sectoral_non_oss | unknown):\n"
+    "  oss_rba: about OSS RBA business activities (NIB, Sertifikat Standar, KBLI codes,\n"
+    "           perizinan berusaha). Default when KBLI is mentioned or topic is\n"
+    "           clearly business-license oriented.\n"
+    "  sectoral_non_oss: about Indonesian sectoral permits OUTSIDE the OSS RBA system.\n"
+    "           Signals: 'Izin Pemakaian Tanah', 'Pemakaian Bangunan Pengairan',\n"
+    "           'Izin Pengairan', 'Izin Lingkungan', 'IMB', 'PBG', 'SLF', 'Izin\n"
+    "           Trayek', 'Izin Trayek Angkutan', 'PUPR', 'Sumber Daya Air',\n"
+    "           'Perhubungan', 'Lingkungan Hidup', 'Pariwisata', 'Sosial',\n"
+    "           plus most permit names that do NOT map to a KBLI code.\n"
+    "  unknown: cannot determine (greetings, ambiguous messages, off-topic).\n"
+    "\n"
     "Also extract the KBLI code (5-digit number like 56102) and business scale if mentioned.\n"
     f"Output ONLY this JSON schema, nothing else:\n{_INTENT_SCHEMA}"
 )
@@ -449,25 +536,41 @@ async def analyze_user_intent(message: str) -> dict:
     import json
 
     if not _GEMINI_API_KEY:
-        return {"phase": 1, "kbli_code": None, "detected_scale": None}
+        return {
+            "phase": 1,
+            "kbli_code": None,
+            "detected_scale": None,
+            "scope": "unknown",
+        }
 
     try:
         raw = await _call_gemma(
             _INTENT_SYSTEM, message,
-            max_tokens=128, temperature=0.0,
+            max_tokens=160, temperature=0.0,
             model_override=_GEMINI_INTENT_MODEL,
         )
         cleaned = _strip_json_fences(raw)
         intent = json.loads(cleaned)
-        # Normalise — ensure required keys exist
+        # Normalise — ensure required keys exist and scope is one of the
+        # allowed values (defends against a Gemma drift into "sectoral" or
+        # other unexpected strings).
+        scope = intent.get("scope", "unknown")
+        if scope not in {"oss_rba", "sectoral_non_oss", "unknown"}:
+            scope = "unknown"
         return {
             "phase":          int(intent.get("phase", 1)),
             "kbli_code":      intent.get("kbli_code") or None,
             "detected_scale": intent.get("detected_scale") or None,
+            "scope":          scope,
         }
     except Exception:
         logger.warning("analyze_user_intent failed — using defaults | msg_len=%d", len(message))
-        return {"phase": 1, "kbli_code": None, "detected_scale": None}
+        return {
+            "phase": 1,
+            "kbli_code": None,
+            "detected_scale": None,
+            "scope": "unknown",
+        }
 
 
 async def _call_gemma_with_retry(
