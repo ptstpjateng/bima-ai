@@ -47,11 +47,19 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 # JWT helpers (kept here, not in routers, so multiple endpoints can issue
 # tokens later without duplicating the encode logic).
 # ---------------------------------------------------------------------------
-def create_access_token(*, subject: str | int, settings: Settings) -> str:
-    """Issue an HS256-signed JWT with `sub`, `iat`, `exp` claims."""
+def create_access_token(
+    *, subject: str | int, settings: Settings, kind: str = "admin"
+) -> str:
+    """Issue an HS256-signed JWT with `sub`, `iat`, `exp`, `kind` claims.
+
+    `kind` namespaces the token's audience — "admin" tokens may reach
+    admin endpoints; citizen ("pemohon") tokens minted by /sso/login
+    must not. The `kind` check happens in get_current_admin_user.
+    """
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(subject),
+        "kind": kind,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(days=settings.JWT_EXPIRY_DAYS)).timestamp()),
     }
@@ -98,6 +106,21 @@ def create_token_with_claims(
 # magic-link flow until Sprint C migrates that too.
 _ADMIN_ROLES: frozenset[str] = frozenset({"admin", "dpmptsp_staff"})
 
+# Token-kind allowlist for admin endpoints. The `kind` claim namespaces
+# tokens by audience so a citizen-SSO JWT (kind='pemohon') cannot reach
+# admin endpoints even when its `sub` collides with an admin user row.
+#
+# Why None is permitted: legacy admin tokens minted before create_access_token
+# set `kind` may still be in flight. They age out as JWT_EXPIRY_DAYS passes
+# (default 7d). After the next full rotation we tighten this set by removing
+# None — by then every active admin token will carry kind='admin' explicitly.
+#
+# 'pemohon' is intentionally NOT here — that's the citizen-token kind from
+# /sso/login and must never reach admin routes.
+_ADMIN_TOKEN_KINDS: frozenset[str | None] = frozenset(
+    {"admin", "dpmptsp_staff", None}
+)
+
 
 async def get_current_admin_user(
     token: Annotated[str | None, Depends(oauth2_scheme)],
@@ -132,6 +155,17 @@ async def get_current_admin_user(
             detail="Invalid token.",
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
         ) from None
+
+    # Reject citizen-SSO tokens BEFORE the DB lookup. Without this guard,
+    # a citizen JWT whose `sub` (= ptsp.person_profile.profile_id) numerically
+    # collides with an existing admin row (= users.id) would pass the
+    # downstream role check and reach admin endpoints. See QA finding C1.
+    kind = payload.get("kind")
+    if kind not in _ADMIN_TOKEN_KINDS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin token required.",
+        )
 
     sub = payload.get("sub")
     if sub is None:
