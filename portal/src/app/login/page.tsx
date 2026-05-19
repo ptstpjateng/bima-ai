@@ -120,7 +120,7 @@ function LoginForm() {
               onChange={(e) => setIdentityNumber(e.target.value)}
               aria-invalid={error ? true : undefined}
               aria-describedby={error ? "identity-error" : "identity-hint"}
-              className="w-full rounded-pill bg-surface-base px-5 py-3 font-mono text-base tracking-wide text-text-primary outline-none ring-1 ring-white/10 transition placeholder:font-sans placeholder:text-text-muted focus:ring-2 focus:ring-brand-navy"
+              className="w-full rounded-pill bg-surface-card-hover px-5 py-3 font-mono text-base tracking-wide text-text-primary outline-none ring-1 ring-white/10 transition placeholder:font-sans placeholder:text-text-muted focus:ring-2 focus:ring-brand-navy"
             />
             <p
               id="identity-hint"

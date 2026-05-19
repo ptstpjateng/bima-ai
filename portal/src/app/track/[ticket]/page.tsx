@@ -153,7 +153,9 @@ export default async function TrackingPage({
           </p>
           <h1 className="mt-3 font-display text-2xl font-semibold leading-tight tracking-tight text-text-primary sm:text-3xl md:text-4xl">
             Tiket{" "}
-            <span className="font-mono text-brand-amber break-all">{padded}</span>
+            <span className="font-mono text-xl text-brand-amber sm:text-3xl md:text-4xl">
+              {padded}
+            </span>
           </h1>
         </header>
 
@@ -175,7 +177,7 @@ function StatusCard({ record }: { record: TrackingRecord }) {
   return (
     <section
       aria-labelledby="status-heading"
-      className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 backdrop-blur-sm sm:p-8"
+      className="rounded-2xl bg-white/[0.03] p-6 ring-1 ring-white/[0.04] backdrop-blur-sm sm:p-8"
     >
       <h2 id="status-heading" className="sr-only">
         Status permohonan
@@ -200,7 +202,7 @@ function StatusCard({ record }: { record: TrackingRecord }) {
         <Field
           label="Status"
           value={record.status}
-          valueClassName="text-brand-amber font-semibold uppercase tracking-wide"
+          valueClassName="text-brand-amber font-semibold capitalize"
         />
       </dl>
     </section>
@@ -209,7 +211,7 @@ function StatusCard({ record }: { record: TrackingRecord }) {
 
 function NotFoundCard({ ticket }: { ticket: string }) {
   return (
-    <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 backdrop-blur-sm sm:p-8">
+    <section className="rounded-2xl bg-white/[0.03] p-6 ring-1 ring-white/[0.04] backdrop-blur-sm sm:p-8">
       <h2 className="font-display text-xl font-semibold text-text-primary">
         Tiket tidak ditemukan
       </h2>
@@ -225,7 +227,7 @@ function NotFoundCard({ ticket }: { ticket: string }) {
 
 function ServiceDownCard({ ticket, reason }: { ticket: string; reason: string }) {
   return (
-    <section className="rounded-2xl border border-brand-amber/20 bg-brand-amber/[0.04] p-6 backdrop-blur-sm sm:p-8">
+    <section className="rounded-2xl bg-brand-amber/[0.04] p-6 ring-1 ring-brand-amber/20 backdrop-blur-sm sm:p-8">
       <h2 className="font-display text-xl font-semibold text-text-primary">
         Sementara tidak dapat memeriksa
       </h2>
