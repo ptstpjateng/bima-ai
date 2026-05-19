@@ -21,32 +21,38 @@ type NavItem = {
 };
 
 // Sprint B.2 nav set per brief:
-//   Dashboard, AI Interactions, KBLI (live) + Settings (placeholder, disabled).
+//   Dasbor, Interaksi AI, KBLI (live) + Pengaturan (placeholder, disabled).
 // Users CRUD + Ingestion CRUD are Sprint C scope — intentionally absent.
 const NAV_ITEMS: NavItem[] = [
-  { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
-  { label: "AI Interactions", href: "/ai-interactions", icon: MessageCircle },
+  { label: "Dasbor", href: "/dashboard", icon: LayoutDashboard },
+  { label: "Interaksi AI", href: "/ai-interactions", icon: MessageCircle },
   { label: "KBLI", href: "/kbli", icon: FileText },
   { label: "Sumber Data", href: "/data", icon: Database },
   { label: "Arsitektur", href: "/architecture", icon: Network },
-  { label: "Settings", href: "/settings", icon: Settings, disabled: true },
+  { label: "Pengaturan", href: "/settings", icon: Settings, disabled: true },
 ];
 
-export function Sidebar() {
+/**
+ * Shared nav body — used by both the persistent desktop sidebar and the
+ * mobile Sheet drawer. `onNavigate` lets the Sheet auto-close when a link is
+ * tapped.
+ */
+function SidebarNavBody({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
 
   return (
-    <aside
-      className="fixed left-0 top-0 bottom-0 w-60 bg-surface-low flex flex-col z-30"
-      aria-label="Primary navigation"
-    >
+    <>
       <div className="px-6 pt-6 pb-8">
-        <Link href="/dashboard" className="block group">
+        <Link
+          href="/dashboard"
+          className="block group"
+          onClick={onNavigate}
+        >
           <span className="font-display text-2xl font-semibold tracking-tight text-text-primary">
             BIMA
           </span>
           <span className="block text-[10px] font-medium uppercase tracking-widest text-text-muted mt-0.5">
-            Admin Console
+            Konsol Admin
           </span>
         </Link>
       </div>
@@ -73,6 +79,7 @@ export function Sidebar() {
             <Link
               key={item.href}
               href={item.href}
+              onClick={onNavigate}
               className={cn(
                 "flex items-center gap-3 px-4 py-2 rounded-pill text-sm transition-colors",
                 active
@@ -91,6 +98,33 @@ export function Sidebar() {
       <div className="px-6 py-4 text-[10px] text-text-muted">
         Phase 1 shell · v0.1.0
       </div>
+    </>
+  );
+}
+
+/**
+ * Persistent sidebar — visible at md (≥768px) and up. On mobile, the sidebar
+ * is hidden in favour of a hamburger-triggered Sheet rendered by TopBar.
+ */
+export function Sidebar() {
+  return (
+    <aside
+      className="hidden md:flex fixed left-0 top-0 bottom-0 w-60 bg-surface-low flex-col z-30"
+      aria-label="Primary navigation"
+    >
+      <SidebarNavBody />
     </aside>
+  );
+}
+
+/**
+ * Body of the mobile drawer — rendered inside a shadcn Sheet by TopBar.
+ * Wrapping element matches the desktop sidebar look so the visual is consistent.
+ */
+export function MobileSidebarBody({ onNavigate }: { onNavigate: () => void }) {
+  return (
+    <div className="flex h-full flex-col bg-surface-low">
+      <SidebarNavBody onNavigate={onNavigate} />
+    </div>
   );
 }

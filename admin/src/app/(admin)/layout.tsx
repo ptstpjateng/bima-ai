@@ -10,8 +10,10 @@ import { TopBar } from "@/components/layout/topbar";
  * verified the admin_token cookie before this layout renders, so we can assume
  * an authenticated session without a client-side guard.
  *
- * Sidebar is fixed at 240px (w-60). Main column offsets left and scrolls
- * independently from the sidebar to keep nav visible on long pages.
+ * Desktop (md+): persistent 240px (w-60) sidebar with the main column offset.
+ * Mobile (<md): sidebar hides and is replaced by a hamburger-triggered Sheet
+ * rendered inside TopBar — main column has zero left margin so content is
+ * fully reachable on narrow screens.
  */
 export default function AdminLayout({
   children,
@@ -23,9 +25,9 @@ export default function AdminLayout({
   return (
     <div className="min-h-screen bg-surface-base">
       <Sidebar />
-      <div className="ml-60 flex min-h-screen flex-col">
+      <div className="md:ml-60 flex min-h-screen flex-col">
         <TopBar />
-        <main className="flex-1 p-8 overflow-y-auto">
+        <main className="flex-1 p-4 md:p-8 overflow-y-auto">
           <AnimatePresence mode="wait">
             <motion.div
               key={pathname}
