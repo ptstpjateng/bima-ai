@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { Suspense, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft, ShieldCheck } from "lucide-react";
@@ -22,8 +22,22 @@ import { loginByIdentity } from "@/lib/auth-client";
  *
  * Honors a `?next=` query param so middleware redirects (e.g. from /me)
  * land back where they came from after login.
+ *
+ * Next.js 16 requires `useSearchParams()` consumers to live inside a
+ * <Suspense> boundary — otherwise prerender fails with the
+ * "missing-suspense-with-csr-bailout" error. We export a tiny shell that
+ * wraps the form in Suspense; the form itself is the original component
+ * containing all the form state and search-param reading.
  */
 export default function LoginPage() {
+  return (
+    <Suspense fallback={<LoginFormFallback />}>
+      <LoginForm />
+    </Suspense>
+  );
+}
+
+function LoginForm() {
   const router = useRouter();
   const search = useSearchParams();
   const next = search.get("next") || "/me";
@@ -154,6 +168,24 @@ export default function LoginPage() {
             . Setelah punya akun, NIK atau NPWP Anda otomatis bisa dipakai login di sini.
           </p>
         </div>
+      </div>
+    </main>
+  );
+}
+
+/**
+ * Pre-mount fallback. Rendered during the SSR/CSR handoff while the
+ * <Suspense> boundary is settling. Keep it visually identical to the form
+ * shell so users don't see a flash of empty layout.
+ */
+function LoginFormFallback() {
+  return (
+    <main className="flex min-h-screen flex-col px-4 py-10 sm:px-6 sm:py-12 lg:px-8">
+      <div className="mx-auto flex w-full max-w-md flex-1 flex-col">
+        <div
+          className="mt-8 h-48 animate-pulse rounded-card bg-surface-card"
+          aria-hidden="true"
+        />
       </div>
     </main>
   );
