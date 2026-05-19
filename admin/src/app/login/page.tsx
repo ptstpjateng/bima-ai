@@ -136,7 +136,7 @@ function LoginForm() {
               BIMA
             </div>
             <CardTitle className="font-display text-xl font-medium text-text-primary">
-              Admin Console
+              Konsol Admin
             </CardTitle>
             <CardDescription className="text-text-secondary text-sm">
               DPMPTSP Jawa Tengah
@@ -217,10 +217,6 @@ function LoginForm() {
             </form>
           </CardContent>
         </Card>
-
-        <p className="text-center text-xs text-text-muted mt-6">
-          Phase 1 shell — admin-api auth wired Phase 2.
-        </p>
       </motion.div>
     </main>
   );

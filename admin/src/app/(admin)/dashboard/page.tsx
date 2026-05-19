@@ -46,26 +46,26 @@ export default function DashboardPage() {
     hint?: string;
   }> = [
     {
-      label: "Total UMKM Users",
+      label: "Pengguna UMKM",
       value: data?.umkm_users ?? 0,
       icon: Users,
     },
     {
-      label: "WhatsApp Messages Today",
+      label: "Pesan WA Hari Ini",
       value: data?.whatsapp_messages_today ?? 0,
       icon: MessageCircle,
     },
     {
-      label: "Active KBLI Codes",
+      label: "Kode KBLI Aktif",
       value: data?.active_kbli_codes ?? 0,
       icon: FileText,
       hint:
         data?.chroma_chunks != null
-          ? `${formatNumber(data.chroma_chunks)} chunks indexed`
+          ? `${formatNumber(data.chroma_chunks)} chunks terindeks`
           : undefined,
     },
     {
-      label: "Pending Ingestions",
+      label: "Antrian Ingestion",
       value: data?.pending_ingestions ?? 0,
       icon: Database,
     },
@@ -76,10 +76,10 @@ export default function DashboardPage() {
       <header className="flex items-end justify-between gap-4">
         <div className="space-y-1">
           <h1 className="font-display text-3xl font-semibold tracking-tight text-text-primary">
-            Dashboard
+            Dasbor
           </h1>
           <p className="text-sm text-text-secondary">
-            Overview of BIMA-AI operations for DPMPTSP Jawa Tengah.
+            Ringkasan operasi BIMA-AI untuk DPMPTSP Jawa Tengah.
           </p>
         </div>
         <div className="text-right">
@@ -87,13 +87,13 @@ export default function DashboardPage() {
             type="button"
             onClick={() => refetch()}
             className="inline-flex items-center gap-1.5 text-xs text-text-secondary hover:text-text-primary transition-colors"
-            aria-label="Refresh stats"
+            aria-label="Muat ulang statistik"
           >
             <RefreshCcw
               className={`size-3 ${isFetching ? "animate-spin" : ""}`}
               aria-hidden
             />
-            <span>Refresh</span>
+            <span>Muat ulang</span>
           </button>
           {data?.last_updated && (
             <p className="text-[11px] text-text-muted mt-1">
@@ -127,8 +127,8 @@ export default function DashboardPage() {
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <RecentInteractions />
         <EmptyPanel
-          title="Recent Ingestions"
-          description="Sprint C (Ingestion runtime) wires this panel."
+          title="Ingestion Terbaru"
+          description="Panel ini akan diisi pada Sprint C (Ingestion runtime)."
         />
       </section>
     </div>
