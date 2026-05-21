@@ -9,6 +9,57 @@
 
 ---
 
+## Cycle 8 — 2026-05-21 · "ROADMAP COMPLETE — signature-assistant, 16/16"
+
+**Type:** PM cycle, run locally. The final cycle.
+
+**THINK.** 15/16 reqs done. The last — #13, Head-of-DPMPTSP signing.
+User decision: BIMA does NOT do cryptographic signing; it gives the
+Head decision support + a deep-link into SIAP to sign there.
+
+**DELEGATE → BIMA Team** (`bima-ai#59`): the signature-assistant.
+- A `mode="signature"` variant of `OfficerCopilot` — same agent, a
+  signing-framed system prompt, a read-only tool subset. Reuses
+  `get_case_log_notes` / `get_validation_summary` / `get_case_full` /
+  `cite_regulation` to synthesise the whole approval chain for the
+  Head's signing decision. Deliberately drops `forward_case` /
+  `record_decision` — the only accountable action here is the
+  signature, and that happens in SIAP.
+- New read tool `get_siap_signing_link` → deep-link
+  `<SIAP_BASE>/admin/tanda-tangan-berkas?tableSearch=<ticket>`
+  (found in SIAP's `TandaTanganBerkasResource`).
+- `/case/[ticket]` gets a copilot mode toggle (Validasi / Tanda
+  Tangan); signature mode shows a `SigningHandoffCard` with the
+  "Tanda tangani di SIAP Jateng →" CTA. Per-mode `copilot_session`
+  rows (migration `003` adds a `mode` column).
+- lint + build pass, py_compile clean.
+
+**REVIEW.** Read-only mode-scoping verified, deep-link correct,
+migration consistent. Passes.
+
+**REPORT.** `#59` merged + deployed. Migration `003` applied
+(`copilot_session.mode` confirmed). ai-engine + admin-api `/health`
+200. `SIAP_SIGNING_URL_BASE` defaults to Beta-SIAP.
+
+### 🎯 ROADMAP COMPLETE
+All four waves shipped. **All 16 BIMA Vision requirements addressed
+and deployed on Beta-SIAP.** The vision↔shipped gap is closed.
+
+Deferred (reported honestly, not hidden): document-upload over
+WhatsApp; per-citizen `profile_id` from NIK; auto per-officer desk
+scoping; the `bima_readonly` Postgres role; a SIAP role-claim on the
+JWT; production-SIAP promotion (gated); the SIAP security backlog;
+DB-password rotation; demo rehearsal + backup video.
+
+### The autonomous Program Office — session tally
+8 PM cycles in one session: §22 capability model → Program Office set
+up → 4 roadmap waves. ~16 PRs across `ptstpjateng/bima-ai` +
+`ptstpjateng/SIAP`. Deploy key, 4 scoped Sanctum tokens, 3 Alembic
+migrations, the transparency poller + guided submission armed. The
+daily PM Briefing routine continues at 06:00 WIB.
+
+---
+
 ## Cycle 7 — 2026-05-21 · "Wave 4 begins — multi-ticket officer inbox"
 
 **Type:** PM cycle, run locally.
