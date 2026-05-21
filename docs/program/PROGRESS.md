@@ -9,6 +9,66 @@
 
 ---
 
+## Cycle 4 — 2026-05-21 · "Wave 2 begins — transparency-notification poller"
+
+**Type:** PM cycle, run locally.
+
+**THINK.** Wave 1 complete — SIAP has a write seam incl. the
+`/license-request/changes` event feed. BIMA's notification dispatcher
+is built + armed. Wave 2's first slice connects them so citizens get
+proactive WhatsApp updates as their request moves (Vision req #12).
+
+**PLAN.** Delegate to the BIMA Team: a background poller that consumes
+the SIAP changes feed and fires citizen notifications.
+
+**DELEGATE → BIMA Team** (`ptstpjateng/bima-ai#50`):
+- `ai-engine/services/transparency_poller.py` — an asyncio background
+  task (default 60s) started in the FastAPI `lifespan`, mirroring the
+  admin-api reconciler pattern.
+- Polls SIAP `GET /api/v1/license-request/changes` with a cursor
+  persisted atomically to a JSON file (survives restart).
+- SIAP status → event mapping (conservative; ambiguous changes
+  skipped): rejected/perbaikan → `citizen_needs_fix`; terminal success
+  + no further step → `citizen_completed`; advanced to a new step →
+  `citizen_progress`.
+- **N1 security:** `recipient_phone` derived server-side only —
+  change `profile_id` → parameterised SELECT on `ptsp.person_profile`
+  → mobile. Never from the change payload. No phone → log + skip.
+- `dedupe_key = "{ticket}:{log_id}"` — no double-sends.
+- Feature-flagged `BIMA_TRANSPARENCY_POLLER_ENABLED` (default OFF).
+
+**REVIEW.** Diff read: N1 satisfied, parameterised query, idempotent,
+fail-safe loop, py_compile clean. Passes.
+
+**REPORT.** `#50` merged + deployed to ai-engine — **dormant** (flag
+OFF; a no-op every tick until armed).
+
+### Roadmap movement
+- Wave 2 deliverable "wire the notification dispatcher to real
+  triggers": built, merged, deployed dormant — pending arming.
+
+### Blockers / for the user — ARMING STEP
+The poller is built but dormant. To arm it (3 steps):
+1. Mint a SIAP Sanctum token with the `events:read` ability on
+   Beta-SIAP via `php artisan bima:issue-token` — a credential; must
+   not leak to any transcript. Needs a SIAP user to attach it to
+   (ideally a dedicated `bima-service` account).
+2. Set `SIAP_EVENTS_API_TOKEN` in `ai-engine/.env` on the VPS.
+3. Flip `BIMA_TRANSPARENCY_POLLER_ENABLED=true` (and confirm
+   `BIMA_NOTIFICATIONS_ENABLED=true`, already set), restart ai-engine.
+Then the Integration Agent runs an end-to-end smoke.
+
+### Note for the SIAP team
+SIAP's change payload has no remaining-SLA / ETA field, so
+`citizen_progress` notifications send `eta_days="—"`. A real estimate
+would need SIAP to expose remaining-SLA in the feed — future slice.
+
+### Next cycle
+Arm the poller (above), then Wave 2 continues: the workflow
+orchestrator + forward-with-context in the officer copilot.
+
+---
+
 ## Cycle 3 — 2026-05-21 · "Wave 1 COMPLETE — state events + scoped tokens"
 
 **Type:** PM cycle, run locally.
