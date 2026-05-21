@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from routers import aptana, copilot, notify, validator, vectorize, webhooks
+from services.transparency_poller import run_transparency_poller_loop
 
 # ---------------------------------------------------------------------------
 # Logging – structured, to stdout so it flows into any log aggregator.
@@ -34,11 +35,37 @@ logger = logging.getLogger("bima_ai")
 # ---------------------------------------------------------------------------
 # Lifespan: startup / shutdown hooks (replaces deprecated @app.on_event).
 # ---------------------------------------------------------------------------
+# Grace period for the transparency poller to wind down on shutdown — must
+# comfortably exceed one poll interval so an in-flight tick can finish.
+_POLLER_SHUTDOWN_TIMEOUT_SECONDS = 15.0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("BIMA-AI engine starting up.")
-    yield
-    logger.info("BIMA-AI engine shutting down.")
+
+    # Transparency-notification poller: a background task that polls SIAP's
+    # license-request changes feed and dispatches proactive citizen WhatsApp
+    # updates. The task is always created; it no-ops every tick until
+    # BIMA_TRANSPARENCY_POLLER_ENABLED is set, so this is safe to ship before
+    # the SIAP events token is provisioned. See services/transparency_poller.py.
+    poller_stop = asyncio.Event()
+    poller_task = asyncio.create_task(
+        run_transparency_poller_loop(poller_stop), name="transparency_poller"
+    )
+
+    try:
+        yield
+    finally:
+        logger.info("BIMA-AI engine shutting down.")
+        poller_stop.set()
+        try:
+            await asyncio.wait_for(
+                poller_task, timeout=_POLLER_SHUTDOWN_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning("transparency poller did not stop in time — cancelling")
+            poller_task.cancel()
 
 
 # ---------------------------------------------------------------------------
