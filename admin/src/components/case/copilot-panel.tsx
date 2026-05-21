@@ -2,7 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { Bot, SendHorizonal, Sparkles, UserRound, Wrench } from "lucide-react";
+import {
+  Bot,
+  PenLine,
+  SendHorizonal,
+  Sparkles,
+  UserRound,
+  Wrench,
+} from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { apiFetch } from "@/lib/api";
@@ -10,21 +17,25 @@ import { cn } from "@/lib/utils";
 import type {
   CaseValidationPayload,
   CopilotChatResponse,
+  CopilotMode,
   CopilotTurn,
 } from "@/lib/case-types";
 
 /**
- * Officer Copilot side panel — the per-officer "right-hand man" (Decisions §22).
+ * Copilot side panel — the per-officer "right-hand man" (Decisions §22), and
+ * — in `mode="signature"` — the Head-of-DPMPTSP signing assistant (Vision
+ * req #13).
  *
  * Behaviour:
  *  - On mount, rehydrates the persisted session via
- *    GET /case/{ticket}/copilot/session. The session is per-officer-per-case
- *    and survives navigation (admin-api owns the `copilot_session` table).
+ *    GET /case/{ticket}/copilot/session?mode=<mode>. The session is
+ *    per-officer-per-case-per-mode and survives navigation (admin-api owns
+ *    the `copilot_session` table).
  *  - If the session is empty, it auto-sends a silent kickoff turn so the
- *    copilot LEADS with the BIMA validation summary — score + worst-first
- *    issues — instead of a blank chatbot box. The validator result the case
- *    page already holds is forwarded so the copilot needs no fresh Gemini
- *    Vision pass.
+ *    copilot LEADS with the right opening: in officer mode the BIMA
+ *    validation summary, in signature mode the full approval-chain
+ *    synthesis. The validator result the case page already holds is
+ *    forwarded so the copilot needs no fresh Gemini Vision pass.
  *  - Subsequent turns POST to /case/{ticket}/copilot/chat; admin-api persists
  *    the updated history.
  *
@@ -32,23 +43,51 @@ import type {
  * amber accents, Manrope via the inherited font stack.
  */
 
-// The silent kickoff prompt. Never shown in the transcript — it just nudges
-// the validation-first system prompt to produce the opening narrative.
-const KICKOFF_PROMPT =
-  "Mulai sesi. Ringkas hasil validasi berkas ini: sebutkan skor, lalu " +
-  "pandu saya menelusuri masalah dari yang paling parah.";
+// Per-mode silent kickoff prompts. Never shown in the transcript — they just
+// nudge the matching system prompt to produce the opening narrative.
+const KICKOFF_PROMPT: Record<CopilotMode, string> = {
+  officer:
+    "Mulai sesi. Ringkas hasil validasi berkas ini: sebutkan skor, lalu " +
+    "pandu saya menelusuri masalah dari yang paling parah.",
+  signature:
+    "Mulai sesi tanda tangan. Susun ringkasan keputusan untuk berkas ini: " +
+    "rangkum catatan setiap meja sebelumnya, skor validasi BIMA beserta " +
+    "masalah yang ditandai, dan konteks permohonan — supaya saya bisa " +
+    "meninjau sebelum menandatangani.",
+};
+
+// Per-mode panel chrome — header copy + composer placeholder.
+const MODE_CHROME: Record<
+  CopilotMode,
+  { title: string; subtitle: (t: string) => string; placeholder: string }
+> = {
+  officer: {
+    title: "Copilot Validasi BIMA",
+    subtitle: (t) => `Asisten pribadi untuk tiket ${t}`,
+    placeholder: "Tanya copilot soal berkas ini…",
+  },
+  signature: {
+    title: "Asisten Tanda Tangan BIMA",
+    subtitle: (t) => `Tinjauan rantai persetujuan · tiket ${t}`,
+    placeholder: "Tanya soal rantai persetujuan berkas ini…",
+  },
+};
 
 type PanelState = "loading" | "idle" | "sending";
 
 export function CopilotPanel({
   ticket,
   validation,
+  mode = "officer",
 }: {
   ticket: string;
   /** The validator result the case page already computed, forwarded so the
    *  copilot's get_validation_summary tool can surface it. Null until the
    *  case page has a result. */
   validation: CaseValidationPayload | null;
+  /** Copilot variant — "officer" (default) or "signature". Selects the
+   *  kickoff prompt, the persisted session row, and the panel chrome. */
+  mode?: CopilotMode;
 }) {
   const [turns, setTurns] = useState<CopilotTurn[]>([]);
   const [state, setState] = useState<PanelState>("loading");
@@ -85,6 +124,7 @@ export function CopilotPanel({
             method: "POST",
             body: {
               message,
+              mode,
               validation: validation ?? undefined,
             },
           }
@@ -105,7 +145,7 @@ export function CopilotPanel({
         setState("idle");
       }
     },
-    [ticket, validation]
+    [ticket, validation, mode]
   );
 
   // Mount: rehydrate the persisted session, then kick off if it's empty.
@@ -115,7 +155,8 @@ export function CopilotPanel({
     async function bootstrap() {
       try {
         const session = await apiFetch<CopilotChatResponse>(
-          `/case/${encodeURIComponent(ticket)}/copilot/session`
+          `/case/${encodeURIComponent(ticket)}/copilot/session`,
+          { params: { mode } }
         );
         if (cancelled) return;
 
@@ -123,10 +164,10 @@ export function CopilotPanel({
         setTurns(existing);
         setState("idle");
 
-        // Empty session → lead with the validation summary.
+        // Empty session → lead with the mode-appropriate opener.
         if (existing.length === 0 && !kickoffFired.current) {
           kickoffFired.current = true;
-          void sendTurn(KICKOFF_PROMPT, { silent: true });
+          void sendTurn(KICKOFF_PROMPT[mode], { silent: true });
         }
       } catch {
         if (cancelled) return;
@@ -134,7 +175,7 @@ export function CopilotPanel({
         setState("idle");
         if (!kickoffFired.current) {
           kickoffFired.current = true;
-          void sendTurn(KICKOFF_PROMPT, { silent: true });
+          void sendTurn(KICKOFF_PROMPT[mode], { silent: true });
         }
       }
     }
@@ -143,7 +184,7 @@ export function CopilotPanel({
     return () => {
       cancelled = true;
     };
-  }, [ticket, sendTurn]);
+  }, [ticket, mode, sendTurn]);
 
   useEffect(() => {
     scrollToBottom();
@@ -156,19 +197,33 @@ export function CopilotPanel({
     void sendTurn(text);
   }, [draft, state, sendTurn]);
 
+  const chrome = MODE_CHROME[mode];
+  const isSignature = mode === "signature";
+
   return (
     <Card className="bg-surface-card border-0 rounded-card flex flex-col overflow-hidden">
       {/* Header */}
       <div className="flex items-center gap-2.5 px-5 py-4 bg-surface-card-hover/40">
-        <div className="rounded-full bg-brand-navy/25 p-1.5 text-brand-amber">
-          <Sparkles className="size-4" aria-hidden />
+        <div
+          className={cn(
+            "rounded-full p-1.5",
+            isSignature
+              ? "bg-brand-amber/15 text-brand-amber"
+              : "bg-brand-navy/25 text-brand-amber"
+          )}
+        >
+          {isSignature ? (
+            <PenLine className="size-4" aria-hidden />
+          ) : (
+            <Sparkles className="size-4" aria-hidden />
+          )}
         </div>
         <div className="min-w-0">
           <h2 className="font-display text-sm font-semibold text-text-primary leading-tight">
-            Copilot Validasi BIMA
+            {chrome.title}
           </h2>
           <p className="text-[11px] text-text-muted">
-            Asisten pribadi untuk tiket {ticket}
+            {chrome.subtitle(ticket)}
           </p>
         </div>
       </div>
@@ -212,7 +267,7 @@ export function CopilotPanel({
                 handleSubmit();
               }
             }}
-            placeholder="Tanya copilot soal berkas ini…"
+            placeholder={chrome.placeholder}
             rows={1}
             disabled={state === "sending"}
             aria-label="Pesan untuk copilot"

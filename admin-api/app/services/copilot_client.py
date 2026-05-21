@@ -80,6 +80,7 @@ class CopilotClient:
         message: str,
         history: list[dict[str, Any]],
         validation: Optional[dict[str, Any]] = None,
+        mode: str = "officer",
     ) -> tuple[bool, dict[str, Any]]:
         """
         Call ai-engine's `/v1/copilot/chat` for one conversation turn.
@@ -94,6 +95,10 @@ class CopilotClient:
           validation: the BIMA validator result for the ticket (score,
             status, summary, issues), so the copilot's `get_validation_summary`
             tool can surface it. Optional — omit when no validation exists.
+          mode: copilot variant — "officer" (default, the validation-first
+            desk copilot) or "signature" (the Head-of-DPMPTSP signing
+            assistant, Vision req #13). Forwarded verbatim; ai-engine
+            validates it.
 
         Returns:
           `(ok, payload)`. `ok=True` only on HTTP 200 with parseable JSON.
@@ -114,6 +119,7 @@ class CopilotClient:
             "officer_id": officer_id,
             "message": message,
             "history": history,
+            "mode": mode,
         }
         if validation is not None:
             body["validation"] = validation

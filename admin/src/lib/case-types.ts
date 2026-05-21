@@ -104,10 +104,21 @@ export interface CaseValidateResponse {
  *   POST /case/{ticket}/copilot/chat   → run one turn
  *   GET  /case/{ticket}/copilot/session → rehydrate the persisted session
  *
- * The session is per-officer-per-case and lives in admin-api's
+ * The session is per-officer-per-case-per-mode and lives in admin-api's
  * `copilot_session` table; ai-engine's agent stays stateless. See
  * [[Decisions]] §22.
  */
+
+/**
+ * Copilot variant (Wave 4 / Vision req #13):
+ *  - "officer"   — the validation-first desk copilot.
+ *  - "signature" — the Head-of-DPMPTSP signing assistant: synthesises the
+ *    whole approval chain for the final signing decision, then hands off to
+ *    SIAP Jateng (which owns the actual TTE/BSRE signature).
+ * Each mode keeps its own persisted session transcript per ticket.
+ */
+export type CopilotMode = "officer" | "signature";
+
 export type CopilotRole = "user" | "model";
 
 export interface CopilotTurn {
@@ -125,4 +136,40 @@ export interface CopilotChatResponse {
   reply: string;
   tool_calls: CopilotToolCall[];
   history: CopilotTurn[];
+}
+
+/* -------------------------------------------------------------------------- */
+/* SIAP signing handoff — Wave 4, Vision req #13                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Base URL of SIAP Jateng's Filament admin panel. BIMA never signs — the
+ * digital signature (TTE/BSRE) is performed in SIAP. We deep-link the Head
+ * of DPMPTSP straight to SIAP's "Tanda Tangan Berkas" page.
+ *
+ * Defaults to Beta-SIAP so a missing env var still produces a working
+ * rehearsal link. Production (`perizinan.jatengprov.go.id`) is set via
+ * `NEXT_PUBLIC_SIAP_BASE_URL` in Vercel only when explicitly cut over.
+ */
+const SIAP_BASE_URL = (
+  process.env.NEXT_PUBLIC_SIAP_BASE_URL ?? "https://beta-siap.nolongin.com"
+).replace(/\/+$/, "");
+
+/**
+ * Build the deep-link that opens SIAP's signing page for one case.
+ *
+ * SIAP route (verified against the SIAP repo, 2026-05-21):
+ *   - Filament panel path:  `/admin`
+ *   - Resource slug:        `tanda-tangan-berkas` (TandaTanganBerkasResource)
+ *   - The page table column `properties.ticket` is searchable, so we
+ *     pre-filter it to this one case via Filament's `?tableSearch=` param.
+ *
+ * The actual TTE is a per-row action on that page; the Head clicks it and
+ * signs in SIAP with their BSrE passphrase. BIMA only opens the door.
+ */
+export function buildSiapSigningUrl(ticket: string): string {
+  const padded = /^\d+$/.test(ticket) ? ticket.padStart(9, "0") : ticket;
+  return `${SIAP_BASE_URL}/admin/tanda-tangan-berkas?tableSearch=${encodeURIComponent(
+    padded
+  )}`;
 }

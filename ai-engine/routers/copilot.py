@@ -24,6 +24,12 @@ access decision (admin-api already scoped the session before calling us).
 admin-api and injected so the `get_validation_summary` tool can surface
 the score + issues without a second Gemini Vision pass.
 
+`mode` selects the copilot variant — "officer" (default, the validation-
+first desk copilot) or "signature" (the Head-of-DPMPTSP signing assistant,
+Vision req #13). Same agent, different system prompt + tool subset; the
+signature mode is read-only over the case and adds the SIAP signing
+deep-link handoff tool.
+
 Auth: gated by X-Internal-Key — mirrors the validator and tracking
 endpoints. The endpoint is *not* meant to be exposed to citizens.
 """
@@ -92,6 +98,15 @@ class CopilotChatRequest(BaseModel):
         ),
     )
     message: str = Field(..., min_length=1, max_length=_MAX_MESSAGE_CHARS)
+    mode: str = Field(
+        default="officer",
+        description=(
+            "Copilot mode: 'officer' (validation-first desk copilot, the "
+            "default) or 'signature' (the Head-of-DPMPTSP signing assistant "
+            "— Vision req #13). Selects the system prompt and tool subset. "
+            "An unknown value is coerced to 'officer' by the agent."
+        ),
+    )
     history: list[HistoryTurn] = Field(
         default_factory=list,
         description=(
@@ -118,6 +133,14 @@ class CopilotChatRequest(BaseModel):
                 f"history exceeds {_MAX_HISTORY_TURNS} turns — "
                 "trim older turns client-side before retrying."
             )
+        return v
+
+    @field_validator("mode")
+    @classmethod
+    def _mode_known(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in {"officer", "signature"}:
+            raise ValueError("mode must be 'officer' or 'signature'")
         return v
 
 
@@ -155,8 +178,9 @@ async def copilot_chat_endpoint(
     history_payload = [{"role": t.role, "text": t.text} for t in body.history]
 
     logger.info(
-        "Copilot chat | ticket=%s | officer_id=%s | message_len=%d | "
+        "Copilot chat | mode=%s | ticket=%s | officer_id=%s | message_len=%d | "
         "history_turns=%d | has_validation=%s",
+        body.mode,
         body.ticket,
         body.officer_id if body.officer_id is not None else "<none>",
         len(body.message),
@@ -179,6 +203,7 @@ async def copilot_chat_endpoint(
             history=history_payload,
             officer_id=body.officer_id,
             validation=body.validation,
+            mode=body.mode,
         )
     except httpx.TimeoutException as exc:
         logger.warning("Copilot timeout | ticket=%s | err=%s", body.ticket, exc)

@@ -66,6 +66,23 @@ Write actions (Wave 2 — officer-in-the-loop):
     the previous desk said"). Forward/decision notes land in that same log,
     so this tool closes the chained-context loop.
 
+Signature-assistant mode (Wave 4 — Vision req #13):
+  * `chat(mode="signature")` selects the SIGNATURE-ASSISTANT variant — a
+    Head-of-DPMPTSP-facing copilot for the FINAL signing decision. It is
+    the SAME function-calling agent with the SAME read tools; only the
+    system prompt changes (to frame the whole approval chain for a signing
+    decision) and one extra READ tool is exposed: `get_siap_signing_link`.
+  * BIMA does NOT sign anything. Digital signing / BSRE is owned entirely
+    by SIAP Jateng (its "Tanda Tangan Berkas" / TTE feature). The
+    signature-assistant's job is decision SUPPORT + a clean HANDOFF: it
+    synthesises every prior desk's notes, the validator findings, and the
+    regulation basis, then `get_siap_signing_link` returns a deep-link that
+    opens SIAP's signing page for that case. The Head reviews with BIMA,
+    clicks through, and signs in SIAP. No cryptography lives in BIMA.
+  * The signature-assistant deliberately does NOT expose `forward_case` or
+    `record_decision` — the only accountable action at this stage is the
+    signature itself, and that happens in SIAP, not BIMA.
+
 Not yet covered (deferred to Phase 3):
   * `get_doc_summary` returns a canned summary because SIAP does not
     currently expose a file-download endpoint. When that lands, swap the
@@ -85,6 +102,7 @@ import logging
 import os
 import re
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -110,6 +128,18 @@ _GEMINI_TOOL_MODEL: str = os.getenv(
     "models/gemini-2.5-flash",
 )
 _TOOL_TIMEOUT_SECONDS: float = float(os.getenv("GEMINI_TOOL_TIMEOUT_SECONDS", "30"))
+
+# SIAP signing deep-link base (Wave 4 / Vision req #13). The signature-
+# assistant hands the Head of DPMPTSP off to SIAP Jateng to perform the
+# actual digital signature (TTE/BSRE). This is the public base of SIAP's
+# Filament admin panel — the "Tanda Tangan Berkas" resource lives at
+# `<base>/admin/tanda-tangan-berkas`. Defaults to Beta-SIAP so a missing
+# env var still produces a working rehearsal link rather than a dead one.
+#   Beta:       https://beta-siap.nolongin.com
+#   Production: https://perizinan.jatengprov.go.id  (gated — do not auto-use)
+_SIAP_SIGNING_BASE: str = os.getenv(
+    "SIAP_SIGNING_URL_BASE", "https://beta-siap.nolongin.com"
+).rstrip("/")
 
 # Hard ceiling on tool-call rounds inside a single chat() invocation. Five is
 # generous — typical answer is 1–2 tool calls. If we hit the cap we return
@@ -183,6 +213,66 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "`get_case_log_notes` untuk catatan tahap sebelumnya, lalu tool lain "
     "sesuai pertanyaan petugas."
 )
+
+
+# ---------------------------------------------------------------------------
+# Signature-assistant system prompt — Wave 4, Vision req #13.
+#
+# The Head of DPMPTSP signs the final licence. This variant frames the SAME
+# read tools for the SIGNING decision: synthesise the whole approval chain,
+# surface anything a prior desk flagged, then hand off to SIAP to sign. BIMA
+# never performs the signature — SIAP owns TTE/BSRE.
+# ---------------------------------------------------------------------------
+
+_SIGNATURE_SYSTEM_PROMPT_TEMPLATE = (
+    "Anda adalah BIMA, asisten tanda tangan untuk Kepala DPMPTSP Jawa "
+    "Tengah. Pejabat yang sedang Anda dampingi akan MENANDATANGANI "
+    "(mengesahkan) izin final. Tugas Anda adalah memberi beliau gambaran "
+    "LENGKAP rantai persetujuan supaya keputusan tanda tangan diambil "
+    "dengan keyakinan penuh.\n\n"
+    "PRINSIP KERJA:\n"
+    "1. Di awal sesi, susun ringkasan keputusan: panggil "
+    "`get_case_log_notes` untuk membaca SELURUH catatan dari setiap meja "
+    "sebelumnya (rantai license_log), `get_validation_summary` untuk skor "
+    "validator BIMA beserta masalah yang ditandai, dan `get_case_full` "
+    "untuk konteks faktual permohonan. Sajikan semuanya sebagai satu "
+    "sintesis yang runut — dari pengajuan hingga meja terakhir.\n"
+    "2. SOROT secara eksplisit apa pun yang ditandai bermasalah oleh meja "
+    "sebelumnya atau oleh validator (critical/high lebih dahulu). Jika ada "
+    "temuan yang belum tuntas, sampaikan terus terang sebagai bahan "
+    "pertimbangan sebelum tanda tangan — jangan menutupinya.\n"
+    "3. Gunakan `cite_regulation` bila Kepala bertanya soal dasar hukum, "
+    "persyaratan, atau kewajiban yang melekat pada izin.\n"
+    "4. Selalu gunakan tool untuk fakta. Jangan pernah mengarang skor, "
+    "nama pemohon, isi catatan meja, atau referensi peraturan. Jika tool "
+    "tidak mengembalikan data, katakan terus terang.\n"
+    "5. Jawab ringkas, dalam Bahasa Indonesia formal dan santun sesuai "
+    "kedudukan pejabat.\n\n"
+    "=== TANDA TANGAN DILAKUKAN DI SIAP JATENG, BUKAN DI BIMA ===\n"
+    "BIMA TIDAK menandatangani dokumen apa pun. Penandatanganan digital "
+    "(TTE/BSRE) sepenuhnya milik aplikasi SIAP Jateng. Peran Anda adalah "
+    "PENDUKUNG KEPUTUSAN dan PENGHUBUNG.\n"
+    "Ketika Kepala sudah selesai meninjau dan siap menandatangani — atau "
+    "menanyakan cara/tempat tanda tangan — panggil `get_siap_signing_link` "
+    "untuk mendapatkan tautan halaman tanda tangan SIAP bagi berkas ini, "
+    "lalu sampaikan tautan itu dengan ajakan jelas: "
+    "'Tanda tangani di SIAP Jateng'. Jelaskan singkat bahwa proses TTE "
+    "dilakukan di SIAP menggunakan passphrase BSrE milik beliau.\n"
+    "DILARANG mengaku telah menandatangani berkas, atau menjanjikan BIMA "
+    "akan menandatanganinya. BIMA hanya menyiapkan konteks dan tautan.\n\n"
+    "Konteks sesi:\n"
+    "- Tiket yang akan ditandatangani: {ticket}\n"
+    "- Mulailah dengan sintesis rantai persetujuan (`get_case_log_notes` + "
+    "`get_validation_summary` + `get_case_full`), lalu jawab pertanyaan "
+    "Kepala dan tawarkan tautan tanda tangan SIAP saat beliau siap."
+)
+
+
+# Copilot operating modes. "officer" is the validation-first desk copilot
+# (Wave 1-2); "signature" is the Head-of-DPMPTSP signing assistant (Wave 4).
+_MODE_OFFICER = "officer"
+_MODE_SIGNATURE = "signature"
+_VALID_MODES = frozenset({_MODE_OFFICER, _MODE_SIGNATURE})
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +561,83 @@ async def get_case_log_notes(ticket: str) -> dict:
         "request_id": timeline.get("request_id"),
         "note_count": len(notes),
         "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Signature handoff tool — Wave 4, Vision req #13.
+#
+# BIMA does NOT sign. SIAP Jateng owns the digital signature (TTE/BSRE) via
+# its "Tanda Tangan Berkas" Filament resource. This tool builds the deep-link
+# that opens SIAP's signing surface for a specific case so the Head of
+# DPMPTSP can review with BIMA, then click through and sign in SIAP.
+#
+# SIAP route (verified against the SIAP repo, 2026-05-21):
+#   * Filament panel:   AdminPanelProvider → ->id('admin') ->path('admin')
+#   * Resource:         App\Filament\Resources\TandaTanganBerkasResource
+#                       protected static ?string $slug = 'tanda-tangan-berkas';
+#                       single page ManageTandaTanganBerkas at route '/'.
+#   * The TTE action is a Filament table EditAction named 'tte' on that page;
+#     the table column `properties.ticket` is `searchable`.
+# So the signing page is `<base>/admin/tanda-tangan-berkas`, and we pre-filter
+# it to the one case by appending Filament's table-search query param
+# (`?tableSearch=<ticket>`) — the ticket is the stable, public-knowledge
+# handle (BIMA does not own SIAP's internal `request_id` record key).
+# ---------------------------------------------------------------------------
+
+# Filament's table-search query parameter. Filament v3 hydrates the table
+# search box from `?tableSearch=`, so the Head lands on the signing list
+# already filtered to this one ticket.
+_SIAP_SIGNING_PATH = "/admin/tanda-tangan-berkas"
+
+
+def get_siap_signing_link(ticket: str) -> dict:
+    """
+    Build the deep-link that opens SIAP Jateng's signing page for a case.
+
+    BIMA never signs — SIAP owns TTE/BSRE. This tool is the HANDOFF: it
+    returns the URL of SIAP's "Tanda Tangan Berkas" Filament page,
+    pre-filtered to `ticket` via Filament's `tableSearch` query param, so
+    the Head of DPMPTSP clicks through and signs in SIAP itself.
+
+    Args:
+      ticket: the SIAP ticket of the case to sign.
+
+    Returns:
+      {
+        "available": bool,
+        "ticket": str,
+        "url": str,            # the SIAP signing deep-link
+        "label": str,          # the call-to-action text, Indonesian
+        "note": str,           # one-line guidance for the model to narrate
+      }
+    On a missing ticket returns `{"available": False, "note": "..."}`.
+    """
+    ticket = (ticket or "").strip()
+    if not ticket:
+        return {
+            "available": False,
+            "note": (
+                "Nomor tiket tidak tersedia — tautan tanda tangan SIAP "
+                "tidak dapat dibuat."
+            ),
+        }
+
+    # Zero-padded 9-digit ticket matches what SIAP stores in
+    # `license_request.properties->>'ticket'`, so the table search hits.
+    padded = ticket.zfill(9) if ticket.isdigit() else ticket
+    url = f"{_SIAP_SIGNING_BASE}{_SIAP_SIGNING_PATH}?tableSearch={quote(padded)}"
+    return {
+        "available": True,
+        "ticket": padded,
+        "url": url,
+        "label": "Tanda tangani di SIAP Jateng",
+        "note": (
+            "Tautan ini membuka halaman Tanda Tangan Berkas di SIAP Jateng "
+            f"yang sudah tersaring ke tiket {padded}. Penandatanganan "
+            "(TTE/BSRE) dilakukan di SIAP menggunakan passphrase BSrE "
+            "milik penandatangan — BIMA tidak menandatangani dokumen."
+        ),
     }
 
 
@@ -822,6 +989,27 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_siap_signing_link",
+        "description": (
+            "HANYA untuk mode asisten tanda tangan. Ambil tautan halaman "
+            "tanda tangan SIAP Jateng untuk berkas ini, supaya Kepala "
+            "DPMPTSP dapat klik dan menandatangani izin di SIAP. BIMA TIDAK "
+            "menandatangani — penandatanganan (TTE/BSRE) dilakukan di SIAP. "
+            "Gunakan tool ini saat Kepala siap menandatangani atau bertanya "
+            "cara/tempat tanda tangan."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticket": {
+                    "type": "string",
+                    "description": "Nomor tiket SIAP, 9 digit (mis. '000077591').",
+                },
+            },
+            "required": ["ticket"],
+        },
+    },
+    {
         "name": "forward_case",
         "description": (
             "TINDAKAN MENGUBAH DATA. Teruskan berkas ke meja persetujuan "
@@ -914,9 +1102,51 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "compare_field": compare_field,
     "cite_regulation": cite_regulation,
     "get_case_log_notes": get_case_log_notes,
+    "get_siap_signing_link": get_siap_signing_link,
     "forward_case": forward_case,
     "record_decision": record_decision,
 }
+
+
+# ---------------------------------------------------------------------------
+# Per-mode tool exposure.
+#
+# The function-calling agent is shared; what differs per mode is WHICH tools
+# the model may call. The signature-assistant (Wave 4) is read-only over the
+# case and gets the SIAP signing handoff tool — it deliberately does NOT see
+# `forward_case`/`record_decision`, because the only accountable action at the
+# signing stage is the signature itself, which happens in SIAP, not BIMA.
+# ---------------------------------------------------------------------------
+
+# Tools the officer copilot may call — the full set (Wave 1-2 behaviour).
+_OFFICER_TOOL_NAMES = frozenset({
+    "get_validation_summary",
+    "get_case_full",
+    "get_doc_summary",
+    "compare_field",
+    "cite_regulation",
+    "get_case_log_notes",
+    "forward_case",
+    "record_decision",
+})
+
+# Tools the signature-assistant may call — read-only chain synthesis plus the
+# SIAP signing deep-link handoff. No write tools.
+_SIGNATURE_TOOL_NAMES = frozenset({
+    "get_validation_summary",
+    "get_case_full",
+    "cite_regulation",
+    "get_case_log_notes",
+    "get_siap_signing_link",
+})
+
+
+def _declarations_for_mode(mode: str) -> list[dict[str, Any]]:
+    """Return the Gemini functionDeclarations subset allowed in `mode`."""
+    allowed = (
+        _SIGNATURE_TOOL_NAMES if mode == _MODE_SIGNATURE else _OFFICER_TOOL_NAMES
+    )
+    return [d for d in _FUNCTION_DECLARATIONS if d["name"] in allowed]
 
 
 def _result_preview(value: Any, limit: int = 240) -> str:
@@ -1009,6 +1239,7 @@ class OfficerCopilot:
         history: list[dict],
         officer_id: int | None = None,
         validation: dict | None = None,
+        mode: str = _MODE_OFFICER,
     ) -> dict:
         """
         Run one user-message turn. Returns:
@@ -1029,12 +1260,24 @@ class OfficerCopilot:
             summary, issues), computed by admin-api and injected here so the
             `get_validation_summary` tool can surface it without re-running
             Gemini Vision. None when no validation is available yet.
+          mode: "officer" (default) for the validation-first desk copilot, or
+            "signature" for the Head-of-DPMPTSP signing assistant (Wave 4 /
+            Vision req #13). The mode selects the system prompt and the
+            tool subset; the agent machinery is otherwise identical. An
+            unknown value falls back to "officer".
         """
+        mode = mode if mode in _VALID_MODES else _MODE_OFFICER
+
         if not is_configured():
+            unavailable = (
+                "Maaf, Asisten Tanda Tangan belum dapat digunakan: "
+                if mode == _MODE_SIGNATURE
+                else "Maaf, Officer Copilot belum dapat digunakan: "
+            )
             return {
                 "reply": (
-                    "Maaf, Officer Copilot belum dapat digunakan: GEMINI_API_KEY "
-                    "belum dikonfigurasi di server ai-engine."
+                    unavailable
+                    + "GEMINI_API_KEY belum dikonfigurasi di server ai-engine."
                 ),
                 "tool_calls": [],
                 "history": list(history or []),
@@ -1043,9 +1286,14 @@ class OfficerCopilot:
         contents = self._build_initial_contents(message, history)
         tool_calls_log: list[dict[str, Any]] = []
 
+        prompt_template = (
+            _SIGNATURE_SYSTEM_PROMPT_TEMPLATE
+            if mode == _MODE_SIGNATURE
+            else _SYSTEM_PROMPT_TEMPLATE
+        )
         system_instruction = {
             "role": "system",
-            "parts": [{"text": _SYSTEM_PROMPT_TEMPLATE.format(ticket=ticket)}],
+            "parts": [{"text": prompt_template.format(ticket=ticket)}],
         }
 
         # Bind the validation result for this turn so `get_validation_summary`
@@ -1053,8 +1301,9 @@ class OfficerCopilot:
         # isolated — each asyncio task gets its own ContextVar copy.
         ctx_token = _validation_context.set(validation)
         logger.info(
-            "Copilot turn start | officer_id=%s | ticket=%s | "
+            "Copilot turn start | mode=%s | officer_id=%s | ticket=%s | "
             "has_validation=%s | history_turns=%d",
+            mode,
             officer_id if officer_id is not None else "<none>",
             ticket,
             validation is not None,
@@ -1068,6 +1317,7 @@ class OfficerCopilot:
                 contents=contents,
                 tool_calls_log=tool_calls_log,
                 system_instruction=system_instruction,
+                mode=mode,
             )
         finally:
             _validation_context.reset(ctx_token)
@@ -1081,16 +1331,20 @@ class OfficerCopilot:
         contents: list[dict],
         tool_calls_log: list[dict[str, Any]],
         system_instruction: dict,
+        mode: str = _MODE_OFFICER,
     ) -> dict:
         """The Gemini function-calling round loop. Split out of `chat()` so the
         ContextVar set/reset stays a tight wrapper around the whole turn."""
         message = client_message
+        # Only the tools allowed in `mode` are declared to Gemini — the
+        # signature-assistant never sees the write tools.
+        declarations = _declarations_for_mode(mode)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             for round_idx in range(self.max_rounds):
                 payload = {
                     "systemInstruction": system_instruction,
                     "contents": contents,
-                    "tools": [{"functionDeclarations": _FUNCTION_DECLARATIONS}],
+                    "tools": [{"functionDeclarations": declarations}],
                     "generationConfig": {
                         "temperature": 0.2,
                         "maxOutputTokens": 1024,
@@ -1159,13 +1413,45 @@ class OfficerCopilot:
                 contents.append({"role": "model", "parts": parts})
 
                 response_parts: list[dict[str, Any]] = []
+                allowed_tools = (
+                    _SIGNATURE_TOOL_NAMES
+                    if mode == _MODE_SIGNATURE
+                    else _OFFICER_TOOL_NAMES
+                )
                 for fc in function_calls:
                     name = fc.get("name", "")
                     args = fc.get("args") or {}
                     logger.info(
-                        "Copilot tool call | round=%d | name=%s | args=%s",
-                        round_idx, name, _result_preview(args, 160),
+                        "Copilot tool call | mode=%s | round=%d | name=%s | args=%s",
+                        mode, round_idx, name, _result_preview(args, 160),
                     )
+                    # Defence-in-depth: even though only mode-scoped tools are
+                    # declared to Gemini, refuse to EXECUTE a tool outside the
+                    # mode's allowed set. A signature-assistant turn can never
+                    # run a write tool, period.
+                    if name not in allowed_tools:
+                        logger.warning(
+                            "Copilot BLOCKED out-of-mode tool | mode=%s | name=%s",
+                            mode, name,
+                        )
+                        blocked = {
+                            "error": (
+                                f"Tool {name!r} tidak tersedia dalam mode "
+                                f"{mode!r}."
+                            )
+                        }
+                        tool_calls_log.append({
+                            "name": name,
+                            "args": args,
+                            "result_preview": _result_preview(blocked),
+                        })
+                        response_parts.append({
+                            "functionResponse": {
+                                "name": name,
+                                "response": {"result": blocked},
+                            },
+                        })
+                        continue
                     # Defence-in-depth audit line: a confirmed write is an
                     # accountable action — log it loudly, separately from the
                     # generic tool-call line, with PII-light args only.
