@@ -22,6 +22,7 @@ Demo mode:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -33,9 +34,11 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
 from deps import require_internal_key
+from services import notifications
 from services.agents.validator import (
     SUPPORTED_DOC_TYPES,
     Document,
+    ValidationResult,
     validate_submission,
 )
 
@@ -111,6 +114,39 @@ class ValidateRequest(BaseModel):
         default=None,
         description="Optional SIAP license_id for license-specific validation (Phase 2.5 — currently unused).",
     )
+    # --- Trusted notification context (set by admin-api only) ----------
+    # These two fields are how a citizen_needs_fix WhatsApp gets a
+    # destination. They MUST be populated by admin-api from the SIAP
+    # person record tied to the submission — NEVER from unvalidated
+    # client/portal input. See the SECURITY note on
+    # _maybe_notify_needs_fix() below. If they're absent, the validator
+    # simply skips the notification (logged) — it never guesses a phone.
+    ticket: str | None = Field(
+        default=None,
+        max_length=32,
+        description=(
+            "SIAP ticket number this submission belongs to. Used to build "
+            "the portal fix URL and label the notification. Trusted: set "
+            "by admin-api, not by end users."
+        ),
+    )
+    citizen_phone: str | None = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Citizen's WhatsApp number, sourced by admin-api from the "
+            "trusted SIAP person record. MUST NOT come from unvalidated "
+            "client input. When absent, no notification is sent."
+        ),
+    )
+    citizen_name: str | None = Field(
+        default=None,
+        max_length=120,
+        description=(
+            "Citizen's name for the notification greeting. Trusted source "
+            "(SIAP person record). Falls back to a generic greeting if absent."
+        ),
+    )
 
 
 class IssueOut(BaseModel):
@@ -136,6 +172,112 @@ class ValidateResponse(BaseModel):
     summary: str
     per_document: dict[str, dict[str, Any]]
     issues: list[IssueOut]
+
+
+# ---------------------------------------------------------------------------
+# citizen_needs_fix notification wiring
+# ---------------------------------------------------------------------------
+
+# Issue severities (from services.agents.validator.IssueLevel) that make a
+# minor_issues result still worth a "please fix" WhatsApp.
+_NEEDS_FIX_SEVERITIES = {"critical", "high"}
+
+_PORTAL_TRACK_URL = "https://portal.nolongin.com/track/{ticket}"
+
+
+def _is_needs_fix(result: ValidationResult) -> bool:
+    """A result warrants a citizen_needs_fix ping when it has major issues,
+    or minor issues that still include at least one CRITICAL/HIGH item."""
+    if result.status == "major_issues":
+        return True
+    if result.status == "minor_issues":
+        return any(
+            i.severity.lower() in _NEEDS_FIX_SEVERITIES for i in result.issues
+        )
+    return False
+
+
+def _top_issue_summary(result: ValidationResult) -> str:
+    """A short human summary of the most important issue, for the WhatsApp
+    body. Picks the highest-severity issue's message and truncates it so a
+    single template parameter stays compact."""
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    ranked = sorted(
+        result.issues,
+        key=lambda i: severity_rank.get(i.severity.lower(), 99),
+    )
+    if not ranked:
+        return result.summary[:160]
+    msg = " ".join(ranked[0].message.split())
+    return msg if len(msg) <= 160 else msg[:157] + "…"
+
+
+def _mask_phone(phone: str) -> str:
+    if len(phone) < 8:
+        return "<short>"
+    return phone[:4] + "…" + phone[-4:]
+
+
+async def _maybe_notify_needs_fix(
+    *,
+    result: ValidationResult,
+    ticket: Optional[str],
+    citizen_phone: Optional[str],
+    citizen_name: Optional[str],
+) -> None:
+    """Fire a citizen_needs_fix WhatsApp when the validation result calls
+    for it. Designed to run as a detached asyncio task — it never raises
+    and never blocks the validation response.
+
+    SECURITY: `citizen_phone` MUST originate from a trusted source — the
+    SIAP person record tied to the submission, passed in by admin-api.
+    It is NEVER taken from unvalidated client/portal input, because doing
+    so would let an attacker make BIMA WhatsApp an arbitrary number. If
+    no trusted phone (or no ticket) is available we log and skip — we do
+    NOT guess a recipient.
+
+    notifications.notify() itself respects BIMA_NOTIFICATIONS_ENABLED, so
+    wiring this in while the flag is off is safe — it becomes a no-op.
+    """
+    try:
+        if not _is_needs_fix(result):
+            return
+
+        if not citizen_phone or not ticket:
+            logger.info(
+                "needs_fix notify skipped — no trusted recipient | "
+                "ticket=%s has_phone=%s status=%s",
+                ticket or "<none>",
+                bool(citizen_phone),
+                result.status,
+            )
+            return
+
+        fix_url = _PORTAL_TRACK_URL.format(ticket=ticket)
+        params = {
+            "name": citizen_name or "Pemohon",
+            "ticket": ticket,
+            "issue_summary": _top_issue_summary(result),
+            "fix_url": fix_url,
+        }
+
+        logger.info(
+            "needs_fix notify dispatching | ticket=%s phone=%s status=%s",
+            ticket,
+            _mask_phone(citizen_phone),
+            result.status,
+        )
+        await notifications.notify(
+            event="citizen_needs_fix",
+            recipient_phone=citizen_phone,
+            params=params,
+        )
+    except Exception:
+        # Fire-and-forget: a notification failure must never surface to the
+        # caller or crash the background task. Log with traceback.
+        logger.exception(
+            "needs_fix notify task crashed | ticket=%s", ticket or "<none>"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +378,21 @@ async def validate_submission_endpoint(
     )
 
     result = await validate_submission(documents)
+
+    # Fire-and-forget: if the submission needs corrections, ping the
+    # citizen on WhatsApp. asyncio.create_task so this never delays the
+    # validation response. The notification is gated three ways:
+    #   1. _maybe_notify_needs_fix only acts on a needs-fix status;
+    #   2. it only sends to a trusted phone supplied by admin-api;
+    #   3. notifications.notify respects BIMA_NOTIFICATIONS_ENABLED.
+    asyncio.create_task(
+        _maybe_notify_needs_fix(
+            result=result,
+            ticket=body.ticket,
+            citizen_phone=body.citizen_phone,
+            citizen_name=body.citizen_name,
+        )
+    )
 
     return ValidateResponse(
         score=result.score,
