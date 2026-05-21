@@ -284,10 +284,10 @@ Ini DOMAIN UTAMAMU. Gunakan data SIAP yang tersedia di konteks.
   sistem yang berbeda. Lebih baik jujur "belum ada datanya" daripada
   memberi jawaban OSS yang salah konteks.
 
-(Catatan teknis: kemampuan SIAP yang lebih dalam — pencarian katalog
-izin, penarikan persyaratan per-izin, daftar permohonan per-pemohon —
-sedang dibangun sebagai SIAP tool layer. Sampai itu live, ikuti aturan
-di atas.)
+(Catatan teknis: pertanyaan SIAP yang lebih dalam — pencarian katalog
+izin, penarikan persyaratan per-izin, status & riwayat tiket — kini
+dilayani oleh SIAP tool layer secara terpisah. Aturan di atas berlaku
+sebagai cadangan bila tool layer tidak tersedia.)
 
 ▶ FASE 3 (Pasca-Perizinan) — Advisor Pertumbuhan & Kepatuhan
 • Ingatkan kewajiban berkala: laporan LKPM (setiap 3 bulan untuk investasi
@@ -448,19 +448,52 @@ async def generate_ai_response(user_id: str, message: str) -> str:
         history = _get_history(user_id)
         siap_ctx = _extract_siap_context_from_history(history)
 
-        # Retrieval routing per audit finding (2026-05-19):
-        #   scope=sectoral_non_oss → skip ChromaDB ENTIRELY. The corpus only
-        #     covers OSS RBA; retrieving on a sectoral query returns wrong
-        #     KBLI 41xxx/42xxx construction chunks with passing similarity
-        #     (false confidence). The IZIN SEKTORAL NON-OSS branch of the
-        #     system prompt handles the response without RAG.
-        #   scope=oss_rba (or unknown) → standard retrieval, optionally
-        #     enriched with the prior-turn SIAP license name so "apa
-        #     syaratnya?" searches for THAT license, not the literal text.
+        # Routing per [[Decisions]] §22 (OSS = brief, SIAP = deep tool layer):
+        #   scope=siap → route to the SIAP agent (Gemini function-calling over
+        #     the services.siap_tools registry). This is the DEEP path — the
+        #     agent queries SIAP's DB directly for requirements / status /
+        #     timeline rather than RAGging the OSS corpus. Fixes the
+        #     2026-05-19 screenshot bug. The Layer-1 regex ticket fast-path
+        #     above still runs first for a bare ticket lookup.
+        #   scope=oss_rba (or unknown) → standard OSS-RBA RAG+Gemma path,
+        #     optionally enriched with the prior-turn SIAP license name so
+        #     "apa syaratnya?" searches for THAT license.
         scope = intent.get("scope", "unknown")
-        if scope == "sectoral_non_oss":
+
+        if scope == "siap":
+            from services.agents.siap_agent import get_siap_agent, is_configured as _siap_agent_configured
+
+            if _siap_agent_configured():
+                logger.info(
+                    "Scope=siap — routing to SIAP agent (deep tool layer) | user_id=%s",
+                    user_id,
+                )
+                agent_result = await get_siap_agent().chat(message, history=history)
+                reply = agent_result.get("reply", "").strip()
+                if reply:
+                    logger.info(
+                        "SIAP agent reply | user_id=%s | tool_calls=%d",
+                        user_id, len(agent_result.get("tool_calls", [])),
+                    )
+                    _append_history(user_id, message, reply)
+                    return reply
+                # Empty reply (should not happen) → fall through to RAG path.
+                logger.warning(
+                    "SIAP agent returned empty reply — falling through to RAG | user_id=%s",
+                    user_id,
+                )
+            else:
+                logger.info(
+                    "Scope=siap but SIAP agent not configured (no GEMINI key) — "
+                    "falling through to RAG path | user_id=%s",
+                    user_id,
+                )
+
+        # Retrieval routing for the OSS-RBA / unknown path. (A scope=siap
+        # message only reaches here if the SIAP agent was unavailable.)
+        if scope == "siap":
             logger.info(
-                "Scope=sectoral_non_oss — skipping RAG retrieval | user_id=%s",
+                "Scope=siap fallthrough — skipping RAG retrieval | user_id=%s",
                 user_id,
             )
             rag_chunks: list = []
@@ -547,7 +580,7 @@ _INTENT_SCHEMA = """{
   "phase": <integer 1, 2, or 3>,
   "kbli_code": <string like "56102" or null if not mentioned>,
   "detected_scale": <string like "Mikro", "Kecil", "Menengah", "Besar" or null>,
-  "scope": <"oss_rba" | "sectoral_non_oss" | "unknown">
+  "scope": <"oss_rba" | "siap" | "unknown">
 }"""
 
 _INTENT_SYSTEM = (
@@ -560,16 +593,18 @@ _INTENT_SYSTEM = (
     "  Phase 2 (Eksekusi): ready to apply, asking for step-by-step, mentions a KBLI code\n"
     "  Phase 3 (Pasca-Perizinan): already has permit, asking about obligations or growth\n"
     "\n"
-    "AXIS 2 — Scope (oss_rba | sectoral_non_oss | unknown):\n"
+    "AXIS 2 — Scope (oss_rba | siap | unknown):\n"
     "  oss_rba: about OSS RBA business activities (NIB, Sertifikat Standar, KBLI codes,\n"
     "           perizinan berusaha). Default when KBLI is mentioned or topic is\n"
-    "           clearly business-license oriented.\n"
-    "  sectoral_non_oss: about Indonesian sectoral permits OUTSIDE the OSS RBA system.\n"
-    "           Signals: 'Izin Pemakaian Tanah', 'Pemakaian Bangunan Pengairan',\n"
-    "           'Izin Pengairan', 'Izin Lingkungan', 'IMB', 'PBG', 'SLF', 'Izin\n"
-    "           Trayek', 'Izin Trayek Angkutan', 'PUPR', 'Sumber Daya Air',\n"
-    "           'Perhubungan', 'Lingkungan Hidup', 'Pariwisata', 'Sosial',\n"
-    "           plus most permit names that do NOT map to a KBLI code.\n"
+    "           clearly national-business-license oriented.\n"
+    "  siap: about SIAP Jateng — DPMPTSP Central Java's own licensing system\n"
+    "        (sectoral/regional permits, ticket status, approval workflow).\n"
+    "        Signals: 'Izin Pemakaian Tanah', 'Pemakaian Bangunan Pengairan',\n"
+    "        'Izin Pengairan', 'Izin Lingkungan', 'IMB', 'PBG', 'SLF', 'Izin\n"
+    "        Trayek', 'Izin Trayek Angkutan', 'PUPR', 'Sumber Daya Air',\n"
+    "        'Perhubungan', 'Lingkungan Hidup', 'Pariwisata', 'Sosial', a SIAP\n"
+    "        ticket/permohonan number, 'status berkas', plus most permit names\n"
+    "        that do NOT map to a KBLI code.\n"
     "  unknown: cannot determine (greetings, ambiguous messages, off-topic).\n"
     "\n"
     "Also extract the KBLI code (5-digit number like 56102) and business scale if mentioned.\n"
@@ -606,10 +641,12 @@ async def analyze_user_intent(message: str) -> dict:
         cleaned = _strip_json_fences(raw)
         intent = json.loads(cleaned)
         # Normalise — ensure required keys exist and scope is one of the
-        # allowed values (defends against a Gemma drift into "sectoral" or
-        # other unexpected strings).
+        # allowed values (defends against a Gemma drift into "sectoral",
+        # the old "sectoral_non_oss" label, or other unexpected strings).
         scope = intent.get("scope", "unknown")
-        if scope not in {"oss_rba", "sectoral_non_oss", "unknown"}:
+        if scope == "sectoral_non_oss":  # legacy label → renamed in §22
+            scope = "siap"
+        if scope not in {"oss_rba", "siap", "unknown"}:
             scope = "unknown"
         return {
             "phase":          int(intent.get("phase", 1)),
