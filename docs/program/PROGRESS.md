@@ -9,6 +9,53 @@
 
 ---
 
+## Cycle 6 — 2026-05-21 · "Wave 3 COMPLETE — guided submission live"
+
+**Type:** PM cycle, run locally.
+
+**THINK.** Waves 1+2 done. Wave 3 (req #4) is the citizen-facing
+capstone — BIMA conversationally files a license end to end.
+
+**DELEGATE → BIMA Team** (`bima-ai#55`):
+- `services/guided_submission.py` — a per-user state machine
+  (RESOLVING_LICENSE → COLLECTING_FIELDS → REVIEW → DONE/FAILED).
+  Conservative regex intent detection (needs a filing verb + a
+  licensing noun). Multi-turn state in a bounded LRU (500-cap, 6h TTL)
+  — the 2-turn `_history` is far too short for a form.
+- Routed via a `FAST-PATH 0` block in `ai_handler.py` (non-streaming +
+  streaming) — `maybe_handle()` returns `None` for non-submission
+  turns, so normal chat is untouched.
+- Validator gates the submit (only a `ready` score proceeds);
+  validation issues block + tell the citizen what to fix.
+- `services/siap_submission_client.py` — `POST /api/v1/license-request`
+  with a distinct `submission:create` token.
+- 15 new tests + the 27 existing all green.
+
+**REVIEW.** Routing is `None`-safe (normal chat untouched),
+feature-flagged, py_compile clean. Passes.
+
+**REPORT.** `#55` merged + deployed. **Armed:** `submission:create`
+token minted on Beta-SIAP (VPS-side, not echoed) →
+`SIAP_SUBMISSION_API_TOKEN`; `GUIDED_SUBMISSION_PROFILE_ID=40766`
+(MAESAROH, a Beta-SIAP test profile); `GUIDED_SUBMISSION_DEMO_FIXTURE=clean`;
+`BIMA_GUIDED_SUBMISSION_ENABLED=true`. Smoke test: `maybe_handle("saya
+mau ajukan izin pemakaian tanah")` engaged the flow and returned the
+license-selection prompt. **Wave 3 live — req #4 done.**
+
+### Roadmap movement
+- Wave 3: ✅ COMPLETE + armed. Wave 4 (final) is next.
+
+### Deferred (reported, not hidden)
+- Document upload over the APTANA media webhook — validator runs the
+  fixture path for now (real validate→branch→submit logic).
+- Per-citizen `profile_id` from NIK — pinned to test profile 40766.
+
+### Next cycle
+Wave 4 — the final wave: multi-ticket inbox (#14), SOP-as-motivator
+(#15), Head-of-DPMPTSP signing (#13, BSRE — likely a real-team dep).
+
+---
+
 ## Cycle 5 — 2026-05-21 · "Transparency poller ARMED + live; officer-copilot write actions begin"
 
 **Type:** PM cycle, run locally.
