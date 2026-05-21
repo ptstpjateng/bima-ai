@@ -67,6 +67,11 @@ _MAX_COPILOT_HISTORY_TURNS = 40
 _TICKET_PATTERN = re.compile(r"^\d{4,9}$")
 _ALLOWED_DEMO_FIXTURES = frozenset({"clean", "name_mismatch", "nik_typo"})
 
+# Copilot modes — "officer" (validation-first desk copilot) and "signature"
+# (the Head-of-DPMPTSP signing assistant, Vision req #13). Kept in sync with
+# ai-engine's officer_copilot._VALID_MODES.
+_ALLOWED_COPILOT_MODES = frozenset({"officer", "signature"})
+
 
 # ---------------------------------------------------------------------------
 # Response shapes
@@ -141,6 +146,15 @@ class CopilotChatRequest(BaseModel):
         min_length=1,
         max_length=_MAX_COPILOT_MESSAGE_CHARS,
         description="The officer's new message to the copilot.",
+    )
+    mode: str = Field(
+        default="officer",
+        description=(
+            "Copilot variant: 'officer' (validation-first desk copilot, the "
+            "default) or 'signature' (the Head-of-DPMPTSP signing assistant, "
+            "Vision req #13). Selects both the ai-engine system prompt and "
+            "which persisted session row this turn writes to."
+        ),
     )
     validation: Optional[dict[str, Any]] = Field(
         default=None,
@@ -411,17 +425,19 @@ def _coerce_history(raw: Any) -> list[dict[str, str]]:
 
 
 async def _get_or_create_session(
-    db: AsyncSession, *, officer_id: int, ticket: str
+    db: AsyncSession, *, officer_id: int, ticket: str, mode: str
 ) -> CopilotSession:
-    """Load the (officer_id, ticket) copilot session, creating it on first use.
+    """Load the (officer_id, ticket, mode) copilot session, creating on first use.
 
     SECURITY: the lookup is keyed on `officer_id` (always the JWT subject) AND
-    `ticket`, so an officer can only ever touch their own session row.
+    `ticket`, so an officer can only ever touch their own session row. `mode`
+    keeps the officer-copilot and signature-assistant transcripts separate.
     """
     result = await db.execute(
         select(CopilotSession).where(
             CopilotSession.officer_id == officer_id,
             CopilotSession.ticket == ticket,
+            CopilotSession.mode == mode,
         )
     )
     session = result.scalar_one_or_none()
@@ -429,6 +445,7 @@ async def _get_or_create_session(
         session = CopilotSession(
             officer_id=officer_id,
             ticket=ticket,
+            mode=mode,
             history_json=[],
         )
         db.add(session)
@@ -468,12 +485,28 @@ async def copilot_chat(
          `last_active_at`.
       6. Return reply + tool transcript + the full persisted history.
 
+    Mode (Wave 4 / Vision req #13):
+      `body.mode` selects 'officer' (default) or 'signature'. The signature
+      assistant is the Head-of-DPMPTSP signing copilot — it gets its own
+      persisted session row per ticket so its chain-synthesis transcript
+      never mixes with the officer's validation conversation.
+
     SECURITY: the session is scoped to `current_user.id`. Officer A calling
     this endpoint can never load or mutate officer B's conversation, because
     every query is filtered on `officer_id == current_user.id`.
     """
     padded_ticket = _validate_ticket(ticket)
     officer_id = current_user.id
+
+    mode = (body.mode or "officer").strip().lower()
+    if mode not in _ALLOWED_COPILOT_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown copilot mode {body.mode!r}. "
+                f"Allowed: {sorted(_ALLOWED_COPILOT_MODES)}"
+            ),
+        )
 
     # Confirm the ticket is real before spinning up a copilot turn. Reuses the
     # same SIAP lookup the case header uses — raises 404/503 uniformly.
@@ -490,7 +523,7 @@ async def copilot_chat(
         )
 
     session = await _get_or_create_session(
-        db, officer_id=officer_id, ticket=padded_ticket
+        db, officer_id=officer_id, ticket=padded_ticket, mode=mode
     )
 
     # Trim to the most recent N turns so we never exceed ai-engine's history
@@ -498,8 +531,9 @@ async def copilot_chat(
     prior_history = _coerce_history(session.history_json)[-_MAX_COPILOT_HISTORY_TURNS:]
 
     logger.info(
-        "Copilot turn | officer_id=%s | ticket=%s | prior_turns=%d | "
+        "Copilot turn | mode=%s | officer_id=%s | ticket=%s | prior_turns=%d | "
         "has_validation=%s",
+        mode,
         officer_id,
         padded_ticket,
         len(prior_history),
@@ -512,6 +546,7 @@ async def copilot_chat(
         message=body.message,
         history=prior_history,
         validation=body.validation,
+        mode=mode,
     )
     if not ok:
         raise HTTPException(
@@ -555,7 +590,7 @@ async def copilot_chat(
     "/{ticket}/copilot/session",
     response_model=CopilotChatResponse,
     responses={
-        400: {"description": "Malformed ticket."},
+        400: {"description": "Malformed ticket or unknown mode."},
     },
     summary="Load the officer's persisted copilot session for a ticket.",
 )
@@ -563,22 +598,38 @@ async def get_copilot_session(
     ticket: Annotated[str, Path(min_length=4, max_length=9, pattern=r"^\d{4,9}$")],
     current_user: Annotated[User, Depends(get_current_admin_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    mode: str = "officer",
 ) -> CopilotChatResponse:
     """
     Return the authenticated officer's persisted copilot conversation for a
     ticket, so the case page can rehydrate the panel after a navigation.
 
+    `mode` ('officer' default | 'signature') picks which transcript to load —
+    the validation copilot and the signature assistant each have their own
+    session row per ticket.
+
     No SIAP call, no ai-engine call — a pure read of `copilot_session`. When
     no session exists yet the history is empty (the page then triggers the
-    auto-generated validation opener). `reply` is the last model turn, if any,
-    purely as a convenience for the client.
+    auto-generated opener). `reply` is the last model turn, if any, purely as
+    a convenience for the client.
     """
     padded_ticket = _validate_ticket(ticket)
+
+    mode = (mode or "officer").strip().lower()
+    if mode not in _ALLOWED_COPILOT_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown copilot mode {mode!r}. "
+                f"Allowed: {sorted(_ALLOWED_COPILOT_MODES)}"
+            ),
+        )
 
     result = await db.execute(
         select(CopilotSession).where(
             CopilotSession.officer_id == current_user.id,
             CopilotSession.ticket == padded_ticket,
+            CopilotSession.mode == mode,
         )
     )
     session = result.scalar_one_or_none()
