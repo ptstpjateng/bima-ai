@@ -34,8 +34,19 @@ import app.models  # noqa: E402,F401
 config = context.config
 
 # Inject the runtime DATABASE_URL.
+#
+# Alembic stores main options in a ConfigParser, whose BasicInterpolation
+# treats `%` as a metacharacter (`%(name)s` = interpolation, `%%` = a
+# literal `%`). Our DATABASE_URL carries a url-encoded password — the `%`
+# of every `%XX` escape (e.g. `%40` for `@`) is read as broken
+# interpolation and `set_main_option` raises ValueError at import time.
+# Doubling `%` → `%%` makes the string interpolation-safe; ConfigParser
+# collapses it back to a single `%` when the value is read out via
+# `get_main_option` / `get_section`, so SQLAlchemy receives the correct URL.
 _settings = get_settings()
-config.set_main_option("sqlalchemy.url", _settings.DATABASE_URL)
+config.set_main_option(
+    "sqlalchemy.url", _settings.DATABASE_URL.replace("%", "%%")
+)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
