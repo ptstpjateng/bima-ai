@@ -16,12 +16,14 @@ Primary LLM: gemma-3-27b-it (default) via Google Generative Language API.
 Persona & lifecycle model: see BIMA_PERSONA.md in the project root.
 """
 
+import json
 import logging
 import os
 import re
 import time
 import uuid
 from collections import OrderedDict, defaultdict
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -615,6 +617,256 @@ async def generate_ai_response(user_id: str, message: str) -> str:
         )
 
 
+async def generate_ai_response_stream(
+    user_id: str, message: str
+) -> AsyncIterator[dict]:
+    """
+    Streaming variant of `generate_ai_response` for the portal web chat.
+
+    Yields a sequence of event dicts (the SSE router turns each into one
+    `data:` line). Event shapes:
+
+      {"event": "delta", "text": "<token chunk>"}   — incremental reply text
+      {"event": "done",  "text": "<full reply>", "elapsed": <float>}
+      {"event": "error", "message": "<user-facing message>"}
+
+    Routing rules (mirrors `generate_ai_response`):
+      - SIAP ticket fast-path, SIAP agent, rate-limit, and demo-placeholder
+        replies are NOT streamed — they're already fast / non-LLM. For those
+        the generator emits a single "delta" carrying the whole reply, then
+        "done". The client renders identically whether it got 1 delta or 200.
+      - Only the plain RAG+Gemma chat path streams token-by-token.
+      - If streaming fails on the primary model, falls back to the
+        non-streaming model ladder (`_call_gemma_with_fallback`) and emits the
+        resulting reply as one "delta" + "done". The model-fallback ladder's
+        semantics are unchanged.
+
+    History is appended exactly once, after the full reply is known — same as
+    the non-streaming path.
+    """
+    from services.rag_service import format_rag_context, query_regulations
+    from services.user_context import fetch_user_context, format_user_context
+
+    t0 = time.monotonic()
+
+    # A4 — rate limit (emit as a normal reply, not an error event)
+    if _is_rate_limited(user_id):
+        reply = (
+            "Mohon tunggu sebentar ya — Anda mengirim terlalu banyak pesan dalam waktu singkat. "
+            "Coba lagi dalam 1 menit. 🙏"
+        )
+        yield {"event": "delta", "text": reply}
+        yield {"event": "done", "text": reply, "elapsed": round(time.monotonic() - t0, 2)}
+        return
+
+    try:
+        import asyncio
+
+        # FAST-PATH 1 — SIAP permit-status lookup (non-streamed; already <2s).
+        from services.siap_client import (
+            extract_ticket,
+            format_not_found_reply,
+            format_status_reply,
+            get_siap_client,
+        )
+
+        siap_ticket = extract_ticket(message)
+        if siap_ticket:
+            siap = get_siap_client()
+            if siap.is_configured():
+                logger.info(
+                    "SIAP status-check fast path (stream) | ticket=%s user_id=%s",
+                    siap_ticket, user_id,
+                )
+                record = await siap.get_status_by_ticket(siap_ticket)
+                reply = (
+                    format_status_reply(record)
+                    if record
+                    else format_not_found_reply(siap_ticket)
+                )
+                _append_history(user_id, message, reply)
+                yield {"event": "delta", "text": reply}
+                yield {"event": "done", "text": reply, "elapsed": round(time.monotonic() - t0, 2)}
+                return
+            logger.info(
+                "SIAP ticket pattern detected but client not configured (stream) — "
+                "falling through to Gemma | ticket=%s user_id=%s",
+                siap_ticket, user_id,
+            )
+
+        # Intent classification + user context.
+        if _is_trivial_message(message):
+            logger.info("Trivial message — skipping intent classifier (stream) | user_id=%s", user_id)
+            intent = {"phase": 1, "kbli_code": None, "detected_scale": None, "scope": "unknown"}
+            user_ctx = await fetch_user_context(user_id)
+        else:
+            intent_task = asyncio.create_task(analyze_user_intent(message))
+            user_ctx_task = asyncio.create_task(fetch_user_context(user_id))
+            intent = await intent_task
+            user_ctx = await user_ctx_task
+
+        raw_kbli = intent.get("kbli_code")
+        if raw_kbli:
+            digits = re.sub(r"\D", "", str(raw_kbli))
+            detected_kbli = digits if 4 <= len(digits) <= 6 else None
+        else:
+            detected_kbli = None
+
+        history = _get_history(user_id)
+        siap_ctx = _extract_siap_context_from_history(history)
+
+        scope = intent.get("scope", "unknown")
+        if scope == "unknown" and _looks_like_siap(message):
+            logger.info("scope upgraded unknown→siap via keyword fallback (stream) | user_id=%s", user_id)
+            scope = "siap"
+
+        # SIAP agent (function-calling) — NOT streamed. Emit whole reply.
+        if scope == "siap":
+            from services.agents.siap_agent import (
+                get_siap_agent,
+                is_configured as _siap_agent_configured,
+            )
+
+            if _siap_agent_configured():
+                logger.info(
+                    "Scope=siap — routing to SIAP agent (stream, non-streamed reply) | user_id=%s",
+                    user_id,
+                )
+                agent_result = await get_siap_agent().chat(message, history=history)
+                reply = agent_result.get("reply", "").strip()
+                if reply:
+                    logger.info(
+                        "SIAP agent reply (stream) | user_id=%s | tool_calls=%d",
+                        user_id, len(agent_result.get("tool_calls", [])),
+                    )
+                    _append_history(user_id, message, reply)
+                    yield {"event": "delta", "text": reply}
+                    yield {"event": "done", "text": reply, "elapsed": round(time.monotonic() - t0, 2)}
+                    return
+                logger.warning(
+                    "SIAP agent returned empty reply (stream) — falling through to RAG | user_id=%s",
+                    user_id,
+                )
+            else:
+                logger.info(
+                    "Scope=siap but SIAP agent not configured (stream) — "
+                    "falling through to RAG path | user_id=%s",
+                    user_id,
+                )
+
+        # Retrieval routing (OSS-RBA / unknown / siap-fallthrough).
+        if scope == "siap":
+            logger.info("Scope=siap fallthrough (stream) — skipping RAG retrieval | user_id=%s", user_id)
+            rag_chunks: list = []
+            rag_query = None
+            n_results = 0
+        else:
+            if detected_kbli:
+                rag_query = f"KBLI {detected_kbli} {message}"
+                n_results = 8
+            elif siap_ctx:
+                rag_query = f"{siap_ctx['license_name']} {message}"
+                if siap_ctx.get("sector"):
+                    rag_query = f"{rag_query} bidang {siap_ctx['sector']}"
+                n_results = 6
+            else:
+                rag_query = message
+                n_results = 4
+
+            rag_chunks = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: query_regulations(rag_query, n_results=n_results)
+            )
+
+        logger.info(
+            "Intent (stream) | phase=%s scope=%s kbli=%s | rag_query=%r | n_results=%d | user_id=%s",
+            intent.get("phase"), scope, detected_kbli, rag_query, n_results, user_id,
+        )
+
+        user_ctx_str = format_user_context(user_ctx)
+        rag_ctx_str = format_rag_context(rag_chunks)
+        has_rag = bool(rag_ctx_str)
+
+        if not has_rag:
+            logger.info("RAG returned 0 usable chunks (stream) — activating fallback prompt | user_id=%s", user_id)
+
+        # Build system instruction: STABLE base prompt first, then per-turn
+        # context. Implicit prompt caching keys on the longest stable prefix,
+        # so _SYSTEM_PROMPT leads.
+        system = _SYSTEM_PROMPT if has_rag else f"{_SYSTEM_PROMPT}\n\n{_FALLBACK_SYSTEM_ADDITION}"
+        system_parts = [system]
+        if user_ctx_str:
+            system_parts.append(user_ctx_str)
+        if rag_ctx_str:
+            system_parts.append(rag_ctx_str)
+        system_instruction = "\n\n".join(system_parts)
+
+        if not _GEMINI_API_KEY:
+            reply = _smart_placeholder(message, user_ctx, rag_chunks)
+            yield {"event": "delta", "text": reply}
+            yield {"event": "done", "text": reply, "elapsed": round(time.monotonic() - t0, 2)}
+            return
+
+        # --- Stream the primary model; fall back to the non-streaming ladder. ---
+        accumulated: list[str] = []
+        streamed_ok = False
+        try:
+            async for delta in _call_gemma_stream(
+                system_instruction, message, history=history,
+                model_override=_GEMINI_MODEL,
+            ):
+                accumulated.append(delta)
+                yield {"event": "delta", "text": delta}
+            streamed_ok = True
+        except Exception:
+            logger.warning(
+                "Primary model streaming failed — falling back to non-streaming ladder | user_id=%s",
+                user_id,
+            )
+
+        if streamed_ok and accumulated:
+            ai_response = "".join(accumulated)
+        else:
+            # Streaming failed (or produced nothing). Use the model-fallback
+            # ladder for a complete, non-streamed reply — semantics unchanged.
+            # The ladder re-tries the primary first, then each fallback.
+            try:
+                ai_response = await _call_gemma_with_fallback(
+                    system_instruction, message, history=history
+                )
+            except Exception:
+                logger.warning(
+                    "Gemma ladder exhausted (stream) — using RAG-based fallback | user_id=%s",
+                    user_id,
+                )
+                reply = _rag_fallback_response(message, rag_chunks)
+                yield {"event": "delta", "text": reply}
+                yield {"event": "done", "text": reply, "elapsed": round(time.monotonic() - t0, 2)}
+                return
+            # Emit the fallback reply as a single delta so a streaming client
+            # still receives the text through the same channel.
+            yield {"event": "delta", "text": ai_response}
+
+        # A3 — Phase 2 CTA enforcement. If the streamed text already lacks the
+        # portal link, emit the CTA as a trailing delta so the client sees it.
+        if intent.get("phase") == 2 and _PORTAL_URL not in ai_response:
+            cta = f"\n\n[Buka Portal BIMA-AI →]({_PORTAL_URL})"
+            ai_response += cta
+            yield {"event": "delta", "text": cta}
+
+        _append_history(user_id, message, ai_response)
+        yield {"event": "done", "text": ai_response, "elapsed": round(time.monotonic() - t0, 2)}
+
+    except Exception:
+        logger.exception("generate_ai_response_stream failed | user_id=%s", user_id)
+        yield {
+            "event": "error",
+            "message": (
+                "Maaf, terjadi gangguan teknis sementara. "
+                "Silakan coba lagi dalam beberapa saat. Terima kasih atas kesabaran Anda."
+            ),
+        }
+
+
 _INTENT_SCHEMA = """{
   "phase": <integer 1, 2, or 3>,
   "kbli_code": <string like "56102" or null if not mentioned>,
@@ -661,8 +913,6 @@ async def analyze_user_intent(message: str) -> dict:
 
     Returns: {"phase": 1|2|3, "kbli_code": str|None, "detected_scale": str|None}
     """
-    import json
-
     if not _GEMINI_API_KEY:
         return {
             "phase": 1,
@@ -890,6 +1140,103 @@ async def _call_gemma(
     except Exception:
         logger.exception("Gemma call failed")
         raise
+
+
+async def _call_gemma_stream(
+    system_prompt: str,
+    user_message: str,
+    *,
+    max_tokens: int = 2048,
+    temperature: float = 0.5,
+    history: list[dict] | None = None,
+    model_override: str | None = None,
+) -> AsyncIterator[str]:
+    """
+    Stream a Gemma/Gemini reply token-by-token via the REST `streamGenerateContent`
+    endpoint (`?alt=sse`). Yields incremental text chunks as they arrive.
+
+    Same payload shape as `_call_gemma` — STABLE content first (systemInstruction),
+    VARIABLE content last (history + current user message) — so implicit prompt
+    caching on Gemini 2.5 models hits the system-prompt prefix maximally.
+
+    Behaviour notes:
+    - Thought parts (thought=True) are filtered out, identical to `_call_gemma`.
+    - Raises `httpx.HTTPStatusError` on a non-2xx status (so the caller's
+      model-ladder fallback can switch models exactly as the non-streaming path
+      does). The status check happens before any chunk is yielded, so a failed
+      primary never leaks a partial reply.
+    - The caller is responsible for accumulating the full text (for history /
+      logging) — this generator only emits deltas.
+    """
+    model_name = (model_override or _GEMINI_MODEL).removeprefix("models/")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:streamGenerateContent?alt=sse&key={_GEMINI_API_KEY}"
+    )
+    # STABLE prefix first (systemInstruction), VARIABLE suffix last (contents).
+    contents: list[dict] = list(history or [])
+    contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+
+    emitted_chars = 0
+    output_tokens = 0
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream("POST", url, json=payload) as resp:
+                # Surface HTTP errors BEFORE yielding anything so the ladder can
+                # fall back cleanly. read() materialises the error body for logs.
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode("utf-8", "replace")[:300]
+                    logger.error(
+                        "Gemma stream HTTP error | status=%s | body=%s",
+                        resp.status_code, body,
+                    )
+                    resp.raise_for_status()
+
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    chunk_raw = line[len("data:"):].strip()
+                    if not chunk_raw or chunk_raw == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(chunk_raw)
+                    except json.JSONDecodeError:
+                        logger.warning("Gemma stream: undecodable SSE chunk skipped")
+                        continue
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        continue
+                    candidate = candidates[0]
+                    parts = candidate.get("content", {}).get("parts", []) or []
+                    delta = "".join(
+                        p.get("text", "") for p in parts
+                        if not p.get("thought", False)
+                    )
+                    usage = data.get("usageMetadata", {})
+                    if usage.get("candidatesTokenCount"):
+                        output_tokens = usage["candidatesTokenCount"]
+                    if delta:
+                        emitted_chars += len(delta)
+                        yield delta
+    except httpx.HTTPStatusError:
+        raise
+    except Exception:
+        logger.exception("Gemma stream call failed | model=%s", model_name)
+        raise
+    finally:
+        logger.info(
+            "Gemma stream done | model=%s | output_tokens=%d | chars=%d",
+            model_name, output_tokens, emitted_chars,
+        )
 
 
 def _strip_json_fences(text: str) -> str:
