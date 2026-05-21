@@ -123,23 +123,42 @@ webhook — validator currently runs the fixture path; (b) per-citizen
 
 ---
 
-## Wave 4 — Multi-ticket + Signing   ·   status: IN PROGRESS (final wave)
+## Wave 4 — Multi-ticket + Signing   ·   status: ✅ COMPLETE (2026-05-21)
 
 **Goal:** officers handle volume; the Head of DPMPTSP signs. **Owner:**
-BIMA Team. **Req 13 partly external** (BSRE digital signature).
+BIMA Team.
 
 | Deliverable | Closes | Status |
 |---|---|---|
 | Inbox ranker + multi-ticket admin UX — `GET /inbox` (urgency = days-open ÷ SOP days) + the `/inbox` page | 14 | ✅ merged `bima-ai#57`, deployed |
 | SOP-as-motivator — calm days-used/SOP progress surface, encouraging copy (never red-shame) | 15 | ✅ merged `bima-ai#57`, deployed |
-| Head-of-DPMPTSP signing — signature-assistant copilot (full chain context) + digital signature via SIAP's BSRE | 13 | 🟡 split — copilot piece buildable; **BSRE cryptographic signing is a real SIAP/DPMPTSP-team dependency** |
+| Head-of-DPMPTSP signing — signature-assistant copilot + a deep-link handoff to SIAP's signing page | 13 | ✅ merged `bima-ai#59`, deployed |
 
-**Req 13 plan:** build the **signature-assistant copilot** — gives the
-Head of DPMPTSP a chat partner with the whole approval chain's context
-(every officer's notes, the validator score, the regulation citations)
-so they review + decide confidently. The actual BSRE-backed
-cryptographic SK signature stays a SIAP+BSRE step — flagged for the
-real team. This delivers ~90% of req 13's value without BSRE.
+**Req 13 — final scope (user-decided):** BIMA does NOT perform the
+cryptographic signature. The signature-assistant copilot synthesises
+the whole approval chain (every officer's notes, validator score,
+regulation citations) for the Head of DPMPTSP, then deep-links them to
+SIAP's own `tanda-tangan-berkas` page to sign there with SIAP's
+existing TTE/BSRE flow. No external dependency — SIAP owns signing,
+BIMA owns the decision support + handoff.
+
+---
+
+# 🎯 ROADMAP COMPLETE — all four waves shipped (2026-05-21)
+
+Waves 1-4 are done. All 16 BIMA Vision requirements are addressed and
+deployed on Beta-SIAP. The vision↔shipped gap is closed.
+
+**Remaining (not roadmap waves — tracked separately):**
+- Follow-up slices honestly deferred during the build: document upload
+  over the APTANA media webhook (guided submission uses the validator
+  fixture path); per-citizen `profile_id` resolution from NIK;
+  auto per-officer desk scoping for the inbox.
+- SIAP-team / DB-admin items: the `bima_readonly` Postgres role (B1);
+  a SIAP role-claim on the admin JWT (hard-gates signature mode);
+  production-SIAP promotion of the write seam (gated per Guardrail 1).
+- Cross-cutting: the deferred SIAP security backlog (C1/C2/C4), the
+  DB-password rotation, demo rehearsal + backup video.
 
 ---
 
