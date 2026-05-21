@@ -49,6 +49,23 @@ Design notes:
   * Reuses `services.rag_service.query_regulations` so officer citations
     come from the same ChromaDB collection the citizen chatbot reads.
 
+Write actions (Wave 2 — officer-in-the-loop):
+  * `forward_case` and `record_decision` are the copilot's two WRITE tools.
+    They call SIAP's `forward` / `decision` endpoints via
+    `services.siap_write_client`. Forwarding a case and — especially —
+    approving/rejecting a licence are accountable OFFICER actions, so the
+    copilot can never fire them on its own. Each write tool takes a
+    `confirmed: bool` argument and REFUSES to execute unless it is true.
+    The system prompt makes `confirmed=true` legal only after the officer
+    has typed an explicit "ya"/"setuju"/"lanjutkan" in the turn immediately
+    before. The copilot DRAFTS the action, the officer confirms, then — and
+    only then — the write fires. See `_REQUIRES_CONFIRMATION` below and the
+    "OFFICER-IN-THE-LOOP" block in the system prompt.
+  * `get_case_log_notes` surfaces the prior-stage notes another desk wrote
+    into SIAP's `license_log` (Vision req #11 — "the next desk sees what
+    the previous desk said"). Forward/decision notes land in that same log,
+    so this tool closes the chained-context loop.
+
 Not yet covered (deferred to Phase 3):
   * `get_doc_summary` returns a canned summary because SIAP does not
     currently expose a file-download endpoint. When that lands, swap the
@@ -75,6 +92,8 @@ from dotenv import load_dotenv
 from services.agents.validator import _normalize_name
 from services.rag_service import query_regulations
 from services.siap_client import get_siap_client
+from services.siap_tools import siap_get_status_timeline
+from services.siap_write_client import get_siap_write_client
 
 load_dotenv()
 
@@ -123,13 +142,46 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "menelusuri dokumen tertentu, membandingkan field (mis. NIK di KTP vs "
     "NIB lewat `compare_field`), atau mencari dasar hukum lewat "
     "`cite_regulation`.\n"
-    "4. Jawab ringkas, dalam Bahasa Indonesia formal, dan langsung ke "
+    "4. Saat petugas membuka kasus, panggil `get_case_log_notes` untuk "
+    "membaca catatan dari meja/tahap sebelumnya. Sampaikan catatan itu "
+    "supaya petugas saat ini tahu apa yang dikatakan petugas sebelumnya.\n"
+    "5. Jawab ringkas, dalam Bahasa Indonesia formal, dan langsung ke "
     "inti — petugas sedang bekerja cepat di antrean berkas.\n\n"
+    "=== ATURAN MUTLAK — TINDAKAN YANG MENGUBAH DATA (forward & decision) ===\n"
+    "Anda memiliki dua tool yang MENGUBAH data di SIAP: `forward_case` "
+    "(meneruskan berkas ke meja berikutnya) dan `record_decision` "
+    "(mencatat keputusan TERIMA/TOLAK izin). Tool-tool ini adalah "
+    "tindakan resmi yang menjadi TANGGUNG JAWAB PETUGAS, bukan tanggung "
+    "jawab Anda. Anda HANYA menyusun draf — petugaslah yang memutuskan.\n\n"
+    "Alur wajib dua langkah:\n"
+    "  LANGKAH 1 (USUL): Ketika petugas meminta meneruskan berkas atau "
+    "menerima/menolak izin, JANGAN langsung memanggil tool. Pertama, "
+    "nyatakan ulang dengan TEPAT apa yang akan dilakukan: tiket mana, "
+    "tindakan apa (teruskan / TERIMA / TOLAK), dan isi catatannya. Lalu "
+    "minta petugas mengonfirmasi secara eksplisit, mis. 'Ketik \"ya\" "
+    "untuk menjalankan.'\n"
+    "  LANGKAH 2 (EKSEKUSI): Panggil tool dengan `confirmed=true` HANYA "
+    "jika pesan petugas TEPAT SEBELUM giliran ini berisi konfirmasi "
+    "eksplisit ('ya', 'setuju', 'lanjutkan', 'benar', 'ok jalankan') "
+    "atas usulan yang persis sama.\n\n"
+    "DILARANG KERAS:\n"
+    "  - Memanggil `forward_case`/`record_decision` dengan `confirmed=true` "
+    "tanpa konfirmasi eksplisit petugas di giliran sebelumnya.\n"
+    "  - Menganggap permintaan awal petugas ('tolong teruskan berkas ini') "
+    "sebagai konfirmasi. Itu adalah PERMINTAAN, bukan konfirmasi — Anda "
+    "tetap wajib menyusun draf dan menunggu jawaban 'ya'.\n"
+    "  - Mengarang isi catatan keputusan. Catatan harus berasal dari "
+    "petugas atau dari temuan validasi yang nyata.\n"
+    "Jika ragu apakah petugas sudah mengonfirmasi, ANGGAP BELUM: panggil "
+    "tool dengan `confirmed=false` (itu hanya akan mengembalikan draf) "
+    "atau minta konfirmasi ulang. Meneruskan/memutuskan berkas tanpa izin "
+    "petugas adalah kesalahan serius.\n\n"
     "Konteks sesi:\n"
     "- Tiket yang sedang dianalisis: {ticket}\n"
     "- Mulailah dengan `get_validation_summary` untuk melihat temuan "
-    "validator. Gunakan `get_case_full` bila perlu konteks SIAP, lalu "
-    "tool lain sesuai pertanyaan petugas."
+    "validator. Gunakan `get_case_full` bila perlu konteks SIAP, "
+    "`get_case_log_notes` untuk catatan tahap sebelumnya, lalu tool lain "
+    "sesuai pertanyaan petugas."
 )
 
 
@@ -350,6 +402,295 @@ def cite_regulation(query: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Chained-context read tool — Vision req #11.
+#
+# When an officer opens a case, the next desk must see what the previous desk
+# said. SIAP's forward/decision endpoints append their notes to
+# `ptsp.license_log`; `siap_get_status_timeline` already reads that log
+# (per-step `status` + `description` + owning desk). This tool reuses it and
+# reshapes the result into a clean "prior-stage notes" view the model can
+# narrate. We do NOT re-implement the SQL — siap_tools owns that.
+# ---------------------------------------------------------------------------
+
+# license_log statuses that carry an officer-written note worth surfacing.
+_NOTE_BEARING_STATUSES = {"APPROVED", "REJECTED", "SUBMITTED", "VERIFIKASI", "DITOLAK"}
+
+
+async def get_case_log_notes(ticket: str) -> dict:
+    """
+    Return the chain of notes prior desks wrote into SIAP's `license_log`
+    for this case, so the officer now holding the file sees the handover
+    context (Vision req #11).
+
+    Built on `siap_get_status_timeline` — every forward/decision note lands
+    in `license_log`, which that tool already reads. We reshape its step
+    list into `{step, status, owner_desk, note, entered_on}` entries,
+    oldest-first, dropping steps with no note text.
+
+    Returns:
+      {
+        "found": bool,
+        "ticket": str,
+        "request_id": int | None,   # also the id the write tools need
+        "note_count": int,
+        "notes": [ {step, status, owner_desk, note, entered_on}, ... ],
+      }
+    On miss / SIAP unavailable: found=False with a `note` field. Never raises.
+    """
+    timeline = await siap_get_status_timeline(ticket)
+    if not timeline.get("found"):
+        return {
+            "found": False,
+            "ticket": ticket,
+            "note": timeline.get(
+                "note", "Riwayat catatan untuk tiket ini tidak tersedia."
+            ),
+        }
+
+    notes: list[dict[str, Any]] = []
+    for step in timeline.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        desc = str(step.get("step", "") or "").strip()
+        status = str(step.get("status", "") or "").strip().upper()
+        # The step `description` from license_log is the officer's note.
+        # Skip purely structural rows with no human text.
+        if not desc or desc.lower() in {"tahapan", "-"}:
+            continue
+        notes.append({
+            "step": desc,
+            "status": status,
+            "owner_desk": step.get("owner_desk"),
+            "note": desc,
+            "entered_on": step.get("entered_on"),
+        })
+
+    return {
+        "found": True,
+        "ticket": timeline.get("no_tiket", ticket),
+        "request_id": timeline.get("request_id"),
+        "note_count": len(notes),
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Write tools — Wave 2. OFFICER-IN-THE-LOOP.
+#
+# `forward_case` and `record_decision` are the only side-effecting tools in
+# the copilot. They reach SIAP through `services.siap_write_client`. The hard
+# guard against an unconfirmed write is a `confirmed: bool` argument that is
+# checked HERE, in Python — it does not rely on the model behaving. When
+# `confirmed` is false (or absent) the tool returns a DRAFT and performs no
+# write at all. The model is told (system prompt) that `confirmed=true` is
+# only legal right after an explicit officer "ya"/"setuju". So a write needs
+# BOTH: the model must pass confirmed=true AND, even if it wrongly does so,
+# the draft path is the default — there is no code path that writes without
+# `confirmed is True`.
+#
+# The write endpoints address a request by numeric `request_id`, not by
+# ticket. We resolve it from the ticket via `get_case_log_notes` (which wraps
+# siap_get_status_timeline) so a caller only ever needs the ticket.
+# ---------------------------------------------------------------------------
+
+# Tool names that MUST receive an explicit confirmation. Referenced by the
+# chat loop for defence-in-depth logging.
+_REQUIRES_CONFIRMATION = {"forward_case", "record_decision"}
+
+
+async def _resolve_request_id(ticket: str) -> tuple[Optional[int], Optional[str]]:
+    """Resolve a SIAP `request_id` from a ticket. Returns (request_id, error).
+
+    On success error is None; on failure request_id is None and error holds
+    an Indonesian explanation the write tool can return to the model.
+    """
+    log = await get_case_log_notes(ticket)
+    if not log.get("found"):
+        return None, log.get(
+            "note", f"Tidak dapat menemukan permohonan untuk tiket {ticket}."
+        )
+    request_id = log.get("request_id")
+    if request_id is None:
+        return None, (
+            f"Permohonan untuk tiket {ticket} ditemukan tetapi request_id "
+            "tidak tersedia — tindakan tulis tidak bisa dijalankan."
+        )
+    return int(request_id), None
+
+
+async def forward_case(
+    ticket: str,
+    note: str = "",
+    confirmed: bool = False,
+) -> dict:
+    """
+    Forward a case to the NEXT approval desk in SIAP.
+
+    OFFICER-IN-THE-LOOP: this tool only performs the write when
+    `confirmed is True`. With `confirmed` false/absent it returns a DRAFT
+    (`{"executed": False, "draft": {...}}`) describing exactly what would
+    happen — the copilot must show that draft and get an explicit officer
+    "ya" before calling again with `confirmed=true`.
+
+    Args:
+      ticket: the 9-digit SIAP ticket of the case to forward.
+      note: optional officer note (max 1000 chars) recorded into
+        `license_log` so the next desk sees why the file moved.
+      confirmed: MUST be true to actually forward. The system prompt makes
+        this legal only directly after an explicit officer confirmation.
+
+    Returns a structured dict — never raises:
+      draft  → {"executed": False, "draft": {...}, "needs_confirmation": True}
+      done   → {"executed": True, "ok": True, "result": {...}}
+      failed → {"executed": True, "ok": False, "note": "..."}
+    """
+    ticket = (ticket or "").strip()
+    note = (note or "").strip()
+
+    if not confirmed:
+        # DRAFT path — no write. This is the default and the safe path.
+        return {
+            "executed": False,
+            "needs_confirmation": True,
+            "draft": {
+                "action": "forward_case",
+                "ticket": ticket,
+                "note": note,
+                "description": (
+                    f"Akan meneruskan berkas tiket {ticket} ke meja "
+                    f"persetujuan berikutnya di SIAP"
+                    + (f", dengan catatan: \"{note}\"." if note else ".")
+                ),
+            },
+            "instruction_to_model": (
+                "Tampilkan draf ini kepada petugas dan minta konfirmasi "
+                "eksplisit ('ya'). JANGAN memanggil forward_case dengan "
+                "confirmed=true sebelum petugas menjawab ya."
+            ),
+        }
+
+    write_client = get_siap_write_client()
+    if not write_client.is_configured():
+        return {
+            "executed": False,
+            "ok": False,
+            "note": (
+                "Integrasi tulis SIAP belum dikonfigurasi (SIAP_WRITE_API_TOKEN "
+                "kosong). Berkas tidak diteruskan."
+            ),
+        }
+
+    request_id, error = await _resolve_request_id(ticket)
+    if error is not None:
+        return {"executed": True, "ok": False, "note": error}
+
+    logger.info(
+        "Copilot WRITE forward_case | ticket=%s | request_id=%s | confirmed=True",
+        ticket, request_id,
+    )
+    result = await write_client.forward_request(request_id, note=note or None)
+    return {
+        "executed": True,
+        "ok": bool(result.get("ok")),
+        "result": result.get("data") if result.get("ok") else None,
+        "note": result.get("note", ""),
+    }
+
+
+async def record_decision(
+    ticket: str,
+    decision: str,
+    notes: str,
+    confirmed: bool = False,
+) -> dict:
+    """
+    Record an officer's APPROVE or REJECT decision on a case in SIAP.
+
+    OFFICER-IN-THE-LOOP: this is the most accountable action the copilot
+    can take, so the guard is the same as `forward_case` — the write only
+    happens when `confirmed is True`. With `confirmed` false/absent it
+    returns a DRAFT and writes NOTHING. A `rejected` decision routes the
+    case back to the previous desk on the SIAP side.
+
+    Args:
+      ticket: the 9-digit SIAP ticket of the case.
+      decision: "approved" (terima) or "rejected" (tolak).
+      notes: the officer's reasoning — REQUIRED, max 1000 chars. This is
+        written into `license_log` so the next/previous desk sees it.
+      confirmed: MUST be true to actually record the decision. Legal only
+        directly after an explicit officer confirmation (system prompt).
+
+    Returns a structured dict — never raises:
+      draft  → {"executed": False, "draft": {...}, "needs_confirmation": True}
+      done   → {"executed": True, "ok": True, "result": {...}}
+      failed → {"executed": True, "ok": False, "note": "..."}
+    """
+    ticket = (ticket or "").strip()
+    decision_norm = (decision or "").strip().lower()
+    notes = (notes or "").strip()
+
+    decision_label = {"approved": "MENERIMA", "rejected": "MENOLAK"}.get(
+        decision_norm, decision_norm.upper() or "(tidak ditentukan)"
+    )
+
+    if not confirmed:
+        # DRAFT path — no write. Safe default.
+        return {
+            "executed": False,
+            "needs_confirmation": True,
+            "draft": {
+                "action": "record_decision",
+                "ticket": ticket,
+                "decision": decision_norm,
+                "notes": notes,
+                "description": (
+                    f"Akan mencatat keputusan {decision_label} izin untuk "
+                    f"tiket {ticket} di SIAP"
+                    + (f", dengan alasan: \"{notes}\"." if notes else
+                       " (PERINGATAN: alasan keputusan masih kosong).")
+                ),
+            },
+            "instruction_to_model": (
+                "Tampilkan draf keputusan ini kepada petugas dan minta "
+                "konfirmasi eksplisit ('ya'). Keputusan izin bersifat "
+                "final dan menjadi tanggung jawab petugas — JANGAN "
+                "memanggil record_decision dengan confirmed=true sebelum "
+                "petugas menjawab ya."
+            ),
+        }
+
+    write_client = get_siap_write_client()
+    if not write_client.is_configured():
+        return {
+            "executed": False,
+            "ok": False,
+            "note": (
+                "Integrasi tulis SIAP belum dikonfigurasi (SIAP_WRITE_API_TOKEN "
+                "kosong). Keputusan tidak dicatat."
+            ),
+        }
+
+    request_id, error = await _resolve_request_id(ticket)
+    if error is not None:
+        return {"executed": True, "ok": False, "note": error}
+
+    logger.info(
+        "Copilot WRITE record_decision | ticket=%s | request_id=%s | "
+        "decision=%s | confirmed=True",
+        ticket, request_id, decision_norm,
+    )
+    result = await write_client.record_decision(
+        request_id, decision=decision_norm, notes=notes
+    )
+    return {
+        "executed": True,
+        "ok": bool(result.get("ok")),
+        "result": result.get("data") if result.get("ok") else None,
+        "note": result.get("note", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Function declarations for Gemini.
 #
 # Gemini's `functionDeclarations` accepts the OpenAPI 3.0 subset (same family
@@ -461,6 +802,106 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "get_case_log_notes",
+        "description": (
+            "Ambil rangkaian catatan dari meja/tahap SEBELUMNYA pada riwayat "
+            "berkas (license_log SIAP). Gunakan saat petugas baru membuka "
+            "kasus agar tahu apa yang dikatakan petugas sebelumnya — konteks "
+            "serah-terima antar meja."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticket": {
+                    "type": "string",
+                    "description": "Nomor tiket SIAP, 9 digit (mis. '000077591').",
+                },
+            },
+            "required": ["ticket"],
+        },
+    },
+    {
+        "name": "forward_case",
+        "description": (
+            "TINDAKAN MENGUBAH DATA. Teruskan berkas ke meja persetujuan "
+            "berikutnya di SIAP. WAJIB pola dua langkah: panggil pertama "
+            "dengan confirmed=false untuk mendapatkan DRAF, tampilkan draf "
+            "itu ke petugas, lalu panggil lagi dengan confirmed=true HANYA "
+            "setelah petugas menjawab 'ya'/'setuju' secara eksplisit di "
+            "giliran tepat sebelumnya. Permintaan awal petugas BUKAN "
+            "konfirmasi."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticket": {
+                    "type": "string",
+                    "description": "Nomor tiket SIAP, 9 digit, berkas yang diteruskan.",
+                },
+                "note": {
+                    "type": "string",
+                    "description": (
+                        "Catatan petugas (opsional, maks 1000 karakter) yang "
+                        "dicatat ke license_log agar dibaca meja berikutnya."
+                    ),
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true HANYA setelah petugas mengonfirmasi "
+                        "eksplisit. Jika false/diabaikan, tool hanya "
+                        "mengembalikan draf dan tidak mengubah data apa pun."
+                    ),
+                },
+            },
+            "required": ["ticket"],
+        },
+    },
+    {
+        "name": "record_decision",
+        "description": (
+            "TINDAKAN MENGUBAH DATA — paling penting. Catat keputusan "
+            "petugas TERIMA (approved) atau TOLAK (rejected) atas izin di "
+            "SIAP. WAJIB pola dua langkah: panggil pertama dengan "
+            "confirmed=false untuk DRAF, tampilkan ke petugas, lalu panggil "
+            "lagi dengan confirmed=true HANYA setelah petugas menjawab 'ya' "
+            "secara eksplisit di giliran tepat sebelumnya. Keputusan izin "
+            "adalah tanggung jawab petugas, bukan BIMA."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticket": {
+                    "type": "string",
+                    "description": "Nomor tiket SIAP, 9 digit.",
+                },
+                "decision": {
+                    "type": "string",
+                    "description": (
+                        "Keputusan: 'approved' (terima) atau 'rejected' (tolak)."
+                    ),
+                },
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Alasan/keterangan keputusan dari petugas — WAJIB "
+                        "diisi, maks 1000 karakter. Jangan dikarang; ambil "
+                        "dari petugas atau dari temuan validasi nyata."
+                    ),
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true HANYA setelah petugas mengonfirmasi "
+                        "eksplisit. Jika false/diabaikan, tool hanya "
+                        "mengembalikan draf dan tidak mengubah data apa pun."
+                    ),
+                },
+            },
+            "required": ["ticket", "decision", "notes"],
+        },
+    },
 ]
 
 
@@ -472,6 +913,9 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "get_doc_summary": get_doc_summary,
     "compare_field": compare_field,
     "cite_regulation": cite_regulation,
+    "get_case_log_notes": get_case_log_notes,
+    "forward_case": forward_case,
+    "record_decision": record_decision,
 }
 
 
@@ -722,6 +1166,18 @@ class OfficerCopilot:
                         "Copilot tool call | round=%d | name=%s | args=%s",
                         round_idx, name, _result_preview(args, 160),
                     )
+                    # Defence-in-depth audit line: a confirmed write is an
+                    # accountable action — log it loudly, separately from the
+                    # generic tool-call line, with PII-light args only.
+                    if name in _REQUIRES_CONFIRMATION and args.get("confirmed") is True:
+                        logger.warning(
+                            "Copilot CONFIRMED WRITE | name=%s | ticket=%s | "
+                            "decision=%s | note_len=%d",
+                            name,
+                            args.get("ticket", "<none>"),
+                            args.get("decision", "-"),
+                            len(str(args.get("notes") or args.get("note") or "")),
+                        )
                     result = await _invoke_tool(name, args)
                     preview = _result_preview(result)
                     logger.info(
