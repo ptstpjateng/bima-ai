@@ -95,9 +95,9 @@ Wave 1's forward endpoint + state events.
 
 | Deliverable | Closes | Status |
 |---|---|---|
-| Workflow orchestrator — state machine over SIAP's `license_approval_step` chain | 7, 16 | ⚪ |
-| Wire the notification dispatcher to real triggers: `new_case` on forward, `citizen_progress` on stage change, `sla_warn` on threshold | 7, 12 | ⚪ |
-| Forward-with-context — officer copilot gains a "forward to next stage" action carrying prior notes | 10, 11 | ⚪ |
+| Wire the notification dispatcher to real triggers — transparency poller over SIAP's `/license-request/changes` feed (`citizen_progress` / `citizen_completed` / `citizen_needs_fix`) | 7, 12 | 🔄 merged `bima-ai#50`, deployed **dormant** — awaiting arming (mint `events:read` token, flip flag) |
+| Workflow orchestrator — state machine over SIAP's `license_approval_step` chain | 7, 16 | ⚪ next slice |
+| Forward-with-context — officer copilot gains a "forward to next stage" action carrying prior notes | 10, 11 | ⚪ next slice |
 
 ---
 
