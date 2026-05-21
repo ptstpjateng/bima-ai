@@ -103,20 +103,27 @@ and citizens get proactive WhatsApp updates at every stage.
 
 ---
 
-## Wave 3 — Guided Submission   ·   status: NEXT (unblocked)
+## Wave 3 — Guided Submission   ·   status: ✅ COMPLETE (2026-05-21)
 
 **Goal:** BIMA walks a citizen through filing a license application end
-to end. **Owner:** BIMA Team. **Needs:** Wave 1's create endpoint.
+to end. **Owner:** BIMA Team.
 
 | Deliverable | Closes | Status |
 |---|---|---|
-| Conversational form-fill — collect required fields + documents over WhatsApp / portal, license-specific (uses `siap_get_requirements`) | 4 | ⚪ |
-| Pre-submit validation gate — runs the existing validator (req 6); only a clean score submits | 4 | ⚪ |
-| Submit via the SIAP create endpoint; return the citizen their ticket | 4 | ⚪ |
+| Conversational form-fill — `guided_submission.py` state machine (resolve license → collect fields → review), per-user multi-turn state, intent-detected, routed via FAST-PATH 0 in `ai_handler.py` | 4 | ✅ merged `bima-ai#55`, **armed + live** |
+| Pre-submit validation gate — runs the validator; only a `ready` score submits | 4, 6 | ✅ live |
+| Submit via the SIAP create endpoint; return the citizen their ticket + portal track link | 4 | ✅ live (`submission:create` token wired) |
+
+**Wave 3 done.** A citizen WhatsApps "saya mau ajukan izin…" and BIMA
+resolves the license, walks them through the requirements, validates,
+submits to SIAP, and returns a ticket. **Two follow-up slices deferred
+(reported, not hidden):** (a) document upload over the APTANA media
+webhook — validator currently runs the fixture path; (b) per-citizen
+`profile_id` resolution from NIK — pinned to a Beta-SIAP test profile.
 
 ---
 
-## Wave 4 — Multi-ticket + Signing   ·   status: BLOCKED ON WAVE 1-2
+## Wave 4 — Multi-ticket + Signing   ·   status: NEXT (final wave)
 
 **Goal:** officers handle volume; the Head of DPMPTSP signs. **Owner:**
 BIMA Team + SIAP Team. **Partly external** (BSRE digital signature).
