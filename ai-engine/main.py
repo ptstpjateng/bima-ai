@@ -18,7 +18,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from routers import aptana, copilot, validator, vectorize, webhooks
+from routers import aptana, copilot, notify, validator, vectorize, webhooks
 
 # ---------------------------------------------------------------------------
 # Logging – structured, to stdout so it flows into any log aggregator.
@@ -164,6 +164,7 @@ app.include_router(vectorize.router, tags=["Vectorize"])
 app.include_router(aptana.router, tags=["APTANA WhatsApp"])
 app.include_router(validator.router)
 app.include_router(copilot.router)
+app.include_router(notify.router)
 
 
 # ---------------------------------------------------------------------------
