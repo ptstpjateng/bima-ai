@@ -227,7 +227,7 @@ async def siap_get_requirements(
     if not is_siap_db_configured():
         return {
             "found": False,
-            "note": "Integrasi basis data SIAP belum dikonfigurasi (SIAP_DB_URL kosong).",
+            "note": "Integrasi basis data SIAP belum dikonfigurasi pada lingkungan ini.",
         }
     if license_id is None and not (license_name and license_name.strip()):
         return {
@@ -340,7 +340,7 @@ async def siap_get_status(ticket: str) -> dict:
     if not is_siap_db_configured():
         return {
             "found": False,
-            "note": "Integrasi basis data SIAP belum dikonfigurasi (SIAP_DB_URL kosong).",
+            "note": "Integrasi basis data SIAP belum dikonfigurasi pada lingkungan ini.",
         }
     digits = re.sub(r"\D", "", ticket or "")
     if not digits:
@@ -451,7 +451,7 @@ async def siap_get_status_timeline(ticket: str) -> dict:
     if not is_siap_db_configured():
         return {
             "found": False,
-            "note": "Integrasi basis data SIAP belum dikonfigurasi (SIAP_DB_URL kosong).",
+            "note": "Integrasi basis data SIAP belum dikonfigurasi pada lingkungan ini.",
         }
     digits = re.sub(r"\D", "", ticket or "")
     if not digits:
@@ -546,7 +546,7 @@ async def siap_lookup_license(query: str, limit: int = _LOOKUP_DEFAULT_LIMIT) ->
     if not is_siap_db_configured():
         return {
             "found": False,
-            "note": "Integrasi basis data SIAP belum dikonfigurasi (SIAP_DB_URL kosong).",
+            "note": "Integrasi basis data SIAP belum dikonfigurasi pada lingkungan ini.",
         }
     q = (query or "").strip()
     if not q:
@@ -643,7 +643,7 @@ async def siap_list_licenses_by_sektor(sektor: str) -> dict:
     if not is_siap_db_configured():
         return {
             "found": False,
-            "note": "Integrasi basis data SIAP belum dikonfigurasi (SIAP_DB_URL kosong).",
+            "note": "Integrasi basis data SIAP belum dikonfigurasi pada lingkungan ini.",
         }
     s = (sektor or "").strip()
     if not s:
