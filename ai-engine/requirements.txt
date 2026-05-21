@@ -5,6 +5,9 @@ pydantic-settings==2.7.1
 python-dotenv==1.0.1
 requests==2.32.3
 httpx==0.28.1
+# Direct Postgres driver for the SIAP tool layer (services/siap_db.py).
+# Read-only reads against dbsiapjateng — same driver admin-api uses.
+asyncpg>=0.30.0,<0.31
 chromadb==0.6.3
 # Pinned to avoid huggingface_hub API breakage (is_offline_mode removed in >=0.28)
 huggingface-hub==0.27.0
