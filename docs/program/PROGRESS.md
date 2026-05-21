@@ -9,6 +9,60 @@
 
 ---
 
+## Cycle 3 — 2026-05-21 · "Wave 1 COMPLETE — state events + scoped tokens"
+
+**Type:** PM cycle, run locally.
+
+**THINK.** Wave 1's three write endpoints were merged + live. Remaining:
+the state-event feed + scoped/expiring tokens.
+
+**PLAN.** Delegate the Wave 1 final slice to the SIAP Team.
+
+**DELEGATE → SIAP Team** (`ptstpjateng/SIAP#23`):
+- **`GET /api/v1/license-request/changes`** — `changed-since` event
+  feed over `ptsp.license_log`. Cursor is `?since=<log_id>` (the
+  monotonic, gap-free log sequence — chosen over a timestamp cursor
+  because `created_on` can collide). Returns change rows joined to
+  `license_request` + `license_approval_step`; `limit` 1-500.
+  Scoped to a new `events:read` ability.
+- **Scoped + expiring Sanctum tokens** — `config/sanctum.php`
+  `expiration` set to 90 days (was `null` — closes audit S1; note:
+  this is the effective lifetime of ALL SIAP Sanctum tokens now,
+  including officer login tokens — a security improvement). New
+  `php artisan bima:issue-token` command mints a scoped token
+  (abilities: submission:create / workflow:advance / decision:draft /
+  events:read), refuses wildcard.
+- 9 new feature tests; full `Api/V1` suite 29 passing, 143 assertions.
+
+**REVIEW.** Diff read: parameterised query builder, validated, scoped
+ability, no raw SQL. Passes.
+
+**REPORT.** `SIAP#23` merged → `main`. Deployed to Beta-SIAP via the
+now-working **deploy-key `git pull`** flow (the VPS blocks outbound
+port 22; the SIAP remote was switched to SSH-over-443 — `git pull`
+authenticates with the read-only deploy key, the rsync band-aid is
+retired).
+
+### Roadmap movement
+- **Wave 1: ✅ COMPLETE.** All 5 endpoint/token slices merged + live on
+  Beta-SIAP. Only deferred item: the `bima_readonly` Postgres role
+  (B1) — a DB-admin task.
+- **Wave 2 unblocked** — workflow + transparency can now begin.
+
+### Infra
+- VPS→private-SIAP-repo deploy key now working over SSH port 443.
+  Future SIAP deploys: `git pull` + `docker compose up -d --build
+  siap-beta`. rsync retired.
+
+### Next cycle
+Wave 2, BIMA Team — the transparency-notification poller: consume
+SIAP's new `/license-request/changes` feed, detect stage advances,
+fire `notify(citizen_progress)` to the citizen. Connects the SIAP
+event feed (#23) to the notification dispatcher (already armed) —
+makes req 12 real.
+
+---
+
 ## Cycle 2 — 2026-05-21 · "Wave 1 write seam — all 3 endpoints live on Beta-SIAP"
 
 **Type:** PM cycle, run locally.

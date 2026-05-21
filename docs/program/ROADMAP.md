@@ -59,22 +59,25 @@ Wave 1 (write seam) ──► Wave 2 (workflow + notifications)
 
 ---
 
-## Wave 1 — The Write Seam   ·   status: IN PROGRESS
+## Wave 1 — The Write Seam   ·   status: ✅ COMPLETE (2026-05-21)
 
 **Goal:** SIAP can be written to, safely and contractually. **Owner:**
-SIAP Team builds; Integration Agent defines the contract. **All on
-Beta-SIAP.**
+SIAP Team built; **All on Beta-SIAP.**
 
-The full 3-endpoint contract is designed — see `docs/bima-write-seam.md`
-in the SIAP repo (delivered with PR #21).
+The full contract is in `docs/bima-write-seam.md` in the SIAP repo.
 
 | Deliverable | Closes / unblocks | Status |
 |---|---|---|
 | `POST /api/v1/license-request` — create a new license request | req 4 | ✅ merged `SIAP#21`, live on Beta-SIAP |
 | `POST /api/v1/license-request/{id}/forward` — advance the approval step | reqs 7, 10 | ✅ merged `SIAP#22`, live on Beta-SIAP |
-| `POST /api/v1/license-request/{id}/decision` — record an officer's decision + notes | reqs 8, 11 | ✅ merged `SIAP#22`, live on Beta-SIAP (rejections route to the previous desk) |
-| State-change events — `changed-since` polling endpoint over `license_log` (preferred over webhooks) | reqs 7, 12 | ⚪ next slice |
-| Scoped, expiring Sanctum tokens (per-endpoint abilities) + a read-only Postgres role | audit S1, B1 | ⚪ next slice (ability *check* already wired in #21/#22) |
+| `POST /api/v1/license-request/{id}/decision` — record an officer's decision + notes | reqs 8, 11 | ✅ merged `SIAP#22`, live (rejections route to the previous desk) |
+| `GET /api/v1/license-request/changes` — `changed-since` state-event feed (`log_id` cursor, `events:read` ability) | reqs 7, 12 | ✅ merged `SIAP#23` |
+| Scoped, expiring Sanctum tokens — 90-day expiry + `php artisan bima:issue-token` (abilities: submission:create / workflow:advance / decision:draft / events:read) | audit S1 | ✅ merged `SIAP#23` |
+| Read-only `bima_readonly` Postgres role (DB-layer defence in depth) | audit B1 | ⚪ deferred — slice 6, documented in `bima-write-seam.md` §5 |
+
+**Wave 1 done.** BIMA can now create, advance, decide on, and poll
+SIAP license requests. The read-only Postgres role (B1) is the only
+deferred item — a DB-admin task, not endpoint work.
 
 **Dependencies:** none — SIAP Team can start immediately on Beta-SIAP.
 **Verification:** Integration Agent runs an end-to-end create→forward→
@@ -84,7 +87,7 @@ explicit per-change user sign-off.
 
 ---
 
-## Wave 2 — Workflow + Transparency   ·   status: BLOCKED ON WAVE 1
+## Wave 2 — Workflow + Transparency   ·   status: IN PROGRESS (unblocked 2026-05-21)
 
 **Goal:** a license request moves through SIAP's approval chain with
 BIMA notifying everyone at each step. **Owner:** BIMA Team. **Needs:**
