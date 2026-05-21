@@ -2,12 +2,27 @@
 Officer Copilot HTTP surface.
 
 POST /v1/copilot/chat
-  Internal endpoint called by admin-api (`/case/{ticket}/copilot/chat`,
-  to be added in a follow-up) on behalf of the bima-admin case page.
-  Runs one user-message turn through `OfficerCopilot.chat`, executing
-  Gemini function-calling rounds as needed, and returns the final
-  Indonesian reply plus a transcript of tool calls (for transparency
-  in the admin UI side panel).
+  Internal endpoint called by admin-api (`/case/{ticket}/copilot/chat`)
+  on behalf of the bima-admin case page. Runs one user-message turn
+  through `OfficerCopilot.chat`, executing Gemini function-calling rounds
+  as needed, and returns the final Indonesian reply plus a transcript of
+  tool calls (for transparency in the admin UI side panel).
+
+Stateless by design:
+  This endpoint keeps NO conversation memory. admin-api owns the
+  `copilot_session` table (one row per officer+ticket): it loads the
+  prior `history`, sends it here, and persists the `history` we return.
+  See [[Decisions]] §22 — admin-api owns durability, ai-engine owns the
+  agent logic.
+
+`officer_id` is for masked logging + audit only. admin-api derives it
+from the authenticated officer's JWT (`get_current_admin_user`) — it is
+NEVER a value an end user can set. The copilot does not use it for any
+access decision (admin-api already scoped the session before calling us).
+
+`validation` is the BIMA validator result for the ticket, computed by
+admin-api and injected so the `get_validation_summary` tool can surface
+the score + issues without a second Gemini Vision pass.
 
 Auth: gated by X-Internal-Key — mirrors the validator and tracking
 endpoints. The endpoint is *not* meant to be exposed to citizens.
@@ -67,12 +82,31 @@ class CopilotChatRequest(BaseModel):
             "(typically 9-digit zero-padded)."
         ),
     )
+    officer_id: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "ID of the officer this copilot session belongs to. Supplied by "
+            "admin-api from the authenticated officer's JWT — used here for "
+            "masked logging/audit only, never for an access decision."
+        ),
+    )
     message: str = Field(..., min_length=1, max_length=_MAX_MESSAGE_CHARS)
     history: list[HistoryTurn] = Field(
         default_factory=list,
         description=(
             "Prior turns in the conversation. The endpoint is stateless, "
-            "so the caller is responsible for echoing it back each turn."
+            "so the caller (admin-api) is responsible for echoing it back "
+            "each turn from the `copilot_session` table."
+        ),
+    )
+    validation: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "BIMA validator result for `ticket` (score, score_percent, "
+            "status, summary, issues), computed by admin-api. Injected so "
+            "the `get_validation_summary` tool can surface it without "
+            "re-running Gemini Vision. Omit when no validation exists yet."
         ),
     )
 
@@ -121,8 +155,13 @@ async def copilot_chat_endpoint(
     history_payload = [{"role": t.role, "text": t.text} for t in body.history]
 
     logger.info(
-        "Copilot chat | ticket=%s | message_len=%d | history_turns=%d",
-        body.ticket, len(body.message), len(history_payload),
+        "Copilot chat | ticket=%s | officer_id=%s | message_len=%d | "
+        "history_turns=%d | has_validation=%s",
+        body.ticket,
+        body.officer_id if body.officer_id is not None else "<none>",
+        len(body.message),
+        len(history_payload),
+        body.validation is not None,
     )
 
     # Narrow exception handling per QA finding H4 (2026-05-19) — the prior
@@ -138,6 +177,8 @@ async def copilot_chat_endpoint(
             message=body.message,
             ticket=body.ticket,
             history=history_payload,
+            officer_id=body.officer_id,
+            validation=body.validation,
         )
     except httpx.TimeoutException as exc:
         logger.warning("Copilot timeout | ticket=%s | err=%s", body.ticket, exc)

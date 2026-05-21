@@ -1,11 +1,13 @@
 """
-Officer-facing case detail + validator proxy.
+Officer-facing case detail + validator proxy + copilot.
 
-Two endpoints, both JWT-gated (officers/admins, not service-to-service):
+Endpoints, all JWT-gated (officers/admins, not service-to-service):
 
-    GET  /case/{ticket}            — fetch SIAP case data (cheap, page header)
-    POST /case/{ticket}/validate   — run BIMA validator on attached docs,
-                                     return combined SIAP record + validation
+    GET  /case/{ticket}              — fetch SIAP case data (cheap, page header)
+    POST /case/{ticket}/validate     — run BIMA validator on attached docs,
+                                       return combined SIAP record + validation
+    POST /case/{ticket}/copilot/chat — run one Officer Copilot turn against a
+                                       persistent per-officer-per-case session
 
 Why split GET from POST:
   The bima-admin case page renders SIAP fields immediately on load (header,
@@ -19,6 +21,13 @@ Auth contrast with `/tracking/{ticket}`:
   triaging the queue from the admin console — JWT-gated with admin role.
   Same SIAP read underneath, different trust boundary.
 
+Copilot session ownership (Decisions §22):
+  admin-api owns the `copilot_session` table — one row per (officer, ticket).
+  ai-engine's `/v1/copilot/chat` is stateless. The `/copilot/chat` endpoint
+  here loads the prior history, calls ai-engine, and persists the returned
+  history. SECURITY: `officer_id` is ALWAYS `current_user.id` from the
+  verified JWT — an officer can only ever load their own session.
+
 Sprint D scope:
   Demo fixture passthrough (`?demo_fixture=clean|name_mismatch|nik_typo`) so
   rehearsals don't depend on Gemini latency or quota. See [[Decisions]] §21.
@@ -28,18 +37,31 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.deps import get_current_admin_user
+from app.deps import get_current_admin_user, get_db
+from app.models import CopilotSession, User
+from app.services.copilot_client import get_copilot_client
 from app.services.siap_client import get_siap_tracking_client
 from app.services.validator_client import get_validator_client
 
 logger = logging.getLogger("bima_admin_api.case")
 
 router = APIRouter()
+
+# Copilot guardrails — kept loose since the surface is internal/officer-only,
+# but bounded so a runaway client cannot grow a session row without limit.
+_MAX_COPILOT_MESSAGE_CHARS = 4000
+# Hard cap on stored turns. ai-engine's own router rejects history > 40 turns,
+# so we trim to the most recent 40 before sending. Each turn is user+model, so
+# 40 turns ≈ 20 exchanges — comfortable for a case-analysis session.
+_MAX_COPILOT_HISTORY_TURNS = 40
 
 # Same ticket grammar used by /tracking — 4-9 digits, zero-padded inside.
 _TICKET_PATTERN = re.compile(r"^\d{4,9}$")
@@ -92,6 +114,60 @@ class CaseWithValidation(BaseModel):
     validation: dict[str, Any] = Field(
         ...,
         description="Raw ValidateResponse from ai-engine (score, issues, per_document).",
+    )
+
+
+# --- Copilot ----------------------------------------------------------------
+
+
+class CopilotHistoryTurn(BaseModel):
+    """One stored conversation turn. Matches ai-engine's HistoryTurn shape."""
+
+    role: str = Field(..., description="'user' or 'model'.")
+    text: str = Field(..., min_length=1)
+
+
+class CopilotChatRequest(BaseModel):
+    """Body for POST /case/{ticket}/copilot/chat.
+
+    Deliberately minimal: NO `officer_id` and NO `history` field. The officer
+    is taken from the JWT; the history is loaded server-side from the
+    `copilot_session` table. Accepting either from the client would let an
+    officer impersonate another or inject a forged transcript.
+    """
+
+    message: str = Field(
+        ...,
+        min_length=1,
+        max_length=_MAX_COPILOT_MESSAGE_CHARS,
+        description="The officer's new message to the copilot.",
+    )
+    validation: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional BIMA validator result the case page already holds "
+            "(score, status, summary, issues). Forwarded to the copilot so "
+            "its get_validation_summary tool can surface it without a fresh "
+            "Gemini Vision pass. Omit if the page has not validated yet."
+        ),
+    )
+
+
+class CopilotToolCall(BaseModel):
+    name: str
+    args: dict[str, Any]
+    result_preview: str
+
+
+class CopilotChatResponse(BaseModel):
+    reply: str = Field(..., description="The copilot's Indonesian reply.")
+    tool_calls: list[CopilotToolCall] = Field(
+        default_factory=list,
+        description="Transcript of tool calls the agent made this turn.",
+    )
+    history: list[CopilotHistoryTurn] = Field(
+        default_factory=list,
+        description="The full persisted conversation after this turn.",
     )
 
 
@@ -306,3 +382,215 @@ def _transform_per_document(per_doc: dict[str, dict[str, Any]] | None) -> list[d
             }
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Copilot session persistence
+# ---------------------------------------------------------------------------
+
+
+def _coerce_history(raw: Any) -> list[dict[str, str]]:
+    """Defensively normalize stored history_json into a clean turn list.
+
+    The column is JSON, so an old/corrupt row could hold anything. We keep
+    only well-formed {role: user|model, text: non-empty str} turns so a bad
+    row degrades to "shorter history" rather than crashing the turn.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for turn in raw:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role", "")).strip().lower()
+        text = turn.get("text", "")
+        if role not in {"user", "model"} or not isinstance(text, str) or not text:
+            continue
+        out.append({"role": role, "text": text})
+    return out
+
+
+async def _get_or_create_session(
+    db: AsyncSession, *, officer_id: int, ticket: str
+) -> CopilotSession:
+    """Load the (officer_id, ticket) copilot session, creating it on first use.
+
+    SECURITY: the lookup is keyed on `officer_id` (always the JWT subject) AND
+    `ticket`, so an officer can only ever touch their own session row.
+    """
+    result = await db.execute(
+        select(CopilotSession).where(
+            CopilotSession.officer_id == officer_id,
+            CopilotSession.ticket == ticket,
+        )
+    )
+    session = result.scalar_one_or_none()
+    if session is None:
+        session = CopilotSession(
+            officer_id=officer_id,
+            ticket=ticket,
+            history_json=[],
+        )
+        db.add(session)
+        # Flush so the row exists for this transaction; commit happens via the
+        # get_db dependency's clean-return path.
+        await db.flush()
+    return session
+
+
+@router.post(
+    "/{ticket}/copilot/chat",
+    response_model=CopilotChatResponse,
+    responses={
+        400: {"description": "Malformed ticket or empty message."},
+        404: {"description": "No case matches the given ticket."},
+        502: {"description": "Copilot upstream (ai-engine) returned an error."},
+        503: {"description": "SIAP or ai-engine copilot not configured."},
+    },
+    summary="Run one Officer Copilot turn against a persistent session.",
+)
+async def copilot_chat(
+    ticket: Annotated[str, Path(min_length=4, max_length=9, pattern=r"^\d{4,9}$")],
+    body: CopilotChatRequest,
+    current_user: Annotated[User, Depends(get_current_admin_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CopilotChatResponse:
+    """
+    Run one turn of the Officer Copilot for the authenticated officer.
+
+    Flow (Decisions §22 — admin-api owns durability, ai-engine is stateless):
+      1. Derive `officer_id` from the verified JWT (never the request body).
+      2. Confirm the ticket exists in SIAP.
+      3. Load (or create) the officer's `copilot_session` row for this ticket.
+      4. POST {message, prior history, validation} to ai-engine's
+         `/v1/copilot/chat`.
+      5. Persist the updated history back to the session row + bump
+         `last_active_at`.
+      6. Return reply + tool transcript + the full persisted history.
+
+    SECURITY: the session is scoped to `current_user.id`. Officer A calling
+    this endpoint can never load or mutate officer B's conversation, because
+    every query is filtered on `officer_id == current_user.id`.
+    """
+    padded_ticket = _validate_ticket(ticket)
+    officer_id = current_user.id
+
+    # Confirm the ticket is real before spinning up a copilot turn. Reuses the
+    # same SIAP lookup the case header uses — raises 404/503 uniformly.
+    await _fetch_case_or_404(padded_ticket)
+
+    copilot = get_copilot_client()
+    if not copilot.is_configured():
+        logger.warning(
+            "Copilot chat for %s but copilot client not configured", padded_ticket
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Officer Copilot (ai-engine) is not configured on this environment.",
+        )
+
+    session = await _get_or_create_session(
+        db, officer_id=officer_id, ticket=padded_ticket
+    )
+
+    # Trim to the most recent N turns so we never exceed ai-engine's history
+    # cap (40) even on a long-running session.
+    prior_history = _coerce_history(session.history_json)[-_MAX_COPILOT_HISTORY_TURNS:]
+
+    logger.info(
+        "Copilot turn | officer_id=%s | ticket=%s | prior_turns=%d | "
+        "has_validation=%s",
+        officer_id,
+        padded_ticket,
+        len(prior_history),
+        body.validation is not None,
+    )
+
+    ok, payload = await copilot.chat(
+        ticket=padded_ticket,
+        officer_id=officer_id,
+        message=body.message,
+        history=prior_history,
+        validation=body.validation,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "message": "Officer Copilot (ai-engine) failed to return a reply.",
+                "copilot_error": payload,
+            },
+        )
+
+    # ai-engine returns the full updated history (prior + new user turn + new
+    # model reply). Re-coerce defensively, trim, and persist.
+    updated_history = _coerce_history(payload.get("history"))[
+        -_MAX_COPILOT_HISTORY_TURNS:
+    ]
+    session.history_json = updated_history
+    session.last_active_at = datetime.now(timezone.utc)
+    # The get_db dependency commits on clean return.
+
+    tool_calls = [
+        CopilotToolCall(
+            name=tc.get("name", ""),
+            args=tc.get("args") or {},
+            result_preview=tc.get("result_preview", ""),
+        )
+        for tc in (payload.get("tool_calls") or [])
+        if isinstance(tc, dict)
+    ]
+
+    return CopilotChatResponse(
+        reply=payload.get("reply", ""),
+        tool_calls=tool_calls,
+        history=[
+            CopilotHistoryTurn(role=h["role"], text=h["text"])
+            for h in updated_history
+        ],
+    )
+
+
+@router.get(
+    "/{ticket}/copilot/session",
+    response_model=CopilotChatResponse,
+    responses={
+        400: {"description": "Malformed ticket."},
+    },
+    summary="Load the officer's persisted copilot session for a ticket.",
+)
+async def get_copilot_session(
+    ticket: Annotated[str, Path(min_length=4, max_length=9, pattern=r"^\d{4,9}$")],
+    current_user: Annotated[User, Depends(get_current_admin_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CopilotChatResponse:
+    """
+    Return the authenticated officer's persisted copilot conversation for a
+    ticket, so the case page can rehydrate the panel after a navigation.
+
+    No SIAP call, no ai-engine call — a pure read of `copilot_session`. When
+    no session exists yet the history is empty (the page then triggers the
+    auto-generated validation opener). `reply` is the last model turn, if any,
+    purely as a convenience for the client.
+    """
+    padded_ticket = _validate_ticket(ticket)
+
+    result = await db.execute(
+        select(CopilotSession).where(
+            CopilotSession.officer_id == current_user.id,
+            CopilotSession.ticket == padded_ticket,
+        )
+    )
+    session = result.scalar_one_or_none()
+    history = _coerce_history(session.history_json) if session else []
+
+    last_model = next(
+        (h["text"] for h in reversed(history) if h["role"] == "model"), ""
+    )
+    return CopilotChatResponse(
+        reply=last_model,
+        tool_calls=[],
+        history=[
+            CopilotHistoryTurn(role=h["role"], text=h["text"]) for h in history
+        ],
+    )

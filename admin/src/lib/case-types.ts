@@ -93,3 +93,36 @@ export interface CaseValidateResponse {
   case: CaseHeaderPayload;
   validation: CaseValidationPayload;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Officer Copilot                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Officer Copilot contract — mirrors admin-api's `CopilotChatResponse`.
+ *
+ *   POST /case/{ticket}/copilot/chat   → run one turn
+ *   GET  /case/{ticket}/copilot/session → rehydrate the persisted session
+ *
+ * The session is per-officer-per-case and lives in admin-api's
+ * `copilot_session` table; ai-engine's agent stays stateless. See
+ * [[Decisions]] §22.
+ */
+export type CopilotRole = "user" | "model";
+
+export interface CopilotTurn {
+  role: CopilotRole;
+  text: string;
+}
+
+export interface CopilotToolCall {
+  name: string;
+  args: Record<string, unknown>;
+  result_preview: string;
+}
+
+export interface CopilotChatResponse {
+  reply: string;
+  tool_calls: CopilotToolCall[];
+  history: CopilotTurn[];
+}

@@ -9,8 +9,8 @@ Two flavours coexist here:
   try to recreate them. The `alembic/env.py` include_object hook + the
   baseline migration enforce that.
 
-* **Owned** (ingestion_sources) — net-new in admin-api. Alembic creates and
-  evolves it.
+* **Owned** (ingestion_sources, copilot_session) — net-new in admin-api.
+  Alembic creates and evolves them.
 
 Importing this module forces every class to be registered against `Base`, so
 `Base.metadata.tables` contains all of them — even though only the owned ones
@@ -19,6 +19,7 @@ this side effect runs.
 """
 
 from app.models.ai_interaction import AiInteraction
+from app.models.copilot_session import CopilotSession
 from app.models.ingestion_source import IngestionSource
 from app.models.kbli import Kbli
 from app.models.kbli_scrape_target import KbliScrapeTarget
@@ -27,6 +28,7 @@ from app.models.user import User
 
 __all__ = [
     "AiInteraction",
+    "CopilotSession",
     "IngestionSource",
     "Kbli",
     "KbliScrapeTarget",
