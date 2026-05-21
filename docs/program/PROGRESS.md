@@ -36,10 +36,24 @@ write. Chained context (req 11) comes free — the notes land in SIAP's
 - Wave 2 transparency-notification deliverable: ✅ LIVE (req 12 done).
 - Wave 2 officer-copilot write actions: 🔄 in progress.
 
-### Blockers / for the user
-- The officer-copilot write actions need a SECOND scoped token —
-  `workflow:advance` + `decision:draft` abilities (the poller's token
-  is `events:read` only). Minted after the cycle-5 code lands.
+### Cycle 5 outcome — WAVE 2 COMPLETE
+- `bima-ai#53` (officer-copilot write actions) merged + deployed.
+  Two new copilot tools — `forward_case`, `record_decision` — call
+  SIAP's live write endpoints. **Officer-in-the-loop guard is
+  structural:** `confirmed=False` default, the draft path is the only
+  default, no code path writes without `confirmed is True`; plus a
+  system-prompt rule and a per-write audit log. `get_case_log_notes`
+  surfaces prior-desk notes (chained context, req 11). 27 tests green.
+- Second scoped token (`workflow:advance` + `decision:draft`) minted
+  on Beta-SIAP, wired to `SIAP_WRITE_API_TOKEN` (VPS-side, not echoed).
+- Deployed + verified: officer copilot + write client load, token
+  present, ai-engine `/health` 200.
+- **Wave 2 COMPLETE.** Citizen↔officer workflow loop runs end-to-end
+  on Beta-SIAP. Reqs closed across Waves 1+2: 7, 8, 10, 11, 12.
+
+### Next cycle
+Wave 3 — Guided Submission (req 4): conversational form-fill →
+validator gate → submit via SIAP's create endpoint.
 
 ---
 
