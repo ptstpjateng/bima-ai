@@ -1,9 +1,14 @@
 """
-Officer Copilot agent — the officer-facing AI partner per [[BIMA Vision]] req #8
-and [[Decisions]] §18.
+Officer Copilot agent — the officer-facing AI partner per [[BIMA Vision]]
+req #6/#8/#9 and [[Decisions]] §18 + §22.
 
-Lives in the bima-admin case page side panel. When an officer opens a permit
-submission, this agent can:
+Lives in the bima-admin case page side panel. It is each officer's
+"right-hand man", scoped to their assigned cases, and its HEADLINE JOB is
+helping the officer VALIDATE the submission in front of them (the killer
+feature — Decisions §22). When an officer opens a permit submission, this
+agent can:
+  * surface the BIMA validator's score + prioritized issue list
+    (`get_validation_summary` — the lead tool),
   * pull the live case record from SIAP,
   * compare two extracted fields (e.g. NIK on KTP vs NIK on NIB),
   * cite the relevant OSS-RBA regulation chunk for a KBLI/scenario,
@@ -14,13 +19,27 @@ this module wires the tool implementations to Gemini's `functionDeclarations`
 contract and runs the call loop (max 5 rounds) until the model produces a
 plain-text reply.
 
+Stateful sessions, stateless agent:
+  The agent itself holds NO per-officer memory. Conversation durability is
+  owned by admin-api's `copilot_session` table (one row per officer+ticket).
+  admin-api loads the prior history, passes it to `chat()`, and persists the
+  returned history. ai-engine stays stateless at the HTTP layer — see
+  routers/copilot.py and [[Decisions]] §22.
+
+Validation context injection:
+  The validator needs the submission's document bytes to run, which the
+  copilot does not hold. admin-api DOES already run the validator for the
+  case page (`POST /case/{ticket}/validate`), so it injects the computed
+  validation result into the copilot call. `get_validation_summary` reads
+  that injected context — no second Gemini Vision pass, no quota burn.
+
 Design notes:
   * The Indonesian system prompt forbids hallucinating case details. The
     officer is the human in the loop — they must be able to trust every
     fact in the reply. If a tool returns nothing, the model is instructed
     to say so explicitly rather than fabricate.
   * Tools are pure Python. We do not let the model run arbitrary code; the
-    only side effect surface is the four declared tools.
+    only side effect surface is the declared tools.
   * Reuses `services.siap_client.get_siap_client()` so the SIAP auth and
     timeout story stays uniform across BIMA's agents.
   * Reuses `services.agents.validator._normalize_name` so name comparison
@@ -42,6 +61,7 @@ Not yet covered (deferred to Phase 3):
 
 from __future__ import annotations
 
+import contextvars
 import difflib
 import json
 import logging
@@ -87,22 +107,125 @@ def is_configured() -> bool:
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT_TEMPLATE = (
-    "Anda adalah BIMA, asisten AI yang membantu petugas DPMPTSP Jateng "
-    "menganalisis berkas permohonan izin. Selalu gunakan tool yang "
-    "tersedia untuk mendapatkan data faktual sebelum menjawab. Jangan "
-    "pernah mengarang detail kasus, nama pemohon, atau referensi "
-    "peraturan — selalu kutip dari tool result. Jawab dalam Bahasa "
-    "Indonesia formal.\n\n"
+    "Anda adalah BIMA, co-pilot validasi untuk petugas DPMPTSP Jateng. "
+    "Anda BUKAN chatbot umum — tugas utama Anda adalah membantu petugas "
+    "MEMVALIDASI berkas permohonan izin yang sedang dibuka.\n\n"
+    "PRINSIP KERJA:\n"
+    "1. Validasi adalah prioritas. Di awal sesi, atau ketika petugas "
+    "belum jelas mau apa, panggil `get_validation_summary` lalu sampaikan "
+    "skor validasi BIMA dan pandu petugas menelusuri masalah dari yang "
+    "paling parah lebih dahulu (critical → high → medium → low).\n"
+    "2. Selalu gunakan tool untuk mendapatkan data faktual sebelum "
+    "menjawab. Jangan pernah mengarang detail kasus, skor, nama pemohon, "
+    "atau referensi peraturan — selalu kutip dari hasil tool. Jika tool "
+    "tidak mengembalikan data, katakan terus terang.\n"
+    "3. Setelah menjelaskan sebuah masalah, tawarkan langkah konkret: "
+    "menelusuri dokumen tertentu, membandingkan field (mis. NIK di KTP vs "
+    "NIB lewat `compare_field`), atau mencari dasar hukum lewat "
+    "`cite_regulation`.\n"
+    "4. Jawab ringkas, dalam Bahasa Indonesia formal, dan langsung ke "
+    "inti — petugas sedang bekerja cepat di antrean berkas.\n\n"
     "Konteks sesi:\n"
     "- Tiket yang sedang dianalisis: {ticket}\n"
-    "- Gunakan `get_case_full` di awal jika Anda belum memiliki data "
-    "kasusnya, lalu gunakan tool lain sesuai pertanyaan petugas."
+    "- Mulailah dengan `get_validation_summary` untuk melihat temuan "
+    "validator. Gunakan `get_case_full` bila perlu konteks SIAP, lalu "
+    "tool lain sesuai pertanyaan petugas."
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-call validation context.
+#
+# `get_validation_summary` needs the case's validation result, but the
+# validator requires the submission's document bytes — which the copilot does
+# not hold. admin-api already computes the validation result for the case page
+# and injects it into each `/v1/copilot/chat` call. We carry that injected
+# payload to the tool via a ContextVar so the tool stays a plain module-level
+# function (consistent with the other tools) while remaining async-task-safe:
+# `chat()` sets the var per invocation, the tool reads it, and a token reset
+# restores the previous value when the turn ends.
+# ---------------------------------------------------------------------------
+
+_validation_context: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "officer_copilot_validation_context", default=None
+)
+
+# Severity ladder — kept in sync with admin/src/lib/case-types.ts SEVERITY_ORDER
+# and ai-engine/services/agents/validator.py IssueLevel. Lower = worse.
+_SEVERITY_RANK: dict[str, int] = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+}
 
 
 # ---------------------------------------------------------------------------
 # Tool implementations.
 # ---------------------------------------------------------------------------
+
+def get_validation_summary() -> dict:
+    """
+    Return the BIMA validator's findings for the case currently in session:
+    the completion score and the issue list sorted worst-first.
+
+    This is the copilot's LEAD tool — Decisions §22 makes validation help the
+    headline job. The validation result is supplied by admin-api (which runs
+    the validator for the case page) and injected via `_validation_context`;
+    we never re-run Gemini Vision here.
+
+    Returns a structured dict the model can narrate verbatim:
+      {
+        "available": bool,
+        "score_percent": int,        # 0-100
+        "status": str,               # ready | minor_issues | major_issues | unverified
+        "summary": str,              # one-paragraph Indonesian
+        "issue_count": int,
+        "issues": [ {severity, field, message, related_docs}, ... ]  # worst-first
+      }
+    On miss returns `{"available": False, "note": "..."}` so the model is told
+    to ask the officer to run the validator rather than fabricating a score.
+    """
+    ctx = _validation_context.get()
+    if not ctx or not isinstance(ctx, dict):
+        return {
+            "available": False,
+            "note": (
+                "Hasil validasi belum tersedia untuk tiket ini. Minta petugas "
+                "menjalankan validator pada halaman kasus terlebih dahulu."
+            ),
+        }
+
+    raw_issues = ctx.get("issues") or []
+    issues: list[dict[str, Any]] = []
+    for it in raw_issues:
+        if not isinstance(it, dict):
+            continue
+        issues.append({
+            "severity": str(it.get("severity", "") or "").lower(),
+            "field": it.get("field", "") or "",
+            "message": it.get("message", "") or "",
+            "related_docs": it.get("related_docs", []) or [],
+        })
+    # Worst-first so the model walks the officer through critical items first.
+    issues.sort(key=lambda i: _SEVERITY_RANK.get(i["severity"], 99))
+
+    score_percent = ctx.get("score_percent")
+    if score_percent is None and ctx.get("score") is not None:
+        try:
+            score_percent = int(round(float(ctx["score"]) * 100))
+        except (TypeError, ValueError):
+            score_percent = None
+
+    return {
+        "available": True,
+        "score_percent": score_percent if score_percent is not None else 0,
+        "status": ctx.get("status", "unverified") or "unverified",
+        "summary": ctx.get("summary", "") or "",
+        "issue_count": len(issues),
+        "issues": issues,
+    }
+
 
 async def get_case_full(ticket: str) -> dict:
     """
@@ -238,6 +361,20 @@ def cite_regulation(query: str) -> list[dict]:
 
 _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
     {
+        "name": "get_validation_summary",
+        "description": (
+            "Ambil hasil validasi BIMA untuk tiket yang sedang dianalisis: "
+            "skor kelengkapan, status, dan daftar masalah yang sudah "
+            "diurutkan dari yang paling parah. WAJIB dipanggil di awal sesi "
+            "atau saat petugas bertanya tentang kondisi/kelayakan berkas. "
+            "Tidak butuh argumen — konteksnya sudah terikat ke sesi."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "get_case_full",
         "description": (
             "Ambil seluruh data permohonan izin dari SIAP berdasarkan nomor "
@@ -330,6 +467,7 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
 # Map tool name → callable. Each callable is invoked with the dict of
 # arguments the model produced. The chat loop handles sync vs async.
 _TOOL_DISPATCH: dict[str, Any] = {
+    "get_validation_summary": get_validation_summary,
     "get_case_full": get_case_full,
     "get_doc_summary": get_doc_summary,
     "compare_field": compare_field,
@@ -425,6 +563,8 @@ class OfficerCopilot:
         message: str,
         ticket: str,
         history: list[dict],
+        officer_id: int | None = None,
+        validation: dict | None = None,
     ) -> dict:
         """
         Run one user-message turn. Returns:
@@ -435,6 +575,16 @@ class OfficerCopilot:
                            and the final model reply, ready to be passed
                            back on the next call.
           }
+
+        Args:
+          officer_id: the verified-JWT officer this session belongs to. Used
+            only for masked logging — the agent holds no per-officer state;
+            durability is admin-api's `copilot_session` table. NEVER trust an
+            officer_id from a request body; admin-api derives it from the JWT.
+          validation: the BIMA validator result for `ticket` (score, status,
+            summary, issues), computed by admin-api and injected here so the
+            `get_validation_summary` tool can surface it without re-running
+            Gemini Vision. None when no validation is available yet.
         """
         if not is_configured():
             return {
@@ -454,6 +604,43 @@ class OfficerCopilot:
             "parts": [{"text": _SYSTEM_PROMPT_TEMPLATE.format(ticket=ticket)}],
         }
 
+        # Bind the validation result for this turn so `get_validation_summary`
+        # can read it. The token reset in `finally` keeps concurrent requests
+        # isolated — each asyncio task gets its own ContextVar copy.
+        ctx_token = _validation_context.set(validation)
+        logger.info(
+            "Copilot turn start | officer_id=%s | ticket=%s | "
+            "has_validation=%s | history_turns=%d",
+            officer_id if officer_id is not None else "<none>",
+            ticket,
+            validation is not None,
+            len(history or []),
+        )
+        try:
+            return await self._run_chat_loop(
+                client_message=message,
+                ticket=ticket,
+                history=history,
+                contents=contents,
+                tool_calls_log=tool_calls_log,
+                system_instruction=system_instruction,
+            )
+        finally:
+            _validation_context.reset(ctx_token)
+
+    async def _run_chat_loop(
+        self,
+        *,
+        client_message: str,
+        ticket: str,
+        history: list[dict],
+        contents: list[dict],
+        tool_calls_log: list[dict[str, Any]],
+        system_instruction: dict,
+    ) -> dict:
+        """The Gemini function-calling round loop. Split out of `chat()` so the
+        ContextVar set/reset stays a tight wrapper around the whole turn."""
+        message = client_message
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             for round_idx in range(self.max_rounds):
                 payload = {
