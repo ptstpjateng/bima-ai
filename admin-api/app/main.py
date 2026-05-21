@@ -37,6 +37,7 @@ from app.routers import (
     case,
     dashboard,
     health,
+    inbox,
     ingestion,
     kbli,
     sso,
@@ -234,4 +235,5 @@ app.include_router(kbli.router, prefix="/kbli", tags=["KBLI"])
 app.include_router(ingestion.router, prefix="/ingestion", tags=["Ingestion"])
 app.include_router(tracking.router, prefix="/tracking", tags=["Tracking"])
 app.include_router(case.router, prefix="/case", tags=["Case"])
+app.include_router(inbox.router, prefix="/inbox", tags=["Inbox"])
 app.include_router(sso.router, prefix="/sso", tags=["SSO"])

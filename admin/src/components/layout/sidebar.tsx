@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard,
+  Inbox,
   MessageCircle,
   FileText,
   Database,
@@ -25,6 +26,7 @@ type NavItem = {
 // Users CRUD + Ingestion CRUD are Sprint C scope — intentionally absent.
 const NAV_ITEMS: NavItem[] = [
   { label: "Dasbor", href: "/dashboard", icon: LayoutDashboard },
+  { label: "Kotak Masuk", href: "/inbox", icon: Inbox },
   { label: "Interaksi AI", href: "/ai-interactions", icon: MessageCircle },
   { label: "KBLI", href: "/kbli", icon: FileText },
   { label: "Sumber Data", href: "/data", icon: Database },
