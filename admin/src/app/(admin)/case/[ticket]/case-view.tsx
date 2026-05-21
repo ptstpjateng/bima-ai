@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import Link from "next/link";
@@ -10,8 +11,10 @@ import {
   CheckCircle2,
   CloudOff,
   FileQuestion,
+  PenLine,
   RefreshCcw,
   ShieldCheck,
+  Sparkles,
   UserRound,
 } from "lucide-react";
 import { Card } from "@/components/ui/card";
@@ -21,17 +24,20 @@ import { Button } from "@/components/ui/button";
 import { ScoreGauge } from "@/components/case/score-gauge";
 import { IssueCard } from "@/components/case/issue-card";
 import { CopilotPanel } from "@/components/case/copilot-panel";
+import { SigningHandoffCard } from "@/components/case/signing-handoff-card";
 import {
   CaseStatusBadge,
   DemoBadge,
 } from "@/components/case/case-status-badge";
 import { SektorBadge } from "@/components/admin/badges";
 import { apiFetch, ApiError } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { formatDateTime } from "@/lib/format";
 import {
   SEVERITY_ORDER,
   VALIDATION_STATUS_LABEL,
   type CaseValidateResponse,
+  type CopilotMode,
   type DemoFixture,
 } from "@/lib/case-types";
 
@@ -44,6 +50,30 @@ import {
  * 5 minutes by react-query's default staleTime to keep the page snappy when
  * the officer flips between cases.
  */
+/**
+ * Heuristic: is this case at the FINAL signing stage?
+ *
+ * BIMA does not own a clean SIAP role/stage enum, so we infer from the
+ * free-form `current_desk` (`posisi_berkas`) and `status` text. SIAP's
+ * signing surface is the "Tanda Tangan Berkas" desk, registered for the
+ * `Kepala DPMPTSP` role. When the case sits at a desk/status that mentions
+ * the Head or signing, the signature-assistant is the natural default.
+ *
+ * This is a best-effort default only — the mode toggle always lets a user
+ * switch in or out regardless. See the PR notes on scoping.
+ */
+const SIGNING_STAGE_PATTERN = /tanda.?tangan|kepala|penandatangan|tte|^ttd/i;
+
+function looksLikeSigningStage(
+  desk: string | null,
+  status: string
+): boolean {
+  return (
+    SIGNING_STAGE_PATTERN.test(desk ?? "") ||
+    SIGNING_STAGE_PATTERN.test(status)
+  );
+}
+
 export function CaseView({
   ticket,
   fixture,
@@ -53,6 +83,10 @@ export function CaseView({
 }) {
   const params: Record<string, string | undefined> = {};
   if (fixture) params.demo_fixture = fixture;
+
+  // Copilot mode — null until the case loads, then defaulted from the SIAP
+  // stage heuristic. A user-driven toggle overrides it.
+  const [copilotMode, setCopilotMode] = useState<CopilotMode | null>(null);
 
   const { data, isLoading, isError, error, isFetching, refetch } = useQuery({
     queryKey: ["case-validate", ticket, fixture ?? "live"],
@@ -98,6 +132,16 @@ export function CaseView({
   const sortedIssues = [...validation.issues].sort(
     (a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]
   );
+
+  // Resolve the copilot mode: the user toggle wins; otherwise default from
+  // the SIAP signing-stage heuristic so a case sitting on the Head's desk
+  // opens the signature assistant automatically.
+  const stageIsSigning = looksLikeSigningStage(
+    caseInfo.current_desk,
+    caseInfo.status
+  );
+  const activeMode: CopilotMode =
+    copilotMode ?? (stageIsSigning ? "signature" : "officer");
 
   return (
     <div className="space-y-6 max-w-6xl mx-auto">
@@ -245,12 +289,103 @@ export function CaseView({
           )}
         </section>
 
-        {/* (d) Officer Copilot — leads with the validation summary. Sticky on
-            xl so it stays visible while the officer scrolls the issues. */}
-        <aside className="xl:sticky xl:top-6">
-          <CopilotPanel ticket={caseInfo.ticket} validation={validation} />
+        {/* (d) Copilot — officer validation copilot or, in signature mode,
+            the Head-of-DPMPTSP signing assistant. Sticky on xl so it stays
+            visible while the officer scrolls the issues. */}
+        <aside className="xl:sticky xl:top-6 space-y-4">
+          <CopilotModeToggle
+            mode={activeMode}
+            onChange={setCopilotMode}
+            stageIsSigning={stageIsSigning}
+          />
+
+          {/* Re-key by mode so switching does a clean remount: a fresh
+              session rehydrate + the right kickoff opener. */}
+          <CopilotPanel
+            key={activeMode}
+            ticket={caseInfo.ticket}
+            validation={validation}
+            mode={activeMode}
+          />
+
+          {/* The signing handoff CTA — only in signature mode. BIMA never
+              signs; this deep-links the Head into SIAP Jateng to sign. */}
+          {activeMode === "signature" && (
+            <SigningHandoffCard ticket={caseInfo.ticket} />
+          )}
         </aside>
       </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Copilot mode toggle                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Two-way switch between the officer validation copilot and the Head-of-
+ * DPMPTSP signature assistant.
+ *
+ * Scoping note (Vision req #13): BIMA has no clean SIAP role claim on the
+ * admin JWT, so we cannot hard-gate "signature mode = the Head only". We
+ * instead (a) default the mode from the SIAP stage heuristic and (b) leave
+ * the toggle always available. The signature assistant is read-only over
+ * the case and the actual signature happens in SIAP, so an officer opening
+ * it early is harmless — they simply get the approval-chain synthesis.
+ */
+function CopilotModeToggle({
+  mode,
+  onChange,
+  stageIsSigning,
+}: {
+  mode: CopilotMode;
+  onChange: (mode: CopilotMode) => void;
+  stageIsSigning: boolean;
+}) {
+  const options: {
+    value: CopilotMode;
+    label: string;
+    icon: typeof Sparkles;
+  }[] = [
+    { value: "officer", label: "Validasi", icon: Sparkles },
+    { value: "signature", label: "Tanda Tangan", icon: PenLine },
+  ];
+
+  return (
+    <div
+      className="rounded-card bg-surface-card p-1 flex gap-1"
+      role="tablist"
+      aria-label="Mode copilot"
+    >
+      {options.map((opt) => {
+        const Icon = opt.icon;
+        const active = mode === opt.value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(opt.value)}
+            className={cn(
+              "flex-1 inline-flex items-center justify-center gap-1.5 rounded-card px-3 py-2 text-xs font-medium transition-colors",
+              active
+                ? "bg-brand-navy text-white"
+                : "text-text-secondary hover:text-text-primary hover:bg-surface-card-hover"
+            )}
+          >
+            <Icon className="size-3.5" aria-hidden />
+            {opt.label}
+            {opt.value === "signature" && stageIsSigning && !active && (
+              <span
+                className="size-1.5 rounded-full bg-brand-amber"
+                aria-label="Disarankan untuk tahap ini"
+              />
+            )}
+          </button>
+        );
+      })}
     </div>
   );
 }
