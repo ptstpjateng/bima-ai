@@ -9,6 +9,69 @@
 
 ---
 
+## Cycle 2 — 2026-05-21 · "Wave 1 write seam — all 3 endpoints live on Beta-SIAP"
+
+**Type:** PM cycle, run locally.
+
+**THINK.** Cycle 1 shipped `POST /api/v1/license-request` (PR #21). The
+remaining Wave 1 endpoints — `forward` + `decision` — were designed but
+unbuilt. The SIAP repo branching was tangled: `main` had the write seam
+but not the security fixes; `security/fix-batch-2026-05-18` had the
+fixes but not the seam; Beta-SIAP ran the security branch. Neither had
+both.
+
+**PLAN.** Consolidate: merge the security batch into `main` so `main` is
+one integrated trunk, then build slice 2 (`forward` + `decision`) and
+deploy the full seam to Beta-SIAP.
+
+**DELEGATE → SIAP Team** (note: the first slice-2 agent crashed on an
+infrastructure socket error; re-run completed cleanly):
+- **`POST /api/v1/license-request/{id}/forward`** — advance to
+  `sort_order+1`, `APPROVED` log at the current desk. Ability
+  `workflow:advance`.
+- **`POST /api/v1/license-request/{id}/decision`** — record
+  APPROVED/REJECTED + notes. Per user decision, a **rejection routes
+  back to the previous desk** (`sort_order−1`), matching SIAP's own
+  `tolak` action — not the entry step.
+- Mirrors SIAP's `teruskan`/`tolak` from `EditDaftarPermohonan`. 14
+  new feature tests; full `Api/V1` suite 20 passing, 89 assertions.
+
+**REVIEW.** Diffs read: transactional, explicit `ptsp.*` query-builder
+writes, validated, scoped abilities. Passes (#22). Reject-routing fix
+verified — all 20 API tests green.
+
+**REPORT.**
+- **`ptstpjateng/SIAP#20`** (security batch) merged to `main` — user
+  explicitly authorised reversing the earlier "leave unmerged".
+- **`ptstpjateng/SIAP#21`** (create) + **`#22`** (forward + decision)
+  merged. `main` is now the integrated trunk: security fixes + the
+  full 3-endpoint write seam.
+- Deployed to Beta-SIAP (via rsync — the VPS can't `git pull` the
+  private SIAP repo yet; a deploy key is being set up). All three
+  endpoints verified live (HTTP 401 = route exists, auth required);
+  Beta-SIAP `/admin/login` 200 (security fixes intact).
+
+### Roadmap movement
+- Wave 1: all three write-seam endpoints ⚪/🔄 → ✅ (merged + live on
+  Beta-SIAP). Wave 1 remaining: state-change events + scoped/expiring
+  Sanctum tokens.
+
+### Blockers / for the user
+- **Deploy key** for the VPS→private-SIAP-repo `git pull` is generated
+  and awaiting the user adding the public key to GitHub (read-only).
+  Until then, SIAP deploys use rsync.
+- Production SIAP promotion remains gated — Beta-SIAP only so far.
+- Branch-chain irregularity: 26 of 385 Beta-SIAP licences have
+  non-linear approval chains; `forward` returns 409 rather than
+  guessing — a real-SIAP-team data-cleanup item.
+
+### Next cycle
+SIAP Team — Wave 1 final slice: the `changed-since` state-events
+endpoint + scoped/expiring Sanctum token issuance (closes audit S1).
+Then Wave 1 is complete and Wave 2 (workflow + transparency) unblocks.
+
+---
+
 ## Cycle 1 — 2026-05-21 · "Wave 1 begins — SIAP write seam, first endpoint"
 
 **Type:** PM cycle, run locally (the remote routine's first run produced
