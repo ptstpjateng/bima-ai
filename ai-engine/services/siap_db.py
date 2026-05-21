@@ -25,16 +25,29 @@ READ-ONLY by contract:
     §8: a `bima_readonly` role is a SIAP-team ask. The read-only transaction
     guard below is the interim safety net.
 
-Configuration:
-  SIAP_DB_URL — full asyncpg DSN, e.g.
-    postgresql://bima:<pw>@postgres:5432/dbsiapjateng
-  Leave it blank to disable the SIAP tool layer entirely (tools then return
-  a structured "not configured" result and the agent degrades gracefully).
+Configuration (discrete env vars — NOT a DSN string):
+  SIAP_DB_HOST     — e.g. `postgres` (Docker service name on the VPS)
+  SIAP_DB_PORT     — default 5432
+  SIAP_DB_NAME     — default `dbsiapjateng`
+  SIAP_DB_USER     — e.g. `bima`
+  SIAP_DB_PASSWORD — the DB password, raw (NOT url-encoded)
+
+  Why discrete vars, not a `postgresql://user:pw@host/db` DSN: a DSN
+  string breaks when the password contains URL-special characters
+  (`@ / : ? #`) — asyncpg misparses the userinfo/host boundary and the
+  host resolves to garbage ("Name or service not known"). The BIMA DB
+  password contains such characters. Passing host/user/password as
+  separate asyncpg kwargs sidesteps URL parsing entirely.
+
+  Leave SIAP_DB_HOST (or SIAP_DB_USER) blank to disable the SIAP tool
+  layer entirely (tools then return a structured "not configured"
+  result and the agent degrades gracefully).
 
 Failure model:
-  Lazy init — the pool is built on first use and only if SIAP_DB_URL is set.
-  Callers guard with `is_siap_db_configured()`. A SIAP outage never raises out
-  of a tool: tools catch and return a structured error dict.
+  Lazy init — the pool is built on first use and only if the SIAP DB is
+  configured. Callers guard with `is_siap_db_configured()`. A SIAP
+  outage never raises out of a tool: tools catch and return a
+  structured error dict.
 """
 
 from __future__ import annotations
@@ -51,12 +64,18 @@ load_dotenv()
 logger = logging.getLogger("bima_ai.siap_db")
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — discrete connection components (see module docstring for
+# why we do NOT use a DSN string here).
 # ---------------------------------------------------------------------------
 
-# Full asyncpg DSN. On the VPS, ai-engine reaches Postgres over the Docker
-# network at host `postgres`, port 5432, database `dbsiapjateng`.
-_SIAP_DB_URL: str = os.getenv("SIAP_DB_URL", "").strip()
+# On the VPS, ai-engine reaches Postgres over the Docker network at host
+# `postgres`, port 5432, database `dbsiapjateng`.
+_SIAP_DB_HOST: str = os.getenv("SIAP_DB_HOST", "").strip()
+_SIAP_DB_PORT: int = int(os.getenv("SIAP_DB_PORT", "5432") or "5432")
+_SIAP_DB_NAME: str = os.getenv("SIAP_DB_NAME", "dbsiapjateng").strip()
+_SIAP_DB_USER: str = os.getenv("SIAP_DB_USER", "").strip()
+# Password is read raw — never url-encoded, never logged.
+_SIAP_DB_PASSWORD: str = os.getenv("SIAP_DB_PASSWORD", "")
 
 # Conservative pool — the SIAP tool layer is low-volume (one citizen question
 # at a time) and we must not exhaust SIAP's connection slots. Mirrors the
@@ -74,7 +93,7 @@ def is_siap_db_configured() -> bool:
     """Cheap precheck without touching the pool. Callers should branch on
     this and return a friendly "integration disabled" result rather than
     letting a None pool crash."""
-    return bool(_SIAP_DB_URL)
+    return bool(_SIAP_DB_HOST and _SIAP_DB_USER)
 
 
 async def _on_connect(conn: asyncpg.Connection) -> None:
@@ -91,22 +110,29 @@ async def get_siap_pool() -> asyncpg.Pool:
     """
     Return the lazily-constructed SIAP read-only connection pool.
 
-    Raises RuntimeError if SIAP_DB_URL is empty — callers must guard with
-    `is_siap_db_configured()` first. The pool is process-wide; asyncpg
-    pools are safe to share across coroutines.
+    Raises RuntimeError if the SIAP DB isn't configured — callers must
+    guard with `is_siap_db_configured()` first. The pool is process-wide;
+    asyncpg pools are safe to share across coroutines.
     """
     global _pool
-    if not _SIAP_DB_URL:
+    if not (_SIAP_DB_HOST and _SIAP_DB_USER):
         raise RuntimeError(
-            "SIAP_DB_URL is not configured; cannot open the SIAP DB pool."
+            "SIAP DB is not configured (SIAP_DB_HOST / SIAP_DB_USER unset); "
+            "cannot open the SIAP DB pool."
         )
     if _pool is None:
         logger.info(
-            "Opening SIAP read-only pool | min=%d max=%d",
-            _POOL_MIN_SIZE, _POOL_MAX_SIZE,
+            "Opening SIAP read-only pool | host=%s db=%s min=%d max=%d",
+            _SIAP_DB_HOST, _SIAP_DB_NAME, _POOL_MIN_SIZE, _POOL_MAX_SIZE,
         )
+        # Discrete kwargs — no DSN parsing, so a password with URL-special
+        # characters is passed through verbatim.
         _pool = await asyncpg.create_pool(
-            dsn=_SIAP_DB_URL,
+            host=_SIAP_DB_HOST,
+            port=_SIAP_DB_PORT,
+            user=_SIAP_DB_USER,
+            password=_SIAP_DB_PASSWORD,
+            database=_SIAP_DB_NAME,
             min_size=_POOL_MIN_SIZE,
             max_size=_POOL_MAX_SIZE,
             timeout=_CONNECT_TIMEOUT_SECONDS,
