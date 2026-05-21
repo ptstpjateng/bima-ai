@@ -449,6 +449,21 @@ async def generate_ai_response(user_id: str, message: str) -> str:
                     siap_ticket, user_id,
                 )
 
+        # FAST-PATH 0 — guided submission (Wave 3, [[BIMA Vision]] req #4).
+        # When the citizen is mid-way through filing a SIAP licence
+        # application (or just expressed the intent to start one), BIMA's
+        # guided-submission state machine owns the turn: it walks the
+        # citizen through the form, validates, and submits — no Gemma call.
+        # `maybe_handle` returns None when the message is NOT a submission
+        # turn (or the feature flag is off), so the normal path is untouched.
+        from services.guided_submission import maybe_handle as _gs_maybe_handle
+
+        gs_reply = await _gs_maybe_handle(user_id, message)
+        if gs_reply is not None:
+            logger.info("Guided-submission fast path handled | user_id=%s", user_id)
+            _append_history(user_id, message, gs_reply)
+            return gs_reply
+
         # SPEED: skip the ~3-5s intent classifier call for trivial messages
         # (greetings, ack words, very short tests). Default to Phase 1 with no
         # KBLI — that's the right behaviour for these messages anyway.
@@ -693,6 +708,25 @@ async def generate_ai_response_stream(
                 "falling through to Gemma | ticket=%s user_id=%s",
                 siap_ticket, user_id,
             )
+
+        # FAST-PATH 0 — guided submission (Wave 3). Same as the non-streaming
+        # path: a form-filling turn is deterministic and non-LLM, so it is
+        # NOT streamed — the whole reply is emitted as one "delta" + "done",
+        # exactly like the SIAP ticket fast-path above. `maybe_handle` returns
+        # None when the message is not a submission turn (or the flag is off).
+        from services.guided_submission import maybe_handle as _gs_maybe_handle
+
+        gs_reply = await _gs_maybe_handle(user_id, message)
+        if gs_reply is not None:
+            logger.info(
+                "Guided-submission fast path handled (stream) | user_id=%s",
+                user_id,
+            )
+            _append_history(user_id, message, gs_reply)
+            yield {"event": "delta", "text": gs_reply}
+            yield {"event": "done", "text": gs_reply,
+                   "elapsed": round(time.monotonic() - t0, 2)}
+            return
 
         # Intent classification + user context.
         if _is_trivial_message(message):
