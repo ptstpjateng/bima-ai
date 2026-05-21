@@ -163,6 +163,14 @@ export function TopBar() {
             <CommandItem
               onSelect={() => {
                 setPaletteOpen(false);
+                router.push("/inbox");
+              }}
+            >
+              Kotak Masuk
+            </CommandItem>
+            <CommandItem
+              onSelect={() => {
+                setPaletteOpen(false);
                 router.push("/ai-interactions");
               }}
             >
