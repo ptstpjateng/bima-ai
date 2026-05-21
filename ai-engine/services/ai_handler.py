@@ -354,6 +354,33 @@ def _is_trivial_message(message: str) -> bool:
     return bool(_TRIVIAL_PATTERN.match(msg))
 
 
+# Strong SIAP-domain keyword signals. Used as a fallback when the LLM intent
+# classifier is unavailable (Gemini 503) or returns "unknown" — a question
+# with these signals must still route to the SIAP agent, not silently
+# degrade to the OSS RAG path. Phrases are substring-matched; the bare
+# acronyms are word-bounded so "imb" doesn't match inside "kimbang".
+_SIAP_KEYWORD_PATTERN = re.compile(
+    r"izin pemakaian tanah|bangunan pengairan|pengairan|izin lingkungan|"
+    r"izin trayek|izin sektoral|izin reklame|izin pemanfaatan|"
+    r"siap jateng|status berkas|sumber daya air|"
+    r"\b(imb|pbg|slf|pupr)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_siap(message: str) -> bool:
+    """Cheap keyword check for SIAP-domain questions.
+
+    The SIAP agent only runs when intent `scope == "siap"`, and `scope` is
+    set by the LLM intent classifier. When that classifier fails (a Gemini
+    503) it defaults `scope` to "unknown" — which would route a clear SIAP
+    question down the OSS RAG path instead. This regex is the resilient
+    fallback: a strong SIAP keyword upgrades "unknown" → "siap" without
+    needing the LLM. See Decisions §22.
+    """
+    return bool(_SIAP_KEYWORD_PATTERN.search(message))
+
+
 # ---------------------------------------------------------------------------
 # 1. Intent classification + LLM call (hosted Gemma) with graceful fallback
 # ---------------------------------------------------------------------------
@@ -459,6 +486,18 @@ async def generate_ai_response(user_id: str, message: str) -> str:
         #     optionally enriched with the prior-turn SIAP license name so
         #     "apa syaratnya?" searches for THAT license.
         scope = intent.get("scope", "unknown")
+
+        # Resilient routing: if the LLM classifier couldn't determine scope
+        # (e.g. it failed on a Gemini 503 and defaulted to "unknown"), a
+        # strong SIAP keyword signal still routes the message to the SIAP
+        # agent. Without this, a Gemini capacity blip would silently
+        # downgrade a SIAP question to the OSS RAG path.
+        if scope == "unknown" and _looks_like_siap(message):
+            logger.info(
+                "scope upgraded unknown→siap via keyword fallback | user_id=%s",
+                user_id,
+            )
+            scope = "siap"
 
         if scope == "siap":
             from services.agents.siap_agent import get_siap_agent, is_configured as _siap_agent_configured
