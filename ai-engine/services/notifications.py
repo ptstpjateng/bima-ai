@@ -1,7 +1,7 @@
 """Citizen + officer notification dispatcher (proactive WhatsApp).
 
 Single entry point for "BIMA pings someone unprompted":
-  - New case landed in officer queue   →  bima_new_case
+  - New case landed in officer queue   →  bimanewcase   (DISABLED — see below)
   - SLA at risk                        →  bima_sla_warn
   - Citizen progress notification      →  bima_citizen_progress
   - Citizen license issued             →  bima_citizen_completed
@@ -44,6 +44,23 @@ EventKind = Literal[
     "citizen_needs_fix",
 ]
 
+# ---------------------------------------------------------------------------
+# Events that are registered but NOT safe to actually send.
+#
+# `new_case` maps to the Meta template `bimanewcase`. That template was
+# Approved by Meta on 2026-05-21, BUT its approved body is wrong — the
+# APTANA dashboard preview shows "⏰ Berkas {{1}} sudah {{2}} …", which is
+# the bima_sla_warn copy, not a new-case message. Someone pasted the
+# SLA-warn text when creating the template. Firing it would WhatsApp an
+# officer an SLA-warning worded message for a brand-new case.
+#
+# Until the template is recreated correctly in APTANA (and re-approved),
+# `notify()` short-circuits any `new_case` event with a loud warning.
+# Remove "new_case" from this set ONLY after the APTANA template body is
+# fixed and re-verified via the /v1/notify/test endpoint.
+# ---------------------------------------------------------------------------
+_DISABLED_EVENTS: set[str] = {"new_case"}
+
 
 @dataclass(frozen=True)
 class TemplateSpec:
@@ -68,8 +85,13 @@ class TemplateSpec:
 # flag, or sends will silently 400.
 # ---------------------------------------------------------------------------
 _TEMPLATES: dict[EventKind, TemplateSpec] = {
+    # NOTE: `name` is the EXACT approved Meta template name. Meta approved
+    # this one as "bimanewcase" (no underscores) — APTANA dashboard
+    # 2026-05-21. The event is in _DISABLED_EVENTS above because the
+    # approved body is wrong (SLA-warn copy); do not re-enable until the
+    # APTANA template is recreated with the correct new-case body.
     "new_case": TemplateSpec(
-        name="bima_new_case",
+        name="bimanewcase",
         params=("ticket",),
         freeform_body=(
             "📋 Berkas {ticket} baru di meja Anda. "
@@ -137,6 +159,7 @@ async def notify(
     recipient_phone: str,
     params: dict[str, str],
     inside_session_window: bool = False,
+    force: bool = False,
 ) -> bool:
     """Dispatch a proactive WhatsApp notification.
 
@@ -151,22 +174,47 @@ async def notify(
             or unknown, fall back to template. Until we wire a
             last-inbound timestamp store, callers default to False —
             templates always work, freeform sometimes doesn't.
+        force: TESTING ONLY. When True, bypass the BIMA_NOTIFICATIONS_ENABLED
+            master flag so the internal test-fire endpoint can verify an
+            approved template + its param arity before go-live. It does
+            NOT bypass the _DISABLED_EVENTS guard — a disabled event stays
+            blocked even under force. Real call sites must leave this False.
 
     Returns True on a 2xx from APTANA, False on any failure or when
     the feature flag is off (so callers can fire-and-forget without
     branching on flag state).
     """
     if not _is_enabled():
-        logger.info(
-            "notify suppressed (flag off) | event=%s phone=%s",
+        if not force:
+            logger.info(
+                "notify suppressed (flag off) | event=%s phone=%s",
+                event,
+                _mask_phone(recipient_phone),
+            )
+            return False
+        logger.warning(
+            "notify FORCED past disabled flag (test-fire) | event=%s phone=%s "
+            "— BIMA_NOTIFICATIONS_ENABLED is off; this send bypasses it",
             event,
             _mask_phone(recipient_phone),
         )
-        return False
 
     spec = _TEMPLATES.get(event)
     if spec is None:
         logger.error("notify unknown event | event=%s", event)
+        return False
+
+    if event in _DISABLED_EVENTS:
+        # The template for this event is registered but not safe to send.
+        # See _DISABLED_EVENTS above for the rationale (currently:
+        # bimanewcase has the wrong approved body in APTANA).
+        logger.warning(
+            "notify blocked (disabled event) | event=%s template=%s — "
+            "new_case template bimanewcase has wrong body — disabled "
+            "pending APTANA fix",
+            event,
+            spec.name,
+        )
         return False
 
     try:
@@ -196,6 +244,25 @@ async def notify(
 def list_event_kinds() -> Sequence[EventKind]:
     """Introspection helper for tests and the future admin debug page."""
     return tuple(_TEMPLATES.keys())
+
+
+def describe_events() -> list[dict[str, object]]:
+    """Introspection: registered events, their Meta template name, the
+    declared positional param arity, and whether the event is disabled.
+
+    Used by the internal /v1/notify/events endpoint so an operator can
+    confirm template names + param tuples line up with what Meta approved.
+    """
+    return [
+        {
+            "event": event,
+            "template_name": spec.name,
+            "params": list(spec.params),
+            "param_count": len(spec.params),
+            "disabled": event in _DISABLED_EVENTS,
+        }
+        for event, spec in _TEMPLATES.items()
+    ]
 
 
 def _mask_phone(phone: str) -> str:
