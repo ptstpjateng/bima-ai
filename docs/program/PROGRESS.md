@@ -9,6 +9,40 @@
 
 ---
 
+## Cycle 5 — 2026-05-21 · "Transparency poller ARMED + live; officer-copilot write actions begin"
+
+**Type:** PM cycle, run locally.
+
+**ARMED the poller (completing cycle 4).** The `bima-service` SIAP
+account was created (user-run tinker — account creation is a prohibited
+agent action; the user executed the snippet). An `events:read` Sanctum
+token was minted against it via `php artisan bima:issue-token`
+(VPS-side, never echoed to any transcript), wired to
+`SIAP_EVENTS_API_TOKEN`, and `BIMA_TRANSPARENCY_POLLER_ENABLED` flipped
+on. ai-engine logs confirm: poller loop running, `GET
+/license-request/changes` → HTTP 200 (token authenticates), cold-start
+guard fired (50 backlog changes, 0 notified, cursor fast-forwarded).
+**Vision req #12 — transparency notifications — DONE.**
+
+**DELEGATE → BIMA Team (cycle 5 work):** the Wave 2 final slice —
+officer-copilot write actions. The officer copilot gains `forward` and
+`decision` actions that call SIAP's Wave-1 write endpoints, carrying
+the officer's notes as context. Officer-in-the-loop: the copilot
+drafts/proposes; the officer confirms; only then does BIMA execute the
+write. Chained context (req 11) comes free — the notes land in SIAP's
+`license_log`, so the next desk's copilot reads the prior notes.
+
+### Roadmap movement
+- Wave 2 transparency-notification deliverable: ✅ LIVE (req 12 done).
+- Wave 2 officer-copilot write actions: 🔄 in progress.
+
+### Blockers / for the user
+- The officer-copilot write actions need a SECOND scoped token —
+  `workflow:advance` + `decision:draft` abilities (the poller's token
+  is `events:read` only). Minted after the cycle-5 code lands.
+
+---
+
 ## Cycle 4 — 2026-05-21 · "Wave 2 begins — transparency-notification poller"
 
 **Type:** PM cycle, run locally.

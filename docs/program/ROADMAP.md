@@ -95,9 +95,8 @@ Wave 1's forward endpoint + state events.
 
 | Deliverable | Closes | Status |
 |---|---|---|
-| Wire the notification dispatcher to real triggers — transparency poller over SIAP's `/license-request/changes` feed (`citizen_progress` / `citizen_completed` / `citizen_needs_fix`) | 7, 12 | 🔄 merged `bima-ai#50`, deployed **dormant** — awaiting arming (mint `events:read` token, flip flag) |
-| Workflow orchestrator — state machine over SIAP's `license_approval_step` chain | 7, 16 | ⚪ next slice |
-| Forward-with-context — officer copilot gains a "forward to next stage" action carrying prior notes | 10, 11 | ⚪ next slice |
+| Wire the notification dispatcher to real triggers — transparency poller over SIAP's `/license-request/changes` feed (`citizen_progress` / `citizen_completed` / `citizen_needs_fix`) | 7, 12 | ✅ **LIVE** — armed 2026-05-21: `bima-service` account + `events:read` token wired, poller authenticating (HTTP 200), cold-start guard verified. **Req 12 done.** |
+| Forward-with-context — officer copilot gains "forward" + "decision" actions calling SIAP's write endpoints, carrying officer notes | 8, 10, 11 | 🔄 in progress (cycle 5) |
 
 ---
 
