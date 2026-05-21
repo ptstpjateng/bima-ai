@@ -70,11 +70,11 @@ in the SIAP repo (delivered with PR #21).
 
 | Deliverable | Closes / unblocks | Status |
 |---|---|---|
-| `POST /api/v1/license-request` — create a new license request | req 4 | 🔄 PR `ptstpjateng/SIAP#21` open, reviewed, awaiting human merge |
-| `POST /api/v1/license-request/{id}/forward` — advance the approval step | reqs 7, 10 | ⚪ designed (slice 2) |
-| `POST /api/v1/license-request/{id}/decision` — record an officer's decision + notes | reqs 8, 11 | ⚪ designed (slice 2) |
-| State-change events — `changed-since` polling endpoint over `license_log` (preferred over webhooks) | reqs 7, 12 | ⚪ designed (slice 3-4) |
-| Scoped, expiring Sanctum tokens (per-endpoint abilities) + a read-only Postgres role | audit S1, B1 | ⚪ slice 5 (ability *check* already wired in PR #21) |
+| `POST /api/v1/license-request` — create a new license request | req 4 | ✅ merged `SIAP#21`, live on Beta-SIAP |
+| `POST /api/v1/license-request/{id}/forward` — advance the approval step | reqs 7, 10 | ✅ merged `SIAP#22`, live on Beta-SIAP |
+| `POST /api/v1/license-request/{id}/decision` — record an officer's decision + notes | reqs 8, 11 | ✅ merged `SIAP#22`, live on Beta-SIAP (rejections route to the previous desk) |
+| State-change events — `changed-since` polling endpoint over `license_log` (preferred over webhooks) | reqs 7, 12 | ⚪ next slice |
+| Scoped, expiring Sanctum tokens (per-endpoint abilities) + a read-only Postgres role | audit S1, B1 | ⚪ next slice (ability *check* already wired in #21/#22) |
 
 **Dependencies:** none — SIAP Team can start immediately on Beta-SIAP.
 **Verification:** Integration Agent runs an end-to-end create→forward→
