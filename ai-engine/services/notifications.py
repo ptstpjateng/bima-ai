@@ -112,18 +112,34 @@ _TEMPLATES: dict[EventKind, TemplateSpec] = {
     ),
     "citizen_progress": TemplateSpec(
         name="bima_citizen_progress",
-        params=("name", "license_type", "next_stage", "eta_days"),
+        # Approved Meta body has SIX params (verified by test-fire 2026-05-21
+        # — Meta rejected a 4-param send with "The body has 6 parameters"):
+        #   "🔔 Halo {{1}}, izin {{2}} ({{3}}) sudah naik tahap ke {{4}}.
+        #    Estimasi selesai {{5}} hari kerja. Cek di
+        #    nolongin.com/track/{{6}} kapan saja."
+        # {{3}} (inline) and {{6}} (URL path) are BOTH the ticket — so
+        # "ticket" appears twice in the tuple. The caller still supplies a
+        # single "ticket" key; _coerce_params fills both positions from it.
+        params=("name", "license_type", "ticket", "next_stage", "eta_days", "ticket"),
         freeform_body=(
-            "🔔 Pak/Bu {name}, izin {license_type} naik tahap ke "
-            "{next_stage}. Estimasi selesai {eta_days} hari kerja."
+            "🔔 Halo {name}, izin {license_type} ({ticket}) sudah naik "
+            "tahap ke {next_stage}. Estimasi selesai {eta_days} hari kerja. "
+            "Cek di nolongin.com/track/{ticket} kapan saja."
         ),
     ),
     "citizen_completed": TemplateSpec(
         name="bima_citizen_completed",
-        params=("name", "license_type", "download_url"),
+        # Approved Meta body has FOUR params (verified by test-fire 2026-05-21
+        # — Meta rejected a 3-param send with "The body has 4 parameters"):
+        #   "🎉 Selamat {{1}}, izin {{2}} ({{3}}) sudah TERBIT. Unduh SK
+        #    ber-TTE di nolongin.com/track/{{4}} sekarang."
+        # {{3}} (inline) and {{4}} (URL path) are BOTH the ticket — see the
+        # citizen_progress note above.
+        params=("name", "license_type", "ticket", "ticket"),
         freeform_body=(
-            "🎉 Selamat Pak/Bu {name}, izin {license_type} sudah terbit. "
-            "Unduh SK di: {download_url}"
+            "🎉 Selamat {name}, izin {license_type} ({ticket}) sudah "
+            "TERBIT. Unduh SK ber-TTE di nolongin.com/track/{ticket} "
+            "sekarang."
         ),
     ),
     "citizen_needs_fix": TemplateSpec(
