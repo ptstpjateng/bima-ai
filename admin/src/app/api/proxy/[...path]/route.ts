@@ -19,10 +19,14 @@ import { cookies } from "next/headers";
 const ADMIN_API_URL =
   process.env.NEXT_PUBLIC_ADMIN_API_URL ?? "http://localhost:8001";
 
-// 25s upstream timeout — admin-api list queries should always come back well
-// within this; a hang past this point means upstream death and we want to
-// surface it to the user instead of holding a Vercel Function open.
-const UPSTREAM_TIMEOUT_MS = 25_000;
+// 50s upstream timeout. admin-api list queries return in well under a second;
+// the ceiling exists to surface a genuinely-dead upstream rather than holding
+// a Vercel Function open. It was raised from 25s when the Officer Copilot
+// landed: a copilot turn proxies a Gemini function-calling loop on ai-engine
+// (up to 5 tool rounds, ~45s worst case). A lower ceiling would clip a slow
+// but legitimate copilot turn. Normal routes are unaffected — they never
+// approach this.
+const UPSTREAM_TIMEOUT_MS = 50_000;
 
 type Ctx = { params: Promise<{ path: string[] }> };
 

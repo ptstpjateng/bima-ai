@@ -20,6 +20,7 @@ import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { ScoreGauge } from "@/components/case/score-gauge";
 import { IssueCard } from "@/components/case/issue-card";
+import { CopilotPanel } from "@/components/case/copilot-panel";
 import {
   CaseStatusBadge,
   DemoBadge,
@@ -217,31 +218,39 @@ export function CaseView({
         </div>
       </Card>
 
-      {/* (c) Issues list */}
-      <section aria-label="Daftar masalah" className="space-y-3">
-        <div className="flex items-baseline justify-between gap-3 px-1">
-          <h2 className="font-display text-lg sm:text-xl font-medium text-text-primary">
-            Masalah ditemukan
-          </h2>
-          <span className="text-xs text-text-muted tabular-nums">
-            {sortedIssues.length.toLocaleString("id-ID")} item
-          </span>
-        </div>
-
-        {sortedIssues.length === 0 ? (
-          <ReadyToSendCard />
-        ) : (
-          <div className="grid grid-cols-1 gap-3">
-            {sortedIssues.map((issue, i) => (
-              <IssueCard
-                key={`${issue.severity}-${issue.field}-${i}`}
-                issue={issue}
-                index={i}
-              />
-            ))}
+      {/* (c) Issues list + (d) Officer Copilot — two columns on xl. */}
+      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
+        <section aria-label="Daftar masalah" className="space-y-3">
+          <div className="flex items-baseline justify-between gap-3 px-1">
+            <h2 className="font-display text-lg sm:text-xl font-medium text-text-primary">
+              Masalah ditemukan
+            </h2>
+            <span className="text-xs text-text-muted tabular-nums">
+              {sortedIssues.length.toLocaleString("id-ID")} item
+            </span>
           </div>
-        )}
-      </section>
+
+          {sortedIssues.length === 0 ? (
+            <ReadyToSendCard />
+          ) : (
+            <div className="grid grid-cols-1 gap-3">
+              {sortedIssues.map((issue, i) => (
+                <IssueCard
+                  key={`${issue.severity}-${issue.field}-${i}`}
+                  issue={issue}
+                  index={i}
+                />
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* (d) Officer Copilot — leads with the validation summary. Sticky on
+            xl so it stays visible while the officer scrolls the issues. */}
+        <aside className="xl:sticky xl:top-6">
+          <CopilotPanel ticket={caseInfo.ticket} validation={validation} />
+        </aside>
+      </div>
     </div>
   );
 }
