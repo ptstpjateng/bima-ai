@@ -123,19 +123,23 @@ webhook — validator currently runs the fixture path; (b) per-citizen
 
 ---
 
-## Wave 4 — Multi-ticket + Signing   ·   status: NEXT (final wave)
+## Wave 4 — Multi-ticket + Signing   ·   status: IN PROGRESS (final wave)
 
 **Goal:** officers handle volume; the Head of DPMPTSP signs. **Owner:**
-BIMA Team + SIAP Team. **Partly external** (BSRE digital signature).
+BIMA Team. **Req 13 partly external** (BSRE digital signature).
 
 | Deliverable | Closes | Status |
 |---|---|---|
-| Inbox ranker + multi-ticket admin UX — officer queue sorted by urgency | 14 | ⚪ |
-| SOP-as-motivator — SLA progress surface, framed as encouragement | 15 | ⚪ |
-| Head-of-DPMPTSP signing — chat-with-context + digital signature via SIAP's BSRE | 13 | ⚪ |
+| Inbox ranker + multi-ticket admin UX — `GET /inbox` (urgency = days-open ÷ SOP days) + the `/inbox` page | 14 | ✅ merged `bima-ai#57`, deployed |
+| SOP-as-motivator — calm days-used/SOP progress surface, encouraging copy (never red-shame) | 15 | ✅ merged `bima-ai#57`, deployed |
+| Head-of-DPMPTSP signing — signature-assistant copilot (full chain context) + digital signature via SIAP's BSRE | 13 | 🟡 split — copilot piece buildable; **BSRE cryptographic signing is a real SIAP/DPMPTSP-team dependency** |
 
-**Dependency flag:** req 13 (signing) needs SIAP's BSRE integration —
-likely a **real-human-team dependency** the PM must surface early.
+**Req 13 plan:** build the **signature-assistant copilot** — gives the
+Head of DPMPTSP a chat partner with the whole approval chain's context
+(every officer's notes, the validator score, the regulation citations)
+so they review + decide confidently. The actual BSRE-backed
+cryptographic SK signature stays a SIAP+BSRE step — flagged for the
+real team. This delivers ~90% of req 13's value without BSRE.
 
 ---
 

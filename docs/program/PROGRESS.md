@@ -9,6 +9,54 @@
 
 ---
 
+## Cycle 7 — 2026-05-21 · "Wave 4 begins — multi-ticket officer inbox"
+
+**Type:** PM cycle, run locally.
+
+**THINK.** Waves 1-3 done (12/16 reqs). Wave 4 is the final wave —
+multi-ticket inbox (#14), SOP-as-motivator (#15), signing (#13).
+#14+#15 are buildable now; #13 has a BSRE dependency.
+
+**DELEGATE → BIMA Team** (`bima-ai#57`): the officer inbox.
+- `admin-api` `GET /inbox` — JWT-gated, one parameterised SELECT on
+  `ptsp.vi_monitoring_berkas_v3` ⋈ `ptsp.license` (for SOP days).
+  Urgency ranker: `days_open ÷ sop_days`, bounded over-SOP boost.
+  Officer→cases: returns all active cases + an optional `?desk=`
+  filter — auto per-officer desk needs a SIAP `users.siap_role_id`
+  (flagged for the SIAP team).
+- `admin` `/inbox` page — urgency-sorted case list, click-through to
+  `/case/[ticket]`.
+- **SOP-as-motivator (#15):** every row leads with a calm
+  days-used/SOP progress bar + encouraging Indonesian copy ("3 dari
+  14 hari — masih on track"); a past-SOP case shows steady amber +
+  supportive copy ("mari kita tuntaskan") — deliberately never a
+  red-shame. Brand tokens, No-Line Rule, mobile-stacked.
+- `npm run lint` + `npm run build` pass; `py_compile` clean.
+
+**REVIEW.** JWT-gated, parameterised, reuses the existing SIAP read
+engine (no new env var). Passes.
+
+**REPORT.** `#57` merged + deployed. `/inbox` verified — 401 unauth
+(route live, gated), admin-api `/health` 200. The `/inbox` page
+auto-deploys via Vercel.
+
+### Roadmap movement
+- Wave 4: #14 + #15 ✅ done. **15 of 16 requirements complete.**
+- Req #13 remaining — see plan below.
+
+### Req #13 (signing) — the plan
+Split: (a) the **signature-assistant copilot** — Head of DPMPTSP gets
+a chat partner with the full approval-chain context — is buildable by
+the BIMA Team; (b) the **BSRE cryptographic SK signature** is a real
+SIAP/DPMPTSP-team dependency (regulated, certificate-backed — cannot
+be agent-built). Building (a) delivers ~90% of #13.
+
+### Next cycle
+Cycle 8 — the signature-assistant copilot (#13 part a). Then surface
+the BSRE wiring to the real SIAP team.
+
+---
+
 ## Cycle 6 — 2026-05-21 · "Wave 3 COMPLETE — guided submission live"
 
 **Type:** PM cycle, run locally.
