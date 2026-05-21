@@ -267,10 +267,15 @@ async def _maybe_notify_needs_fix(
             _mask_phone(citizen_phone),
             result.status,
         )
+        # dedupe_key includes the score so an identical re-run (e.g. a
+        # retrying caller) is suppressed within the 6h window, but a
+        # genuine re-validation producing a DIFFERENT score still
+        # notifies the citizen. result.score is a 0.0-1.0 float.
         await notifications.notify(
             event="citizen_needs_fix",
             recipient_phone=citizen_phone,
             params=params,
+            dedupe_key=f"{ticket}:{int(round(result.score * 100))}",
         )
     except Exception:
         # Fire-and-forget: a notification failure must never surface to the
