@@ -87,20 +87,23 @@ explicit per-change user sign-off.
 
 ---
 
-## Wave 2 — Workflow + Transparency   ·   status: IN PROGRESS (unblocked 2026-05-21)
+## Wave 2 — Workflow + Transparency   ·   status: ✅ COMPLETE (2026-05-21)
 
 **Goal:** a license request moves through SIAP's approval chain with
-BIMA notifying everyone at each step. **Owner:** BIMA Team. **Needs:**
-Wave 1's forward endpoint + state events.
+BIMA notifying everyone at each step. **Owner:** BIMA Team.
 
 | Deliverable | Closes | Status |
 |---|---|---|
-| Wire the notification dispatcher to real triggers — transparency poller over SIAP's `/license-request/changes` feed (`citizen_progress` / `citizen_completed` / `citizen_needs_fix`) | 7, 12 | ✅ **LIVE** — armed 2026-05-21: `bima-service` account + `events:read` token wired, poller authenticating (HTTP 200), cold-start guard verified. **Req 12 done.** |
-| Forward-with-context — officer copilot gains "forward" + "decision" actions calling SIAP's write endpoints, carrying officer notes | 8, 10, 11 | 🔄 in progress (cycle 5) |
+| Transparency poller over SIAP's `/license-request/changes` feed (`citizen_progress` / `citizen_completed` / `citizen_needs_fix`) | 7, 12 | ✅ LIVE — `events:read` token wired, poller authenticating, cold-start guard verified |
+| Officer-copilot write actions — `forward_case` + `record_decision` calling SIAP's write endpoints, with an officer-in-the-loop confirmation guard; chained prior-desk notes via `get_case_log_notes` | 8, 10, 11 | ✅ merged `bima-ai#53`, deployed — `workflow:advance`+`decision:draft` token wired |
+
+**Wave 2 done.** The citizen↔officer workflow loop runs end-to-end on
+Beta-SIAP: BIMA drives the SIAP approval chain (officer-confirmed),
+and citizens get proactive WhatsApp updates at every stage.
 
 ---
 
-## Wave 3 — Guided Submission   ·   status: BLOCKED ON WAVE 1
+## Wave 3 — Guided Submission   ·   status: NEXT (unblocked)
 
 **Goal:** BIMA walks a citizen through filing a license application end
 to end. **Owner:** BIMA Team. **Needs:** Wave 1's create endpoint.
