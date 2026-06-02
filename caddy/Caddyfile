@@ -16,7 +16,18 @@
 	email rifqi.majid29@gmail.com
 }
 
-nolongin.com, www.nolongin.com {
+# ──────────────────────────────────────────────
+# Primary domains — nolongin.com (legacy) + bimaptsp.com (new brand).
+# Both are served identically during the migration window; nolongin.com will
+# be demoted to a 301-redirector once bimaptsp.com is stable (see the
+# commented-out redirect block at the bottom of this file).
+#
+# ACME note: bimaptsp.com requires a SINGLE A record → 116.254.113.81.
+# If a second A record (e.g. old registrar parking IP) exists, Let's
+# Encrypt HTTP-01 validation will fail intermittently. Remove any extra
+# A records at the registrar before reloading Caddy.
+# ──────────────────────────────────────────────
+nolongin.com, www.nolongin.com, bimaptsp.com, www.bimaptsp.com {
 	encode gzip
 
 	# Match nginx client_max_body_size 350M for Excel + PDF uploads
@@ -34,7 +45,7 @@ nolongin.com, www.nolongin.com {
 		-X-Powered-By
 	}
 
-	# AI-engine webhooks (Telegram legacy, WhatsApp/APTANA, web chat).
+	# AI-engine webhooks (Telegram, WhatsApp/APTANA, Meta-direct, web chat).
 	# Path prefix is preserved — ai-engine routers expect /webhook/<channel>.
 	handle /webhook/* {
 		reverse_proxy ai-engine:8000 {
@@ -44,10 +55,36 @@ nolongin.com, www.nolongin.com {
 		}
 	}
 
-	# Root → public portal (admin lives at admin.nolongin.com now).
-	# Permanent redirect; the old `redir /admin 302` sent anonymous visitors to the
-	# Laravel admin login, which leaked the legacy stack to anyone who typed the bare
-	# domain. Public face is now portal.nolongin.com.
+	# Root → public portal. During migration window, both old and new portal
+	# URLs are valid; bimaptsp.com visitors land on portal.bimaptsp.com.
+	# Citizens who saved portal.nolongin.com/track/... links still work because
+	# nolongin.com still resolves here.
+	@bimaptsp_apex host bimaptsp.com www.bimaptsp.com
+	handle @bimaptsp_apex {
+		handle / {
+			redir https://portal.bimaptsp.com 301
+		}
+		# Admin API on bimaptsp.com/admin-api/* — same upstream as nolongin.com
+		handle_path /admin-api/* {
+			reverse_proxy admin-api:8001 {
+				transport http {
+					read_timeout 60s
+				}
+			}
+		}
+		handle {
+			reverse_proxy backend:80 {
+				transport http {
+					read_timeout 300s
+					write_timeout 300s
+					dial_timeout 60s
+				}
+				flush_interval -1
+			}
+		}
+	}
+
+	# nolongin.com routes (unchanged — keeps existing bookmarks working)
 	handle / {
 		redir https://portal.nolongin.com 301
 	}
@@ -76,13 +113,17 @@ nolongin.com, www.nolongin.com {
 	}
 }
 
+# ── FUTURE: once bimaptsp.com is the primary brand, uncomment this block
+# ── and remove bimaptsp.com from the combined block above.
+# nolongin.com, www.nolongin.com {
+# 	redir https://bimaptsp.com{uri} 301
+# }
+
 # ──────────────────────────────────────────────
-# Beta-SIAP Jateng (staging clone for BIMA integration testing).
-# Lives behind beta-siap.nolongin.com. Same Let's Encrypt auto-provisioning
-# Caddy handles for nolongin.com. PII risk on this subdomain explicitly
-# accepted by user on 2026-05-19 (real SIAP dump restored).
+# Beta-SIAP Jateng — both old and new domain during migration.
+# PII risk accepted 2026-05-19.
 # ──────────────────────────────────────────────
-beta-siap.nolongin.com {
+beta-siap.nolongin.com, beta-siap.bimaptsp.com {
 	encode gzip
 
 	# Match nginx client_max_body_size 350M for SIAP's Excel + PDF + shapefile uploads
