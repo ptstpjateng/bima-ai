@@ -38,8 +38,17 @@ from services import notifications
 from services.agents.validator import (
     SUPPORTED_DOC_TYPES,
     Document,
+    Issue as ValidatorIssue,
     ValidationResult,
+    cross_validate as v1_cross_validate,
+    extract_document as v1_extract_document,
     validate_submission,
+)
+from services.agents.suitability_judge import (
+    Issue as SuitabilityIssue,
+    SuitabilityResult,
+    UploadedDoc,
+    judge_submission,
 )
 
 logger = logging.getLogger("bima_ai.validator")
@@ -413,5 +422,290 @@ async def validate_submission_endpoint(
                 related_docs=i.related_docs,
             )
             for i in result.issues
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# /v1/validator/suitability — Phase 5+ §5B (post-demo)
+#
+# Three new scoring dimensions on top of the v1 validator:
+#   1. completeness  — required docs present?
+#   2. type_correctness — does each file match its claimed type?
+#   3. suitability — does each doc satisfy its requirement text?
+#
+# The existing cross-doc consistency checks (v1) are still produced and
+# passed through as `compatibility_findings` so the admin UI's "Issues"
+# tab still surfaces them. Auth-gated like /submission; the admin
+# follow-up PR will surface results in a tabbed view at /case/[ticket].
+# ---------------------------------------------------------------------------
+
+
+class SuitabilityDocumentInput(BaseModel):
+    """One uploaded document for the suitability endpoint.
+
+    Note: unlike /submission, `claimed_type` is FREE TEXT here — the agent
+    canonicalises it. This lets admin-api forward whatever label the
+    citizen attached without re-validating against the v1 enum.
+    """
+
+    file_id: str = Field(..., min_length=1, max_length=128, description="Opaque admin-api file id.")
+    claimed_type: str = Field(..., min_length=1, max_length=64)
+    filename: str = Field(..., min_length=1, max_length=255)
+    mime_type: str = Field(..., min_length=1, max_length=100)
+    content_base64: str = Field(..., description="Base64-encoded file bytes.")
+
+
+class SuitabilityRequest(BaseModel):
+    license_id: int = Field(..., gt=0, description="SIAP license_id — required.")
+    documents: list[SuitabilityDocumentInput] = Field(..., min_length=1)
+    # Mirror /submission so admin-api can route the same notification
+    # context through if it wants to follow up with a citizen ping later.
+    # The suitability endpoint itself does NOT auto-notify (post-demo
+    # scope; the UI surfaces results first).
+    ticket: str | None = Field(default=None, max_length=32)
+
+
+class CompletenessOut(BaseModel):
+    score: float = Field(..., ge=0.0, le=1.0)
+    missing: list[str]
+    required: list[str]
+    note: Optional[str] = None
+
+
+class TypeCorrectnessOut(BaseModel):
+    file: str
+    file_id: str
+    claimed_type: str
+    detected_type: str
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    matches: bool
+    note: Optional[str] = None
+
+
+class SuitabilityFindingOut(BaseModel):
+    requirement: str
+    file: Optional[str] = None
+    file_id: Optional[str] = None
+    judgement: str  # match | partial | mismatch | unknown
+    evidence: str
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+
+class SuitabilityIssueOut(BaseModel):
+    id: str
+    severity: str
+    title: str
+    detail: str
+
+
+class SuitabilityResponse(BaseModel):
+    license_id: int
+    completeness: CompletenessOut
+    type_correctness: list[TypeCorrectnessOut]
+    suitability: list[SuitabilityFindingOut]
+    compatibility_findings: list[SuitabilityIssueOut]
+    overall_suitability_score: float = Field(..., ge=0.0, le=1.0)
+    overall_suitability_percent: int = Field(..., ge=0, le=100)
+    issues: list[SuitabilityIssueOut]
+
+
+def _v1_issues_to_suitability_issues(
+    v1_issues: list[ValidatorIssue],
+) -> list[SuitabilityIssue]:
+    """Reshape v1 validator Issues (severity/field/message) into the
+    suitability Issue model (id/severity/title/detail). The title is the
+    field name humanised; the detail is the message. Filenames in
+    related_docs are appended to the detail so the admin card still has
+    cross-reference info."""
+    out: list[SuitabilityIssue] = []
+    for i in v1_issues:
+        detail = i.message
+        if i.related_docs:
+            detail = f"{detail} (berkas: {', '.join(i.related_docs)})"
+        out.append(SuitabilityIssue(
+            id=f"compat:{i.field}",
+            severity=i.severity,
+            title=i.field.replace("_", " ").capitalize(),
+            detail=detail,
+        ))
+    return out
+
+
+async def _run_v1_compatibility(documents: list[UploadedDoc]) -> list[SuitabilityIssue]:
+    """Run the v1 extract+cross_validate pipeline on the upload set and
+    return its Issues reshaped for the suitability schema.
+
+    Wrapped in defensive try/except: a compatibility failure must not
+    crash the whole suitability response — the dimension simply degrades
+    to empty.
+    """
+    try:
+        # The v1 validator only knows ktp/nib/npwp. Map by canonical
+        # class so the suitability caller can pass arbitrary labels.
+        from services.agents.suitability_judge import _canonical_class  # local import
+        v1_docs: list[Document] = []
+        canonical_to_v1 = {"KTP": "ktp", "NIB": "nib", "NPWP": "npwp"}
+        for d in documents:
+            v1_type = canonical_to_v1.get(_canonical_class(d.claimed_type))
+            if v1_type is None:
+                continue
+            v1_docs.append(Document(
+                doc_type=v1_type,
+                mime_type=d.mime_type,
+                filename=d.filename,
+                content=d.content,
+            ))
+        if not v1_docs:
+            return []
+
+        extracted_lists = await asyncio.gather(
+            *[v1_extract_document(d) for d in v1_docs], return_exceptions=False
+        )
+        per_doc: dict[str, dict[str, Any]] = {}
+        for v1_doc, fields in zip(v1_docs, extracted_lists):
+            if fields is None or v1_doc.doc_type in per_doc:
+                continue
+            per_doc[v1_doc.doc_type] = fields
+        v1_issues = v1_cross_validate(per_doc, v1_docs)
+        return _v1_issues_to_suitability_issues(v1_issues)
+    except Exception:
+        logger.exception("v1 compatibility pass failed in suitability endpoint")
+        return []
+
+
+@router.post(
+    "/suitability",
+    response_model=SuitabilityResponse,
+    summary="Score a submission's completeness, type-correctness, and suitability",
+)
+async def suitability_endpoint(
+    _internal: Annotated[bool, Depends(require_internal_key)],
+    body: SuitabilityRequest,
+) -> SuitabilityResponse:
+    if len(body.documents) > _MAX_DOCS_PER_REQUEST:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Maximum {_MAX_DOCS_PER_REQUEST} documents per request.",
+        )
+
+    documents: list[UploadedDoc] = []
+    for doc_input in body.documents:
+        try:
+            content = base64.b64decode(doc_input.content_base64, validate=True)
+        except (ValueError, Exception) as e:
+            logger.warning(
+                "suitability base64 decode failed | filename=%s | err=%s",
+                doc_input.filename, e,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Document '{doc_input.filename}' is not valid base64.",
+            )
+
+        if len(content) > _MAX_BYTES_PER_DOC:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"Document '{doc_input.filename}' is "
+                    f"{len(content) / 1024 / 1024:.1f} MB, max "
+                    f"{_MAX_BYTES_PER_DOC / 1024 / 1024:.0f} MB allowed per file."
+                ),
+            )
+
+        documents.append(UploadedDoc(
+            file_id=doc_input.file_id,
+            claimed_type=doc_input.claimed_type,
+            filename=doc_input.filename,
+            mime_type=doc_input.mime_type,
+            content=content,
+        ))
+
+    logger.info(
+        "Suitability request | license_id=%s docs=%d ticket=%s",
+        body.license_id, len(documents), body.ticket or "<none>",
+    )
+
+    # Run v1 compatibility in parallel with the new suitability layer so
+    # the endpoint's wall-clock matches /submission. judge_submission
+    # accepts compatibility_findings as input — but we want to compute
+    # them in parallel, so we kick both off then await.
+    compat_task = asyncio.create_task(_run_v1_compatibility(documents))
+    suit_task = asyncio.create_task(
+        judge_submission(
+            license_id=body.license_id,
+            documents=documents,
+            compatibility_findings=None,  # injected below
+        )
+    )
+
+    compatibility_findings = await compat_task
+    suit_result: SuitabilityResult = await suit_task
+
+    # Merge the parallel-computed compatibility findings into the result
+    # without re-running the suitability/type/completeness logic. We
+    # re-sort the issue list afterwards because adding HIGH/CRITICAL
+    # compatibility issues can change priority order.
+    suit_result.compatibility_findings = compatibility_findings
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    merged_issues = list(suit_result.issues)
+    # Drop any leftover passthrough placeholders the agent may have added,
+    # then re-append the freshly-computed compatibility issues.
+    merged_issues = [
+        i for i in merged_issues if not i.id.startswith("compat:")
+    ] + compatibility_findings
+    merged_issues.sort(key=lambda i: severity_rank.get(i.severity, 99))
+    suit_result.issues = merged_issues
+
+    return SuitabilityResponse(
+        license_id=body.license_id,
+        completeness=CompletenessOut(
+            score=suit_result.completeness.score,
+            missing=suit_result.completeness.missing,
+            required=suit_result.completeness.required,
+            note=suit_result.completeness.note,
+        ),
+        type_correctness=[
+            TypeCorrectnessOut(
+                file=f.file,
+                file_id=f.file_id,
+                claimed_type=f.claimed_type,
+                detected_type=f.detected_type,
+                confidence=f.confidence,
+                matches=f.matches,
+                note=f.note,
+            )
+            for f in suit_result.type_correctness
+        ],
+        suitability=[
+            SuitabilityFindingOut(
+                requirement=f.requirement,
+                file=f.file,
+                file_id=f.file_id,
+                judgement=f.judgement,
+                evidence=f.evidence,
+                confidence=f.confidence,
+            )
+            for f in suit_result.suitability
+        ],
+        compatibility_findings=[
+            SuitabilityIssueOut(
+                id=i.id,
+                severity=i.severity,
+                title=i.title,
+                detail=i.detail,
+            )
+            for i in suit_result.compatibility_findings
+        ],
+        overall_suitability_score=suit_result.overall_suitability_score,
+        overall_suitability_percent=int(round(suit_result.overall_suitability_score * 100)),
+        issues=[
+            SuitabilityIssueOut(
+                id=i.id,
+                severity=i.severity,
+                title=i.title,
+                detail=i.detail,
+            )
+            for i in suit_result.issues
         ],
     )
