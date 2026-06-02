@@ -177,7 +177,7 @@ function StatusCard({ record }: { record: TrackingRecord }) {
   return (
     <section
       aria-labelledby="status-heading"
-      className="rounded-2xl bg-white/[0.03] p-6 ring-1 ring-white/[0.04] backdrop-blur-sm sm:p-8"
+      className="rounded-2xl bg-surface p-6 ring-1 ring-border  sm:p-8"
     >
       <h2 id="status-heading" className="sr-only">
         Status permohonan
@@ -211,7 +211,7 @@ function StatusCard({ record }: { record: TrackingRecord }) {
 
 function NotFoundCard({ ticket }: { ticket: string }) {
   return (
-    <section className="rounded-2xl bg-white/[0.03] p-6 ring-1 ring-white/[0.04] backdrop-blur-sm sm:p-8">
+    <section className="rounded-2xl bg-surface p-6 ring-1 ring-border  sm:p-8">
       <h2 className="font-display text-xl font-semibold text-text-primary">
         Tiket tidak ditemukan
       </h2>
@@ -227,7 +227,7 @@ function NotFoundCard({ ticket }: { ticket: string }) {
 
 function ServiceDownCard({ ticket, reason }: { ticket: string; reason: string }) {
   return (
-    <section className="rounded-2xl bg-brand-amber/[0.04] p-6 ring-1 ring-brand-amber/20 backdrop-blur-sm sm:p-8">
+    <section className="rounded-2xl bg-brand-amber/[0.04] p-6 ring-1 ring-brand-amber/20  sm:p-8">
       <h2 className="font-display text-xl font-semibold text-text-primary">
         Sementara tidak dapat memeriksa
       </h2>
@@ -265,7 +265,7 @@ function Field({
 
 function CtaFooter() {
   return (
-    <div className="mt-6 rounded-xl border border-white/5 bg-white/[0.02] p-5">
+    <div className="mt-6 rounded-xl border border-border bg-surface-2 p-5">
       <p className="text-sm text-text-secondary">
         Ada pertanyaan lanjutan? BIMA siap membantu di WhatsApp.
       </p>

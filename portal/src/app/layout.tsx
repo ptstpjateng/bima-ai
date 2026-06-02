@@ -1,22 +1,24 @@
 import type { Metadata } from "next";
-import { Jost, Work_Sans } from "next/font/google";
+import { Plus_Jakarta_Sans, Lexend } from "next/font/google";
 import { cn } from "@/lib/utils";
 import "./globals.css";
 
-// Brand-locked fonts per BIMA-Vault/Brand.md.
-// Jost = display (Futura alternative, geometric).
-// Work Sans = body / UI (humanist sans).
-const jost = Jost({
+// BIMA design system fonts (see BIMA-Vault/BIMA Design System.md).
+// Plus Jakarta Sans = display — geometric, echoes the lowercase "bima"
+//   wordmark; Indonesian-made, fitting for a Jawa Tengah public service.
+// Lexend = body/UI — engineered for reading proficiency (accessibility),
+//   the skill's recommendation for government surfaces.
+const display = Plus_Jakarta_Sans({
   subsets: ["latin"],
   variable: "--font-display",
-  weight: ["400", "500", "600", "700"],
+  weight: ["500", "600", "700", "800"],
   display: "swap",
 });
 
-const workSans = Work_Sans({
+const sans = Lexend({
   subsets: ["latin"],
   variable: "--font-sans",
-  weight: ["400", "500", "600"],
+  weight: ["300", "400", "500", "600"],
   display: "swap",
 });
 
@@ -34,12 +36,12 @@ export default function RootLayout({
   return (
     <html
       lang="id"
-      className={cn("dark", jost.variable, workSans.variable)}
+      className={cn(display.variable, sans.variable)}
       suppressHydrationWarning
     >
-      <body className="bg-surface-base text-text-primary antialiased min-h-screen">
-        {children}
-      </body>
+      {/* Light-first per the Bima Guidelines; dark mode follows the OS via
+          prefers-color-scheme (and a future .dark/.light toggle). */}
+      <body className="bg-bg text-ink antialiased min-h-screen">{children}</body>
     </html>
   );
 }
