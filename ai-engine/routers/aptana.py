@@ -150,6 +150,20 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
 
     record_engagement(msisdn)
 
+    # Greeting dedup — WhatsApp fires BOTH ReceiveGreetingRequest AND
+    # ReceiveMessageMeta for a user's very first message. The APTANA Greeting
+    # worker forwards the greeting event here AND the Inbound worker forwards
+    # the message event here, often within milliseconds of each other.
+    # If _send_greeting already fired for this number in the last few seconds,
+    # skip AI processing — the greeting IS the welcome response. Without this
+    # guard the user sees the greeting message + a second AI reply to "haloo".
+    if _was_recently_greeted(msisdn):
+        logger.info(
+            "APTANA inbound deduped (greeting just sent) | user=%s text=%r",
+            _mask(msisdn), sanitized[:40],
+        )
+        return {"ok": True, "skipped": "greeted"}
+
     background.add_task(
         _process_inbound, msisdn=msisdn, text=sanitized, name=name, message_id=message_id
     )
@@ -221,6 +235,34 @@ _GREETING_BODY = (
     "• \"Berapa lama proses izin OSS RBA?\""
 )
 
+# ---------------------------------------------------------------------------
+# Greeting dedup — prevents double messages when WhatsApp fires BOTH a
+# ReceiveGreetingRequest AND a ReceiveMessageMeta for the same first-contact
+# message (e.g. user opens chat and immediately types "halo").
+#
+# When the greeting endpoint fires, we stamp the msisdn with the current
+# time. The inbound handler checks this stamp: if a greeting went out for
+# this number within the last N seconds, the inbound is silently skipped
+# (the greeting IS the response). The window is short — just long enough
+# for both APTANA workers to fire and arrive at BIMA.
+# ---------------------------------------------------------------------------
+import time as _time
+_GREETING_DEDUP_WINDOW_SECONDS = 8.0
+_recently_greeted: dict[str, float] = {}   # msisdn → unix timestamp of last greeting send
+
+
+def _mark_greeted(msisdn: str) -> None:
+    _recently_greeted[msisdn] = _time.time()
+    # Prune entries older than the window to keep memory bounded.
+    cutoff = _time.time() - _GREETING_DEDUP_WINDOW_SECONDS
+    for k in [k for k, v in list(_recently_greeted.items()) if v < cutoff]:
+        _recently_greeted.pop(k, None)
+
+
+def _was_recently_greeted(msisdn: str) -> bool:
+    ts = _recently_greeted.get(msisdn)
+    return ts is not None and (_time.time() - ts) < _GREETING_DEDUP_WINDOW_SECONDS
+
 
 @router.post("/webhook/aptana/greeting/{path_secret}")
 async def aptana_greeting(path_secret: str, request: Request, background: BackgroundTasks):
@@ -256,11 +298,19 @@ async def aptana_greeting(path_secret: str, request: Request, background: Backgr
 async def _send_greeting(msisdn: str, name: str | None = None) -> None:
     """Send the static welcome message; never raises."""
     body = _GREETING_BODY
-    if name:
-        # Personalise the first line with the user's WhatsApp display name.
-        # Keep the rest verbatim.
+
+    # Personalise if APTANA provided a real display name.
+    # Guard: APTANA's ReceiveGreetingRequest trigger may send the literal
+    # string "{{name}}" when the variable is unavailable — detect this and
+    # fall back to the generic greeting so citizens never see "Halo {{name}}!".
+    if name and not name.startswith("{{"):
         first_name = name.strip().split(" ")[0][:30]
         body = body.replace("Halo! 👋", f"Halo {first_name}! 👋", 1)
+
+    # Stamp this number as recently greeted BEFORE the send so the inbound
+    # handler sees it even if the send is slow.
+    _mark_greeted(msisdn)
+    record_engagement(msisdn)   # greeting counts as opt-in
 
     delivered = await send_text(recipient_phone=msisdn, body=body)
     if not delivered:
