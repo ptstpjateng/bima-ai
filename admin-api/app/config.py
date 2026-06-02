@@ -60,6 +60,31 @@ def _looks_like_placeholder(value: str) -> bool:
     return bool(_PLACEHOLDER_PATTERN.search(value))
 
 
+# ---------------------------------------------------------------------------
+# Safe built-in allow-list defaults.
+#
+# Mirror ai-engine/main.py so the two services stay in lock-step. NEVER
+# includes '*' — we'd rather break a fresh deploy than silently accept
+# cross-site requests from arbitrary origins / hosts.
+#
+# Updating these is a code change on purpose; env override is the supported
+# runtime knob (CORS_ALLOW_ORIGINS / TRUSTED_HOSTS).
+# ---------------------------------------------------------------------------
+DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
+    "https://portal.nolongin.com",
+    "https://admin.nolongin.com",
+    "https://portal.bimaptsp.com",
+    "https://admin.bimaptsp.com",
+)
+DEFAULT_TRUSTED_HOSTS: tuple[str, ...] = (
+    "nolongin.com",
+    "*.nolongin.com",
+    "bimaptsp.com",
+    "*.bimaptsp.com",
+    "localhost",
+)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -109,10 +134,45 @@ class Settings(BaseSettings):
     JWT_EXPIRY_DAYS: int = Field(default=7, ge=1, le=90)
 
     # ---- CORS / trusted hosts ------------------------------------------
-    # Comma-separated string in env, parsed to a list of clean origins below.
+    # Three knobs, listed in precedence order:
+    #
+    #   1. CORS_ALLOW_ORIGINS — explicit override. Comma-separated full origins
+    #      (scheme + host). When set, this REPLACES the ADMIN_FRONTEND_URL
+    #      list. Use this in prod when origins diverge from "the one admin
+    #      frontend URL" (e.g. supporting both nolongin.com and bimaptsp.com).
+    #   2. ADMIN_FRONTEND_URL — legacy single-purpose var, kept for backward
+    #      compat with existing local-dev `.env` files. Comma-separated.
+    #   3. Built-in safe defaults — used when both vars are empty/unset. NEVER
+    #      "*"; we'd rather break a misconfigured deploy than silently accept
+    #      cross-site requests from arbitrary origins.
+    #
+    # TRUSTED_HOSTS is a separate independent knob (host headers, not origins):
+    #   - When set, REPLACES the auto-derived host list.
+    #   - When unset, hosts are derived from cors_origins (matches old behaviour)
+    #     plus a safe default list.
+    CORS_ALLOW_ORIGINS: str = Field(
+        default="",
+        description=(
+            "Comma-separated allowed CORS origins (full scheme+host, e.g. "
+            "https://admin.nolongin.com). Empty falls back to ADMIN_FRONTEND_URL "
+            "then to a safe built-in default list. Never '*'."
+        ),
+    )
     ADMIN_FRONTEND_URL: str = Field(
         default="http://localhost:3000",
-        description="Comma-separated allowed origins for the admin frontend.",
+        description=(
+            "Legacy: comma-separated allowed origins for the admin frontend. "
+            "Prefer CORS_ALLOW_ORIGINS in new deployments."
+        ),
+    )
+    TRUSTED_HOSTS: str = Field(
+        default="",
+        description=(
+            "Comma-separated trusted Host header values (bare hostnames, no "
+            "scheme). Starlette supports wildcard subdomains like '*.foo.com'. "
+            "Empty falls back to the host part of cors_origins + safe defaults. "
+            "Never '*'."
+        ),
     )
 
     # ---- ai-engine cross-service ---------------------------------------
@@ -231,17 +291,44 @@ class Settings(BaseSettings):
             )
         return v
 
+    @staticmethod
+    def _split_csv(raw: str) -> list[str]:
+        """Comma-split, strip, drop empties. Pure function for testability."""
+        return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
     @property
     def cors_origins(self) -> list[str]:
-        """Parsed allow-list. Strips whitespace, drops empties."""
-        return [origin.strip() for origin in self.ADMIN_FRONTEND_URL.split(",") if origin.strip()]
+        """
+        Resolved CORS allow-list.
+
+        Precedence:
+          1. CORS_ALLOW_ORIGINS (explicit, comma-separated).
+          2. ADMIN_FRONTEND_URL (legacy single-purpose var).
+          3. Built-in safe defaults — never '*'.
+        """
+        explicit = self._split_csv(self.CORS_ALLOW_ORIGINS)
+        if explicit:
+            return explicit
+        legacy = self._split_csv(self.ADMIN_FRONTEND_URL)
+        if legacy:
+            return legacy
+        return list(DEFAULT_CORS_ORIGINS)
 
     @property
     def trusted_hosts(self) -> list[str]:
         """
-        TrustedHostMiddleware wants bare hostnames (no scheme, no path). Build
-        them from the same env var so admin operators only configure one thing.
+        Resolved TrustedHostMiddleware allow-list (bare hostnames, no scheme).
+
+        Precedence:
+          1. TRUSTED_HOSTS (explicit, comma-separated; supports '*.foo.com').
+          2. Auto-derived from cors_origins host parts + a safe default list.
+             This preserves the prior behaviour where one env var configured
+             both CORS and TrustedHost in lock-step.
         """
+        explicit = self._split_csv(self.TRUSTED_HOSTS)
+        if explicit:
+            return explicit
+
         from urllib.parse import urlparse
 
         hosts: list[str] = []
@@ -250,9 +337,12 @@ class Settings(BaseSettings):
             host = parsed.hostname
             if host:
                 hosts.append(host)
-        # Also allow the in-cluster service name so health-checks from the
-        # Docker network don't 400 on Host validation.
+        # Always allow the in-cluster service name + loopback so internal
+        # health-checks don't 400 on Host validation; otherwise fall back to
+        # the safe default suffix list when no CORS host was derivable.
         hosts.extend(["admin-api", "localhost", "127.0.0.1"])
+        if not any(h for h in hosts if h not in {"admin-api", "localhost", "127.0.0.1"}):
+            hosts.extend(DEFAULT_TRUSTED_HOSTS)
         # De-dupe while preserving order.
         return list(dict.fromkeys(hosts))
 
