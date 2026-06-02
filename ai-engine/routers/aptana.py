@@ -37,6 +37,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from services.ai_handler import generate_ai_response, log_to_backend
 from services.input_sanitizer import sanitize_user_input
+from services.notifications import record_engagement, record_opt_out
 from services.prompt_injection_detector import audit_user_input
 from services.whatsapp_sender import acknowledge_received, send_text
 
@@ -130,6 +131,24 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
         )
         return {"ok": True, "skipped": "sanitized_empty"}
     audit_user_input(f"wa-{msisdn}", sanitized)
+
+    # Meta compliance: record engagement (opt-in) + check for STOP/opt-out.
+    # Done synchronously so the records are committed before the background task
+    # reads them — record_engagement is O(1) with in-memory set + async file write.
+    _OPT_OUT_TOKENS = {"stop", "berhenti", "unsubscribe", "opt out", "optout", "hentikan notif"}
+    if sanitized.lower().strip() in _OPT_OUT_TOKENS:
+        record_opt_out(msisdn)
+        background.add_task(
+            send_text,
+            recipient_phone=msisdn,
+            body=(
+                "Oke, notifikasi otomatis dari BIMA untuk nomor ini sudah kami nonaktifkan. "
+                "Anda masih bisa tanya apa saja kapan saja — BIMA tetap siap membantu 🙏"
+            ),
+        )
+        return {"ok": True, "opted_out": True}
+
+    record_engagement(msisdn)
 
     background.add_task(
         _process_inbound, msisdn=msisdn, text=sanitized, name=name, message_id=message_id
