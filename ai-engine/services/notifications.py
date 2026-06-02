@@ -600,6 +600,17 @@ async def notify(
     if sent:
         _record_send(recipient_phone)
         _record_idempotency(event, dedupe_key)
+        # Delivery tracking — link this outbound to its ticket so the status
+        # webhook can later mark it delivered/read. ticket comes from params
+        # (every citizen template carries it) or the dedupe_key "<ticket>:<log_id>".
+        try:
+            from services import delivery_tracker
+            ticket = params.get("ticket") or (
+                (dedupe_key or "").split(":", 1)[0] or None
+            )
+            delivery_tracker.record_sent(recipient_phone, ticket, event)
+        except Exception:  # never let tracking break the send path
+            logger.exception("delivery tracker record_sent failed (non-fatal)")
 
     return sent
 

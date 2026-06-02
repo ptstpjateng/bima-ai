@@ -38,6 +38,13 @@ _SENDER_NUMBER = os.getenv("APTANA_SENDER_NUMBER", "")
 _NATIVE_TYPING_ENABLED = os.getenv("BIMA_NATIVE_TYPING_ENABLED", "false").lower() in ("1", "true", "yes")
 _KEEP_TEXT_BUBBLE = os.getenv("BIMA_NATIVE_TYPING_KEEP_TEXT_BUBBLE", "false").lower() in ("1", "true", "yes")
 
+# Interim "💭 Sebentar ya…" text bubble. Default OFF as of 2026-06-02 (user
+# decision): the bubble cluttered every exchange with an extra message, and the
+# native typing indicator isn't available via APTANA, so we accept a short
+# silent gap during generation in exchange for a clean chat. Set
+# BIMA_ACK_TEXT_BUBBLE_ENABLED=true to bring it back without a redeploy.
+_ACK_TEXT_BUBBLE_ENABLED = os.getenv("BIMA_ACK_TEXT_BUBBLE_ENABLED", "false").lower() in ("1", "true", "yes")
+
 # One-time INFO hint so "flag on but META_WA_* unset" doesn't spam the logs.
 _native_hint_logged = False
 
@@ -235,7 +242,12 @@ async def acknowledge_received(message_id: str | None, recipient_phone: str) -> 
             # Native path must NEVER kill the handler. Mask + fall back.
             logger.warning("Native typing attempt raised | to=%s — falling back", masked)
 
-    # --- Text-bubble fallback (the locked default behavior). ---
+    # --- Text-bubble acknowledgment (OFF by default since 2026-06-02). ---
+    # When native typing is unavailable AND the bubble is disabled, this is a
+    # clean no-op: the citizen sees no interim message, just BIMA's real reply
+    # when it's ready. Re-enable with BIMA_ACK_TEXT_BUBBLE_ENABLED=true.
+    if not _ACK_TEXT_BUBBLE_ENABLED:
+        return
     try:
         await send_text(recipient_phone=recipient_phone, body=_ACK_BODY)
     except Exception:
