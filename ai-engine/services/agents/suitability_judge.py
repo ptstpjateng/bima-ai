@@ -58,6 +58,7 @@ from typing import Any, Optional
 
 from services.gemini_vision import extract_structured, is_configured as vision_configured
 from services.siap_db import get_siap_pool, is_siap_db_configured
+from services.siap_tools import _html_to_lines
 
 logger = logging.getLogger("bima_ai.suitability_judge")
 
@@ -223,17 +224,26 @@ async def get_license_requirements(license_id: int) -> tuple[list[str], Optional
             ]
             note: Optional[str] = None
             if not requirements:
-                # No structured rows — confirm the license itself exists,
-                # otherwise the caller's license_id is wrong and we should
-                # say so rather than report "0 requirements".
+                # No structured rows (true for ~half of licenses, incl. 358).
+                # Fall back to the HTML requirements blob and ACTUALLY PARSE it
+                # with the same stdlib stripper siap_tools uses for the
+                # citizen-facing requirements list — so completeness scoring
+                # has a real denominator instead of collapsing to 0/0.
                 lic = await conn.fetchrow(_SQL_LICENSE_HTML_REQUIREMENTS, int(license_id))
                 if lic is None:
                     note = f"License {license_id} tidak ditemukan di SIAP."
-                elif not (lic["requirements_html"] or "").strip():
-                    note = (
-                        "Daftar persyaratan terstruktur belum tersedia di SIAP "
-                        "untuk izin ini."
-                    )
+                else:
+                    html_reqs = _html_to_lines(lic["requirements_html"])
+                    if html_reqs:
+                        # Parsed from HTML — flag the provenance so the caller
+                        # can note these came from free-text, not a structured
+                        # registry (slightly noisier, but real).
+                        requirements = html_reqs
+                    else:
+                        note = (
+                            "Daftar persyaratan belum tersedia di SIAP "
+                            "untuk izin ini."
+                        )
 
         _registry_cache[license_id] = (now + _REGISTRY_TTL_SECONDS, list(requirements))
         return requirements, note

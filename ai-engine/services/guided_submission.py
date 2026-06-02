@@ -315,6 +315,11 @@ class SubmissionSession:
     # the last content-scoring result (kept so a 'KIRIM' retry and the officer
     # brief can reuse it without re-running Gemini Vision).
     last_score: Optional[dict[str, Any]] = None
+    # True once the citizen has been shown the "send as-is" override prompt for
+    # a sub-threshold packet. The NEXT KIRIM/YA then force-submits past the
+    # ok-gate (otherwise KIRIM loops forever — a flawed packet could never be
+    # filed). Reset implicitly per session.
+    override_offered: bool = False
     # the resulting SIAP ticket once submitted (for officer-brief wiring).
     ticket: Optional[str] = None
     request_id: Optional[int] = None
@@ -889,10 +894,13 @@ async def _enter_doc_scoring(sess: SubmissionSession) -> str:
     return "✅ Semua data pemohon terkumpul.\n\n" + _fmt_review(sess)
 
 
-async def _submit(sess: SubmissionSession) -> str:
+async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     """REVIEW + citizen confirmed: run the validator, then submit to SIAP.
 
-    Validation issues → tell the citizen what to fix, do NOT submit.
+    Validation issues → tell the citizen what to fix, do NOT submit, and offer
+    a "send as-is" override.
+    `force=True` → the citizen has explicitly consented to send the
+    sub-threshold packet anyway (second KIRIM); bypass the ok-gate and submit.
     Clean validation  → POST to SIAP, return ticket + portal track link.
     """
     from services.siap_submission_client import get_siap_submission_client
@@ -912,9 +920,12 @@ async def _submit(sess: SubmissionSession) -> str:
     else:
         result = _run_validation(sess)
 
-    if not result["ok"]:
-        # Keep the session at REVIEW so the citizen can fix + retry ("KIRIM").
+    if not result["ok"] and not force:
+        # Sub-threshold and not yet force-confirmed. Keep the session at REVIEW,
+        # OFFER the "send as-is" override, and remember we offered it so the
+        # next KIRIM/YA submits past the gate (prevents the KIRIM dead-end loop).
         sess.stage = Stage.REVIEW
+        sess.override_offered = True
         sess.touch()
         _put_session(sess)
         # The content-score path already renders a full WhatsApp message; the
@@ -925,7 +936,11 @@ async def _submit(sess: SubmissionSession) -> str:
                 + "\n\nKetik *KIRIM* untuk mengirim apa adanya, atau *BATAL* "
                 "untuk membatalkan."
             )
-        return _fmt_validation_issues(result)
+        return (
+            _fmt_validation_issues(result)
+            + "\n\nKetik *KIRIM* untuk mengirim apa adanya, atau *BATAL* "
+            "untuk membatalkan."
+        )
 
     # --- Step 2: submit to SIAP -----------------------------------------
     client = get_siap_submission_client()
@@ -1124,11 +1139,14 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
             return await _enter_doc_scoring(sess)
 
         if sess.stage == Stage.REVIEW:
+            # If the "send as-is" override has already been offered for a
+            # sub-threshold packet, the next YA/KIRIM force-submits past the
+            # ok-gate. Otherwise it's the first confirm → validate normally.
             if _AFFIRM_PATTERN.match(msg):
-                return await _submit(sess)
+                return await _submit(sess, force=sess.override_offered)
             # "KIRIM" retry after a validation-issues message.
             if re.match(r"^\s*kirim\s*$", msg, re.IGNORECASE):
-                return await _submit(sess)
+                return await _submit(sess, force=sess.override_offered)
             return (
                 "Ketik *YA* untuk memvalidasi dan mengirim permohonan, atau "
                 "*BATAL* untuk membatalkan. Jika ada data yang ingin diubah, "
