@@ -28,6 +28,19 @@ _API_BASE = os.getenv("APTANA_API_BASE", "https://api-multichannel.aptana.co.id"
 _API_TOKEN = os.getenv("APTANA_API_TOKEN", "")
 _SENDER_NUMBER = os.getenv("APTANA_SENDER_NUMBER", "")
 
+# Native WhatsApp typing+read via Meta Graph (services.meta_whatsapp_sender).
+# OFF by default — see acknowledge_received() and BIMA-Vault/Decisions.md §9.
+#   _NATIVE_TYPING_ENABLED : master flag. When false/unset, acknowledge_received
+#                            behaves EXACTLY as before (text bubble).
+#   _KEEP_TEXT_BUBBLE      : when native is on, ALSO fire the text bubble
+#                            (belt-and-suspenders). Default false → once native
+#                            is confirmed working, the duplicate bubble is dropped.
+_NATIVE_TYPING_ENABLED = os.getenv("BIMA_NATIVE_TYPING_ENABLED", "false").lower() in ("1", "true", "yes")
+_KEEP_TEXT_BUBBLE = os.getenv("BIMA_NATIVE_TYPING_KEEP_TEXT_BUBBLE", "false").lower() in ("1", "true", "yes")
+
+# One-time INFO hint so "flag on but META_WA_* unset" doesn't spam the logs.
+_native_hint_logged = False
+
 _TIMEOUT_SECONDS = 30.0
 _MAX_ATTEMPTS = 3
 _RETRY_STATUS = {429, 500, 502, 503, 504}
@@ -139,36 +152,51 @@ async def send_text(recipient_phone: str, body: str, *, preview_url: bool = Fals
 
 
 # ---------------------------------------------------------------------------
-# Typing acknowledgment — text bubble (locked, May 2026).
+# Typing acknowledgment.
 # ---------------------------------------------------------------------------
 #
-# We probed APTANA's /api/v1/messages with Meta's native read+typing status
-# fields (status, message_id, typing_indicator) and got HTTP 422 with explicit
-# rejection of all three field names — APTANA's wrapper enforces a payload
-# whitelist of message TYPES (text, template, document, image, …) and does
-# NOT expose Meta's status-update channel. So we send a short Indonesian text
-# bubble as the acknowledgment.
+# DEFAULT (locked, May 2026): a short Indonesian text bubble.
+#   We probed APTANA's /api/v1/messages with Meta's native read+typing status
+#   fields (status, message_id, typing_indicator) and got HTTP 422 with explicit
+#   rejection of all three field names — APTANA's wrapper enforces a payload
+#   whitelist of message TYPES (text, template, document, image, …) and does
+#   NOT expose Meta's status-update channel. So APTANA can never do native UX.
 #
-# See BIMA-Vault/Decisions.md for the full reasoning. Re-test if APTANA
-# upgrades their wrapper.
+# OPTIONAL NATIVE PATH (behind BIMA_NATIVE_TYPING_ENABLED): when enabled AND a
+#   Meta token + phone-number-id are configured, we call Meta's Graph API
+#   directly (services.meta_whatsapp_sender.mark_read_and_typing) to mark the
+#   inbound READ (blue ticks) and show the native "…" typing bubble in one call.
+#   This is the ONLY path that yields the native UX. It is gated OFF by default
+#   because the number is registered to APTANA's app, so a DPMPTSP token may be
+#   rejected (error 190 / "registered to another app") — in which case we fall
+#   back to the text bubble below. See BIMA-Vault/Decisions.md §9.
 #
 # Fire-and-forget — caller doesn't await; never raises.
 
 # Indonesian-language interim text. Kept short so it doesn't dominate the chat.
+# Brand signal — locked per Decisions §9; do NOT change the wording/emoji.
 _ACK_BODY = "💭 Sebentar ya, BIMA sedang mencarikan info untukmu…"
 
 
 async def acknowledge_received(message_id: str | None, recipient_phone: str) -> None:
     """Best-effort acknowledgment so the user sees activity within ~1s.
 
-    Sends a short interim text via APTANA. The `message_id` argument is kept
-    for forward compatibility — if APTANA ever exposes native typing, the
-    handler can branch on it without changing the call site. Today it's
-    unused.
+    Decision tree (never raises — safe to fire-and-forget):
+      1. If native typing is disabled, or the Meta config / message_id is
+         missing → send the "💭 Sebentar ya…" text bubble via APTANA, exactly
+         as before. (A one-time INFO hint fires if the flag is on but the
+         META_WA_* config is absent, so it never spams.)
+      2. If native typing is enabled AND configured AND message_id present →
+         call Meta's mark_read_and_typing(message_id). On success, skip the
+         text bubble (unless BIMA_NATIVE_TYPING_KEEP_TEXT_BUBBLE is set) so the
+         chat stays clean. On any failure / non-200 → fall back to the text
+         bubble so the user still sees activity.
 
     Call as fire-and-forget:
         asyncio.create_task(acknowledge_received(msg_id, msisdn))
     """
+    global _native_hint_logged
+
     if not _API_TOKEN or not _SENDER_NUMBER:
         return  # send_text would log the same warning; stay silent here.
 
@@ -177,6 +205,37 @@ async def acknowledge_received(message_id: str | None, recipient_phone: str) -> 
         if len(recipient_phone) >= 8
         else "<short>"
     )
+
+    # --- Native-first branch (Meta Graph read + typing), behind the flag. ---
+    if _NATIVE_TYPING_ENABLED:
+        try:
+            # Lazy import keeps the APTANA-only deploy free of a hard dependency
+            # on the Meta module and reads its env-driven config at call time.
+            from services.meta_whatsapp_sender import (
+                _ACCESS_TOKEN as _meta_token,
+                _PHONE_NUMBER_ID as _meta_phone_id,
+                mark_read_and_typing,
+            )
+
+            if not _meta_token or not _meta_phone_id:
+                if not _native_hint_logged:
+                    logger.info(
+                        "BIMA_NATIVE_TYPING_ENABLED is true but META_WA_* unset "
+                        "— falling back to text bubble."
+                    )
+                    _native_hint_logged = True
+            elif message_id:
+                native_ok = await mark_read_and_typing(message_id)
+                if native_ok and not _KEEP_TEXT_BUBBLE:
+                    return  # native UX shown; skip the duplicate text bubble.
+                # native failed (e.g. token rejected) OR KEEP_TEXT_BUBBLE on →
+                # fall through to the text bubble below.
+            # message_id missing → fall through to the text bubble below.
+        except Exception:
+            # Native path must NEVER kill the handler. Mask + fall back.
+            logger.warning("Native typing attempt raised | to=%s — falling back", masked)
+
+    # --- Text-bubble fallback (the locked default behavior). ---
     try:
         await send_text(recipient_phone=recipient_phone, body=_ACK_BODY)
     except Exception:
