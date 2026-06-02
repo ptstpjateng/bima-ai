@@ -174,9 +174,22 @@ def _is_enabled() -> bool:
 # ---------------------------------------------------------------------------
 _ALLOWED_URL_HOSTS: frozenset[str] = frozenset(
     {
+        # Legacy hackathon domain — still live during the bimaptsp.com
+        # migration window. Remove these once Caddy cuts over and SEO has
+        # had time to bake (~30 days post-cutover, per Domain Migration
+        # Runbook).
         "portal.nolongin.com",
         "nolongin.com",
         "beta-siap.nolongin.com",
+        # New DPMPTSP-owned domain. Listed BEFORE DNS cutover so any
+        # PORTAL_TRACK_URL_BASE flipped to bimaptsp.com still passes the
+        # phishing-relay guard — the domain doesn't have to be live to be
+        # allowlisted.
+        "portal.bimaptsp.com",
+        "bimaptsp.com",
+        "beta-siap.bimaptsp.com",
+        # SIAP production domain — stays allowlisted regardless of which
+        # apex BIMA itself lives on.
         "perizinan.jatengprov.go.id",
     }
 )

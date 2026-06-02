@@ -16,7 +16,23 @@
 	email rifqi.majid29@gmail.com
 }
 
-nolongin.com, www.nolongin.com {
+# ──────────────────────────────────────────────
+# Domain migration transition window (2026-06).
+#
+# We're moving the public surface from nolongin.com (legacy hackathon domain)
+# to bimaptsp.com (DPMPTSP-owned domain). To avoid a "flag day" cutover that
+# would break in-flight WhatsApp links, APTANA webhooks, and bookmarked admin
+# sessions, BOTH apex hosts (plus their `www.` variants) are served from the
+# same block during the transition. Caddy will auto-provision Let's Encrypt
+# certs for every listed host on first request.
+#
+# After DNS has propagated and Vercel domains are confirmed on bimaptsp.com,
+# uncomment the 301 redirect block at the bottom of this file — that flips
+# nolongin.com to a permanent-redirect tombstone so SEO/bookmarks migrate
+# cleanly. See `BIMA-Vault/Domain Migration Runbook.md` for the exact order.
+# ──────────────────────────────────────────────
+
+nolongin.com, www.nolongin.com, bimaptsp.com, www.bimaptsp.com {
 	encode gzip
 
 	# Match nginx client_max_body_size 350M for Excel + PDF uploads
@@ -34,8 +50,10 @@ nolongin.com, www.nolongin.com {
 		-X-Powered-By
 	}
 
-	# AI-engine webhooks (Telegram legacy, WhatsApp/APTANA, web chat).
+	# AI-engine webhooks (Telegram, WhatsApp/APTANA, web chat).
 	# Path prefix is preserved — ai-engine routers expect /webhook/<channel>.
+	# After cutover, APTANA + Telegram webhooks should be re-pointed at
+	# bimaptsp.com (see Domain Migration Runbook step "Re-register webhooks").
 	handle /webhook/* {
 		reverse_proxy ai-engine:8000 {
 			transport http {
@@ -44,15 +62,18 @@ nolongin.com, www.nolongin.com {
 		}
 	}
 
-	# Root → public portal (admin lives at admin.nolongin.com now).
-	# Permanent redirect; the old `redir /admin 302` sent anonymous visitors to the
-	# Laravel admin login, which leaked the legacy stack to anyone who typed the bare
-	# domain. Public face is now portal.nolongin.com.
+	# Root → public portal. portal.bimaptsp.com is the target after Vercel
+	# domain attachment lands; we keep portal.nolongin.com as the redirect
+	# target during the transition so anything already pointing at the
+	# legacy apex keeps working. Update this to https://portal.bimaptsp.com
+	# in the same PR that flips the 301-cutover block below.
 	handle / {
 		redir https://portal.nolongin.com 301
 	}
 
-	# Admin API (FastAPI on internal admin-api:8001) — strips /admin-api prefix
+	# Admin API (FastAPI on internal admin-api:8001) — strips /admin-api prefix.
+	# Same code is served from both nolongin.com/admin-api/* and
+	# bimaptsp.com/admin-api/* during transition.
 	handle_path /admin-api/* {
 		reverse_proxy admin-api:8001 {
 			transport http {
@@ -77,12 +98,35 @@ nolongin.com, www.nolongin.com {
 }
 
 # ──────────────────────────────────────────────
-# Beta-SIAP Jateng (staging clone for BIMA integration testing).
-# Lives behind beta-siap.nolongin.com. Same Let's Encrypt auto-provisioning
-# Caddy handles for nolongin.com. PII risk on this subdomain explicitly
-# accepted by user on 2026-05-19 (real SIAP dump restored).
+# TODO (Domain Migration cutover): uncomment the block below ONLY AFTER
+# bimaptsp.com is verified to be serving correctly end-to-end (admin login,
+# portal track page, /webhook/* round-trip, /admin-api/* CORS). Uncommenting
+# this turns nolongin.com into a permanent redirect to bimaptsp.com, which
+# preserves path (e.g. nolongin.com/track/123 → bimaptsp.com/track/123).
+#
+# After uncommenting:
+#   - Remove `nolongin.com, www.nolongin.com,` from the dual-host block above
+#     so they're only served by THIS redirect block (a host can't be in two
+#     site blocks at once).
+#   - Update the `handle /` redirect target inside the surviving block to
+#     `https://portal.bimaptsp.com`.
+#   - Re-register APTANA + Telegram webhooks against bimaptsp.com.
+# Full step list lives in BIMA-Vault/Domain Migration Runbook.md.
 # ──────────────────────────────────────────────
-beta-siap.nolongin.com {
+# nolongin.com, www.nolongin.com {
+# 	# 301 preserves method + path. {uri} is the request path + query string.
+# 	redir https://bimaptsp.com{uri} 301
+# }
+
+# ──────────────────────────────────────────────
+# Beta-SIAP Jateng (staging clone for BIMA integration testing).
+# Lives behind beta-siap.nolongin.com (legacy) AND beta-siap.bimaptsp.com
+# (new). Same Let's Encrypt auto-provisioning Caddy handles for the apex.
+# PII risk on this subdomain explicitly accepted by user on 2026-05-19
+# (real SIAP dump restored). After DNS migration, drop the .nolongin.com
+# host from this block.
+# ──────────────────────────────────────────────
+beta-siap.nolongin.com, beta-siap.bimaptsp.com {
 	encode gzip
 
 	# Match nginx client_max_body_size 350M for SIAP's Excel + PDF + shapefile uploads
