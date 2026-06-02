@@ -187,6 +187,28 @@ async def _process_inbound(
     # interim text. Never blocks the slow generation path below.
     asyncio.create_task(acknowledge_received(message_id, msisdn))
 
+    # Officer chat-bridge FAST-PATH: if this number is the configured demo
+    # officer with an active case session, route the reply into the Officer
+    # Copilot instead of the citizen AI. Feature-flagged; returns None when
+    # the bridge is off or the sender isn't an officer-in-session.
+    try:
+        from services import officer_bridge
+
+        officer_reply = await officer_bridge.maybe_handle_officer_reply(
+            channel=officer_bridge.CHANNEL_WHATSAPP,
+            channel_id=msisdn,
+            message=text,
+        )
+    except Exception:
+        logger.exception("Officer bridge crashed | user=%s", _mask(msisdn))
+        officer_reply = None
+
+    if officer_reply is not None:
+        delivered = await send_text(recipient_phone=msisdn, body=officer_reply)
+        if not delivered:
+            logger.error("APTANA officer delivery failed | user=%s", _mask(msisdn))
+        return
+
     try:
         reply = await generate_ai_response(user_id, text)
     except Exception:

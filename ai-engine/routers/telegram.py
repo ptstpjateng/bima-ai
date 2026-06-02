@@ -215,6 +215,27 @@ async def _process_inbound(
     # raises (cosmetic only).
     asyncio.create_task(acknowledge_typing(chat_id))
 
+    # Officer chat-bridge FAST-PATH: if this chat is the configured demo
+    # officer with an active case session, route into the Officer Copilot
+    # instead of the citizen AI. Feature-flagged; None when off / not officer.
+    try:
+        from services import officer_bridge
+
+        officer_reply = await officer_bridge.maybe_handle_officer_reply(
+            channel=officer_bridge.CHANNEL_TELEGRAM,
+            channel_id=str(chat_id),
+            message=text,
+        )
+    except Exception:
+        logger.exception("Officer bridge crashed | chat=%s", _mask_chat(chat_id))
+        officer_reply = None
+
+    if officer_reply is not None:
+        delivered = await send_text(chat_id=chat_id, body=officer_reply)
+        if not delivered:
+            logger.error("Telegram officer delivery failed | chat=%s", _mask_chat(chat_id))
+        return
+
     try:
         reply = await generate_ai_response(user_id, text)
     except Exception:
