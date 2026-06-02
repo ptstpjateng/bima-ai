@@ -18,7 +18,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from routers import aptana, copilot, notify, validator, vectorize, webhooks
+from routers import aptana, copilot, meta_whatsapp, notify, validator, vectorize, webhooks
 from services.transparency_poller import run_transparency_poller_loop
 
 # ---------------------------------------------------------------------------
@@ -189,6 +189,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 app.include_router(webhooks.router, tags=["Webhooks"])
 app.include_router(vectorize.router, tags=["Vectorize"])
 app.include_router(aptana.router, tags=["APTANA WhatsApp"])
+app.include_router(meta_whatsapp.router, tags=["Meta WhatsApp (Direct)"])
 app.include_router(validator.router)
 app.include_router(copilot.router)
 app.include_router(notify.router)
