@@ -107,6 +107,14 @@ from urllib.parse import quote
 import httpx
 from dotenv import load_dotenv
 
+from services.agents.doc_qa import (
+    DocBytes,
+    extract_field as doc_extract_field,
+    find_in_doc as doc_find_in_doc,
+    read_doc_page as doc_read_doc_page,
+    reset_doc_context,
+    set_doc_context,
+)
 from services.agents.validator import _normalize_name
 from services.rag_service import query_regulations
 from services.siap_client import get_siap_client
@@ -175,7 +183,14 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "4. Saat petugas membuka kasus, panggil `get_case_log_notes` untuk "
     "membaca catatan dari meja/tahap sebelumnya. Sampaikan catatan itu "
     "supaya petugas saat ini tahu apa yang dikatakan petugas sebelumnya.\n"
-    "5. Jawab ringkas, dalam Bahasa Indonesia formal, dan langsung ke "
+    "5. Ketika petugas bertanya tentang ISI dokumen pendukung yang sudah "
+    "diunggah ('apa isi halaman 2 KTP?', 'apakah alamat di NIB sama dengan "
+    "di KTP?', 'cari kata X di dokumen ini'), gunakan tool dokumen Q&A: "
+    "`read_doc_page` untuk halaman spesifik, `extract_field` untuk nilai "
+    "field tertentu, dan `find_in_doc` untuk pencarian teks. Tool-tool ini "
+    "adalah PEMBACA SAJA — tidak pernah mengubah data. Selalu kutip nomor "
+    "halaman + nama berkas saat menjawab pertanyaan dokumen.\n"
+    "6. Jawab ringkas, dalam Bahasa Indonesia formal, dan langsung ke "
     "inti — petugas sedang bekerja cepat di antrean berkas.\n\n"
     "=== ATURAN MUTLAK — TINDAKAN YANG MENGUBAH DATA (forward & decision) ===\n"
     "Anda memiliki dua tool yang MENGUBAH data di SIAP: `forward_case` "
@@ -402,6 +417,59 @@ async def get_doc_summary(file_id: str) -> str:
         "di Phase 3 ketika integrasi pengunduhan dokumen sudah siap, "
         "menggunakan Gemini Vision OCR."
     )
+
+
+# ---------------------------------------------------------------------------
+# Document Q&A tools — Wave 5, Vision req #8 enhancement.
+#
+# These three tools enable multi-turn, PAGE-LEVEL Q&A over supporting docs
+# the officer has uploaded for the case in front of them. They are PURE
+# READS:
+#   * read_doc_page  — page N of a doc, text excerpt + page count
+#   * extract_field  — heuristic value lookup for a labelled field
+#   * find_in_doc    — substring needle search across pages
+#
+# All three thin-wrap `services.agents.doc_qa` so the agent file stays a
+# tool registry; the PDF-paging plumbing lives in doc_qa.py. Document bytes
+# come from admin-api via a per-turn ContextVar (see `chat()` below) —
+# admin-api owns the document store, the copilot is stateless.
+#
+# OFFICER-IN-THE-LOOP: none of these tools mutate SIAP, send notifications,
+# or persist anything. They are inspection only. The copilot's existing
+# write tools (`forward_case`, `record_decision`) remain the ONLY path to
+# state changes, and they still demand explicit officer confirmation.
+# ---------------------------------------------------------------------------
+
+
+async def read_doc_page(file_id: str, page_num: int = 1) -> dict:
+    """Officer-copilot tool: fetch one page of an attached document.
+
+    Pure passthrough to `services.agents.doc_qa.read_doc_page`. Returns a
+    structured dict with the page's extracted text excerpt (PDFs) or a flag
+    that image bytes are available for a follow-up Vision call. Never raises.
+    """
+    return await doc_read_doc_page(file_id, page_num)
+
+
+async def extract_field(file_id: str, field_name: str) -> dict:
+    """Officer-copilot tool: locate one field across an attached document.
+
+    Pure passthrough to `services.agents.doc_qa.extract_field`. Heuristic
+    label-scan against pypdf-extracted text — deterministic, zero LLM cost.
+    Returns `{value, confidence, citation, page, …}`. Never raises.
+    """
+    return await doc_extract_field(file_id, field_name)
+
+
+async def find_in_doc(file_id: str, query: str) -> dict:
+    """Officer-copilot tool: case-insensitive substring search across pages.
+
+    Pure passthrough to `services.agents.doc_qa.find_in_doc`. Returns hits
+    with `{page, evidence, snippet}` so the officer can see the surrounding
+    context. Capped at a small number of hits per page and overall. Never
+    raises.
+    """
+    return await doc_find_in_doc(file_id, query)
 
 
 def compare_field(doc_a: dict, doc_b: dict, field: str) -> dict:
@@ -970,6 +1038,81 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "read_doc_page",
+        "description": (
+            "Ambil satu halaman dari dokumen pendukung yang diunggah petugas. "
+            "Gunakan ketika petugas menanyakan isi halaman tertentu (mis. "
+            "'apa isi halaman 2 KTP?'). Mengembalikan teks halaman (untuk "
+            "PDF) atau penanda bahwa gambar tersedia (untuk JPG/PNG)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "string",
+                    "description": "ID dokumen pendukung yang sudah dilampirkan.",
+                },
+                "page_num": {
+                    "type": "integer",
+                    "description": (
+                        "Nomor halaman (1-indexed). Default 1. Jika di luar "
+                        "jangkauan, tool akan kembali ke halaman pertama."
+                    ),
+                },
+            },
+            "required": ["file_id"],
+        },
+    },
+    {
+        "name": "extract_field",
+        "description": (
+            "Cari nilai satu field bernama (mis. 'nama', 'nik', 'alamat', "
+            "'tanggal_lahir') dalam dokumen pendukung. Heuristik label-scan "
+            "yang deterministik dan tanpa biaya LLM. Mengembalikan "
+            "{value, confidence, citation, page}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "string",
+                    "description": "ID dokumen pendukung yang sudah dilampirkan.",
+                },
+                "field_name": {
+                    "type": "string",
+                    "description": (
+                        "Nama field yang dicari, mis. 'nama', 'nik', 'alamat', "
+                        "'tanggal_lahir', 'npwp'."
+                    ),
+                },
+            },
+            "required": ["file_id", "field_name"],
+        },
+    },
+    {
+        "name": "find_in_doc",
+        "description": (
+            "Pencarian substring (case-insensitive) di dalam dokumen "
+            "pendukung. Gunakan untuk pertanyaan 'di mana dokumen ini "
+            "menyebut X?'. Mengembalikan daftar halaman + cuplikan teks "
+            "di sekitar setiap kemunculan."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "string",
+                    "description": "ID dokumen pendukung yang sudah dilampirkan.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Teks yang dicari (case-insensitive).",
+                },
+            },
+            "required": ["file_id", "query"],
+        },
+    },
+    {
         "name": "get_case_log_notes",
         "description": (
             "Ambil rangkaian catatan dari meja/tahap SEBELUMNYA pada riwayat "
@@ -1099,6 +1242,9 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "get_validation_summary": get_validation_summary,
     "get_case_full": get_case_full,
     "get_doc_summary": get_doc_summary,
+    "read_doc_page": read_doc_page,
+    "extract_field": extract_field,
+    "find_in_doc": find_in_doc,
     "compare_field": compare_field,
     "cite_regulation": cite_regulation,
     "get_case_log_notes": get_case_log_notes,
@@ -1118,11 +1264,18 @@ _TOOL_DISPATCH: dict[str, Any] = {
 # signing stage is the signature itself, which happens in SIAP, not BIMA.
 # ---------------------------------------------------------------------------
 
-# Tools the officer copilot may call — the full set (Wave 1-2 behaviour).
+# Tools the officer copilot may call — the full set (Wave 1-2 + doc-Q&A).
+# The doc-Q&A tools (`read_doc_page`, `extract_field`, `find_in_doc`) are
+# deliberately READ-ONLY and exposed only to the officer mode — the
+# signature-assistant operates after the desks have done their inspection
+# and does not need page-level document chat.
 _OFFICER_TOOL_NAMES = frozenset({
     "get_validation_summary",
     "get_case_full",
     "get_doc_summary",
+    "read_doc_page",
+    "extract_field",
+    "find_in_doc",
     "compare_field",
     "cite_regulation",
     "get_case_log_notes",
@@ -1131,7 +1284,8 @@ _OFFICER_TOOL_NAMES = frozenset({
 })
 
 # Tools the signature-assistant may call — read-only chain synthesis plus the
-# SIAP signing deep-link handoff. No write tools.
+# SIAP signing deep-link handoff. No write tools, no doc-Q&A (the desks
+# below have already inspected the documents).
 _SIGNATURE_TOOL_NAMES = frozenset({
     "get_validation_summary",
     "get_case_full",
@@ -1240,6 +1394,7 @@ class OfficerCopilot:
         officer_id: int | None = None,
         validation: dict | None = None,
         mode: str = _MODE_OFFICER,
+        docs: dict[str, DocBytes] | None = None,
     ) -> dict:
         """
         Run one user-message turn. Returns:
@@ -1265,6 +1420,13 @@ class OfficerCopilot:
             Vision req #13). The mode selects the system prompt and the
             tool subset; the agent machinery is otherwise identical. An
             unknown value falls back to "officer".
+          docs: optional `{file_id → DocBytes}` map of supporting documents
+            uploaded for this case, injected by admin-api per turn (the
+            copilot is stateless — admin-api owns the document store). The
+            officer-mode doc-Q&A tools (`read_doc_page`, `extract_field`,
+            `find_in_doc`) read from this map. Empty/None means those
+            tools will return `available=False` and the model will say so
+            rather than fabricate.
         """
         mode = mode if mode in _VALID_MODES else _MODE_OFFICER
 
@@ -1297,16 +1459,19 @@ class OfficerCopilot:
         }
 
         # Bind the validation result for this turn so `get_validation_summary`
-        # can read it. The token reset in `finally` keeps concurrent requests
-        # isolated — each asyncio task gets its own ContextVar copy.
+        # can read it, and bind the doc map so the doc-Q&A tools can read it.
+        # Token reset in `finally` keeps concurrent requests isolated — each
+        # asyncio task gets its own ContextVar copy.
         ctx_token = _validation_context.set(validation)
+        doc_token = set_doc_context(docs)
         logger.info(
             "Copilot turn start | mode=%s | officer_id=%s | ticket=%s | "
-            "has_validation=%s | history_turns=%d",
+            "has_validation=%s | doc_count=%d | history_turns=%d",
             mode,
             officer_id if officer_id is not None else "<none>",
             ticket,
             validation is not None,
+            len(docs or {}),
             len(history or []),
         )
         try:
@@ -1320,6 +1485,7 @@ class OfficerCopilot:
                 mode=mode,
             )
         finally:
+            reset_doc_context(doc_token)
             _validation_context.reset(ctx_token)
 
     async def _run_chat_loop(
