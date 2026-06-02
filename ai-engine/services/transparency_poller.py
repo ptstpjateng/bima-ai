@@ -81,7 +81,7 @@ from typing import Any, Optional
 
 import httpx
 
-from services.notifications import notify
+from services.notifications import Channel, notify
 from services.siap_db import get_siap_pool, is_siap_db_configured
 
 logger = logging.getLogger("bima_ai.transparency_poller")
@@ -135,6 +135,73 @@ _HTTP_TIMEOUT_SECONDS: float = float(
 _PORTAL_TRACK_URL_BASE: str = os.getenv(
     "PORTAL_TRACK_URL_BASE", "https://portal.nolongin.com/track"
 ).rstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# Interim citizen ↔ Telegram-chat mapping (env-pinned, single citizen).
+#
+# Why this is env-pinned, not a DB lookup
+# ---------------------------------------
+# A proper citizens table mapping NIK → telegram_chat_id is correct
+# long-term but explicitly out of scope for the multi-channel dispatcher
+# PR (the demo is two days away — June 4 — and the SIAP person_profile
+# rows don't carry a Telegram identity yet). For now the poller routes
+# to Telegram exclusively when the SIAP person's NIK matches a single
+# env-pinned NIK, and uses the env-pinned chat_id as the recipient. Any
+# OTHER citizen still flows to APTANA WhatsApp (which will simply not
+# send during the Meta-review window — both flags off — but the routing
+# stays correct so flipping the flags re-enables it).
+#
+# Both vars empty → all citizens stay on the WhatsApp path. Mismatched
+# pair (one set, the other blank) → log once at config-load and treat as
+# "no Telegram mapping configured" — fail-safe.
+# ---------------------------------------------------------------------------
+_NOTIFICATION_TEST_CITIZEN_NIK: str = os.getenv(
+    "NOTIFICATION_TEST_CITIZEN_NIK", ""
+).strip()
+_NOTIFICATION_TEST_TELEGRAM_CHAT_ID: str = os.getenv(
+    "NOTIFICATION_TEST_TELEGRAM_CHAT_ID", ""
+).strip()
+if bool(_NOTIFICATION_TEST_CITIZEN_NIK) != bool(_NOTIFICATION_TEST_TELEGRAM_CHAT_ID):
+    # We log once at module import (not in the loop) so the operator
+    # notices the mis-configuration immediately, not 60s into a poll.
+    logger.warning(
+        "NOTIFICATION_TEST_CITIZEN_NIK and NOTIFICATION_TEST_TELEGRAM_CHAT_ID "
+        "must be set together — only one is set, treating as no Telegram "
+        "mapping configured. Set both to enable Telegram routing for one "
+        "citizen, or leave both blank to keep everything on WhatsApp."
+    )
+
+
+def _resolve_channel_for_citizen(nik: str | None) -> tuple[Channel, int | None]:
+    """Decide which transport to use for a citizen, and (for Telegram) the
+    chat_id to send to.
+
+    Demo-scope rule: if the SIAP person's NIK matches the env-pinned test
+    NIK, route to Telegram with the env-pinned chat_id. Otherwise route
+    to APTANA WhatsApp (recipient_phone is resolved elsewhere from the
+    SIAP person record). Returns (Channel, chat_id-or-None).
+
+    This is deliberately a single-citizen demo mapping — a real citizens
+    table is a follow-up. Documented in the multi-channel dispatcher PR.
+    """
+    if not nik or not _NOTIFICATION_TEST_CITIZEN_NIK or not _NOTIFICATION_TEST_TELEGRAM_CHAT_ID:
+        return Channel.APTANA_WA, None
+    # Constant-time compare on the NIK isn't strictly necessary — the NIK is
+    # not a secret — but it costs nothing and matches the project convention
+    # for any identifier comparison that could otherwise time-leak.
+    import hmac
+    if hmac.compare_digest(nik.strip(), _NOTIFICATION_TEST_CITIZEN_NIK):
+        try:
+            chat_id = int(_NOTIFICATION_TEST_TELEGRAM_CHAT_ID)
+        except ValueError:
+            logger.error(
+                "NOTIFICATION_TEST_TELEGRAM_CHAT_ID is not a valid integer "
+                "— falling back to WhatsApp routing for this citizen"
+            )
+            return Channel.APTANA_WA, None
+        return Channel.TELEGRAM, chat_id
+    return Channel.APTANA_WA, None
 
 
 def _is_enabled() -> bool:
@@ -281,11 +348,14 @@ async def _fetch_changes(since: int) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 # Mirrors admin-api/app/services/siap_user_client.py — `ptsp.person_profile`
-# stores contact data in a JSONB `properties` column. We only read the two
-# fields a notification needs: the display name and the mobile number.
+# stores contact data in a JSONB `properties` column. We read the fields a
+# notification needs: display name, mobile (WhatsApp recipient), and NIK
+# (the channel-resolution key for the env-pinned Telegram mapping). We do
+# NOT log the NIK anywhere — see _process_change for masked logging.
 _SQL_PERSON_BY_PROFILE_ID = """
     SELECT properties ->> 'full_name'    AS full_name,
-           properties ->> 'mobile_phone' AS mobile
+           properties ->> 'mobile_phone' AS mobile,
+           properties ->> 'nik'          AS nik
       FROM ptsp.person_profile
      WHERE profile_id = $1
      LIMIT 1
@@ -293,9 +363,14 @@ _SQL_PERSON_BY_PROFILE_ID = """
 
 
 async def _lookup_person(profile_id: int) -> Optional[dict]:
-    """Resolve a SIAP `profile_id` to {full_name, mobile} from the trusted
-    `ptsp.person_profile` table. Returns None on not-configured / miss /
-    error — the caller logs and skips the change (never guesses a recipient)."""
+    """Resolve a SIAP `profile_id` to {full_name, mobile, nik} from the
+    trusted `ptsp.person_profile` table. Returns None on not-configured /
+    miss / error — the caller logs and skips the change (never guesses a
+    recipient).
+
+    `nik` is read for channel routing only; it's NEVER logged in clear
+    and NEVER returned to callers outside this module.
+    """
     if not is_siap_db_configured():
         return None
     try:
@@ -309,7 +384,11 @@ async def _lookup_person(profile_id: int) -> Optional[dict]:
         return None
     if row is None:
         return None
-    return {"full_name": row["full_name"], "mobile": row["mobile"]}
+    return {
+        "full_name": row["full_name"],
+        "mobile": row["mobile"],
+        "nik": row["nik"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -524,9 +603,29 @@ async def _process_change(change: dict) -> None:
         )
         return
 
-    # N1 — recipient phone is derived ONLY from the trusted person record.
+    # N1 — recipient identity (phone AND NIK for routing) is derived ONLY
+    # from the trusted person record. We never accept identifiers from the
+    # change payload itself.
     person = await _lookup_person(int(profile_id))
-    if not person or not person.get("mobile"):
+    if not person:
+        logger.info(
+            "transparency change %s — no trusted person record for "
+            "profile_id=%s, skipped",
+            log_id,
+            profile_id,
+        )
+        return
+
+    # Channel resolution: env-pinned NIK → Telegram, otherwise WhatsApp.
+    # See _resolve_channel_for_citizen for the demo-scope rule. A real
+    # citizens table is a deliberate follow-up.
+    nik = (person.get("nik") or "").strip() or None
+    channel, telegram_chat_id = _resolve_channel_for_citizen(nik)
+
+    recipient_phone = str(person.get("mobile") or "").strip()
+    if channel == Channel.APTANA_WA and not recipient_phone:
+        # Without a mobile we cannot send via WhatsApp. (For Telegram the
+        # chat_id came from env, so this check is APTANA-only.)
         logger.info(
             "transparency change %s — no trusted phone for profile_id=%s "
             "(person miss or blank mobile), skipped",
@@ -535,7 +634,6 @@ async def _process_change(change: dict) -> None:
         )
         return
 
-    recipient_phone = str(person["mobile"]).strip()
     citizen_name = (person.get("full_name") or "").strip().title() or "Bapak/Ibu"
 
     ticket, license_name = await _resolve_ticket_and_license(request_id, license_id)
@@ -581,21 +679,28 @@ async def _process_change(change: dict) -> None:
             "fix_url": f"{_PORTAL_TRACK_URL_BASE}/{ticket}",
         }
 
-    logger.info(
-        "transparency dispatch | log_id=%s event=%s ticket=%s phone=%s",
-        log_id,
-        event,
-        ticket,
-        _mask_phone(recipient_phone),
-    )
+    if channel == Channel.TELEGRAM:
+        logger.info(
+            "transparency dispatch | log_id=%s event=%s ticket=%s "
+            "channel=telegram chat=<env-pinned>",
+            log_id, event, ticket,
+        )
+    else:
+        logger.info(
+            "transparency dispatch | log_id=%s event=%s ticket=%s "
+            "channel=aptana_wa phone=%s",
+            log_id, event, ticket, _mask_phone(recipient_phone),
+        )
 
     # notify() never raises and is itself feature-flagged + rate-limited +
     # idempotent. We pass our own dedupe_key as a second idempotency layer.
     try:
         await notify(
             event=event,  # type: ignore[arg-type]  # event is a valid EventKind
-            recipient_phone=recipient_phone,
             params=params,
+            channel=channel,
+            recipient_phone=recipient_phone or None,
+            recipient_telegram_chat_id=telegram_chat_id,
             dedupe_key=dedupe_key,
         )
     except Exception:  # pragma: no cover — notify() shouldn't raise, belt+braces
