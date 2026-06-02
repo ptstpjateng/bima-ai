@@ -323,31 +323,118 @@ async def _send_greeting(msisdn: str, name: str | None = None) -> None:
 
 @router.post("/webhook/aptana/status/{path_secret}")
 async def aptana_status(path_secret: str, request: Request):
-    """Receive outbound delivery/read/failure callbacks from APTANA.
+    """Receive WhatsApp Business webhook events from APTANA (the
+    `ReceiveWhatsAppBusinessWebhookMeta` worker → POST here).
 
-    Confirmed body schema (from Postman URL Callback Webhook page):
-        {msisdn, transactionId, uniqueId, campaignId, sourceId}
+    The body shape APTANA forwards is:
+        {"wabaId": "...", "payload": <Meta webhook envelope>, "receivedAt": "..."}
 
-    No `status` field in the documented schema — surprising, but that's what the
-    docs show. Real callbacks may include more; log the raw payload for now.
+    `payload` is Meta's full WhatsApp Cloud API webhook envelope:
+        {object, entry:[{id, changes:[{field:"messages", value:{...}}]}]}
+    where `value` carries `statuses[]` (sent/delivered/read/failed receipts for
+    messages BIMA sent), `messages[]` (inbound — handled by the inbound worker),
+    and/or `errors[]`.
+
+    We DECODE and log a clean one-line summary per event instead of dumping the
+    whole blob (the raw envelope is huge — APTANA inlines a full price-list — and
+    contains PII). Full raw dump stays at DEBUG for deep debugging only.
+
+    This endpoint does NOT act on the events yet — it's the visibility layer.
+    Read receipts captured here are the foundation for "citizen read the
+    notification" tracking; see BIMA-Vault for the roadmap.
     """
     _check_path_secret(path_secret)
 
     try:
-        payload = await request.json()
+        body = await request.json()
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid_json")
 
-    logger.info(
-        "APTANA status | to=%s tx=%s unique=%s campaign=%s source=%s raw=%s",
-        _mask(payload.get("msisdn", "")),
-        payload.get("transactionId"),
-        payload.get("uniqueId"),
-        payload.get("campaignId"),
-        payload.get("sourceId"),
-        payload,
-    )
+    # Full raw envelope only at DEBUG (off by default) — never INFO (PII + noise).
+    logger.debug("APTANA status raw | %s", body)
+
+    envelope = body.get("payload") if isinstance(body, dict) else None
+    # APTANA may forward `payload` as a dict (observed) or as a JSON string.
+    if isinstance(envelope, str):
+        try:
+            envelope = json.loads(envelope)
+        except (json.JSONDecodeError, ValueError):
+            envelope = None
+
+    if not isinstance(envelope, dict):
+        # Either a legacy flat APTANA callback or an unparseable shape — log a
+        # minimal line so we still see that *something* arrived.
+        logger.info(
+            "APTANA status | unrecognized shape | top_keys=%s",
+            sorted(body.keys()) if isinstance(body, dict) else type(body).__name__,
+        )
+        return {"ok": True}
+
+    _log_meta_webhook_summary(envelope)
     return {"ok": True}
+
+
+def _log_meta_webhook_summary(envelope: dict[str, Any]) -> None:
+    """Walk a Meta webhook envelope and log a clean summary per sub-event.
+
+    Surfaces exactly what event TYPES arrive so we can confirm what the
+    `ReceiveWhatsAppBusinessWebhookMeta` passthrough actually delivers
+    (status receipts incl. `read`, inbound messages, errors, or anything
+    unexpected like a presence/typing event).
+    """
+    for entry in envelope.get("entry") or []:
+        for change in entry.get("changes") or []:
+            field = change.get("field")
+            value = change.get("value")
+            if not isinstance(value, dict):
+                logger.info("APTANA status | field=%s (no value object)", field)
+                continue
+
+            statuses = value.get("statuses") or []
+            messages = value.get("messages") or []
+            errors = value.get("errors") or []
+            # Any keys beyond the known ones reveal new event types (e.g. typing).
+            known = {"messaging_product", "metadata", "contacts", "statuses",
+                     "messages", "errors"}
+            extra = sorted(set(value.keys()) - known)
+
+            for st in statuses:
+                err = st.get("errors") or []
+                err_codes = [e.get("code") for e in err] if err else None
+                logger.info(
+                    "APTANA status | field=%s status=%s recipient=%s wamid=…%s "
+                    "category=%s errors=%s",
+                    field,
+                    st.get("status"),                       # sent|delivered|read|failed
+                    _mask(st.get("recipient_id", "")),
+                    str(st.get("id", ""))[-8:],
+                    (st.get("conversation") or {}).get("origin", {}).get("type"),
+                    err_codes,
+                )
+
+            for msg in messages:
+                # Inbound messages also arrive via the raw passthrough; the
+                # inbound worker handles them. Log only that they appeared.
+                logger.info(
+                    "APTANA status | field=%s INBOUND message type=%s from=%s "
+                    "(handled by inbound worker, ignored here)",
+                    field, msg.get("type"), _mask(msg.get("from", "")),
+                )
+
+            for er in errors:
+                logger.info(
+                    "APTANA status | field=%s ERROR code=%s title=%s",
+                    field, er.get("code"), er.get("title"),
+                )
+
+            if extra:
+                # The interesting case for the typing/read investigation:
+                # an event type we haven't seen before.
+                logger.info(
+                    "APTANA status | field=%s UNEXPECTED value keys=%s "
+                    "(investigate — possible new event type)",
+                    field, extra,
+                )
 
 
 # ---------------------------------------------------------------------------
