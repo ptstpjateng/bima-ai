@@ -3,6 +3,17 @@ import { NextRequest, NextResponse } from "next/server";
 // Server-side proxy: Next.js portal → ai-engine /webhook/chat
 // Validates the Sanctum token against the backend /auth/me before forwarding,
 // then uses the server-verified user_id — never trusts the client-supplied value.
+//
+// AUTH (security/gate-webhook-chat): ai-engine /webhook/chat now requires
+// either a citizen-SSO JWT bearer or an X-Internal-Key. This proxy already
+// validates the Sanctum session against the legacy backend, so it is in
+// trusted-server position — we pass the shared INTERNAL_API_KEY along with
+// the verified `user_id`. The browser never holds either secret.
+//
+// Note: this `frontend/` directory is the deprecated legacy portal; the live
+// portal at `portal/` does its citizen auth via admin-api SSO and would call
+// ai-engine with the citizen JWT instead. Kept here so the legacy path,
+// while it remains in the tree, fails closed rather than wide-open.
 
 const AI_ENGINE_URL =
   process.env.AI_ENGINE_URL ??
@@ -13,6 +24,12 @@ const BACKEND_URL =
   process.env.BACKEND_URL ??
   process.env.NEXT_PUBLIC_API_URL ??
   "http://116.254.113.81";
+
+// Server-only — must NEVER be exposed to the browser bundle. Next.js keeps
+// non-NEXT_PUBLIC_ env vars server-side automatically, so reading from a
+// Route Handler (this file) is safe.
+const INTERNAL_API_KEY =
+  process.env.BIMA_INTERNAL_API_KEY ?? process.env.INTERNAL_API_KEY ?? "";
 
 export async function POST(req: NextRequest) {
   const authHeader = req.headers.get("Authorization");
@@ -72,10 +89,24 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Without the shared secret we cannot authenticate to ai-engine. Fail closed
+  // — surfacing 503 here is the same posture admin-api takes when an upstream
+  // is misconfigured (better than silently leaking an unauthenticated call).
+  if (!INTERNAL_API_KEY) {
+    console.error("[ai/chat] BIMA_INTERNAL_API_KEY not configured");
+    return NextResponse.json(
+      { message: "Asisten AI tidak dikonfigurasi." },
+      { status: 503 },
+    );
+  }
+
   try {
     const upstream = await fetch(`${AI_ENGINE_URL}/webhook/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Internal-Key": INTERNAL_API_KEY,
+      },
       // user_id uses verified server-side id — never client-supplied
       body: JSON.stringify({ user_id: `web-${verifiedUserId}`, message }),
       cache: "no-store",

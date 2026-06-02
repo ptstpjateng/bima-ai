@@ -6,20 +6,45 @@ Endpoints:
   POST /webhook/chat/stream  – Server-Sent Events (SSE) streaming variant of
                                the same chat, for progressive token rendering.
 
+Auth posture (security/gate-webhook-chat — the prior regression-audit
+critical finding closed):
+
+  Both endpoints require `require_chat_auth`. Callers MUST present EITHER
+  a valid `X-Internal-Key` header (server-to-server proxy) OR a citizen
+  SSO `Authorization: Bearer <jwt>` (issued by admin-api /sso/login).
+
+  - X-Internal-Key path: the body's `user_id` is trusted as-is. This is
+    the path the portal SSR proxy uses — the proxy already verified the
+    citizen's cookie session before forwarding, and only it (plus the
+    operator) holds the shared secret. The same path is what admin-api
+    would use if it ever proxied a chat call.
+
+  - Citizen JWT path: the body's `user_id` is OVERRIDDEN by the verified
+    `sub` claim of the JWT (prefixed with `web-` to match the existing
+    history-key convention). If the client supplied a `user_id` that does
+    NOT match the token's identity, we 403 — that mismatch is the exact
+    session-hijack signal we are defending against.
+
+  Neither header present / valid → 401.
+
 Note on history: this file used to also house Telegram + Meta direct WhatsApp
 webhook handlers. Both were removed when the WhatsApp channel migrated to
 APTANA (see routers/aptana.py for the new inbound + status endpoints).
+APTANA and Telegram inbound paths have their own provider-specific secret
+validation and are deliberately routed AROUND this dep.
 """
 
 import json
 import logging
 import time as _time
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
+from deps import ChatAuthContext, require_chat_auth
 from services.ai_handler import (
     generate_ai_response,
     generate_ai_response_stream,
@@ -55,18 +80,58 @@ class ChatRequest(BaseModel):
         return v
 
 
+def _resolve_user_id(body: ChatRequest, auth: ChatAuthContext) -> str:
+    """
+    Decide which user_id to use for downstream history / rate-limit keys.
+
+    See module docstring for the full table. In short:
+      * internal-key caller  → trust body.user_id
+      * citizen-JWT caller   → require body.user_id to match the verified
+                               id (or be absent — we already validated it
+                               is non-empty in the schema), else 403
+
+    The 403 mismatch path is the session-hijack defense: a stolen JWT
+    can still only talk to its own session, and a malicious client that
+    drops a victim's user_id into the body fails closed.
+    """
+    if auth.via_internal_key:
+        return body.user_id
+
+    # JWT path: verified_user_id MUST be set by the dep.
+    assert auth.verified_user_id is not None
+    if body.user_id != auth.verified_user_id:
+        logger.warning(
+            "Chat user_id mismatch | body=%s | jwt=%s — rejecting as session-hijack attempt",
+            body.user_id,
+            auth.verified_user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="user_id does not match authenticated identity.",
+        )
+    return auth.verified_user_id
+
+
 @router.post("/webhook/chat", status_code=status.HTTP_200_OK)
-async def web_chat(body: ChatRequest, background_tasks: BackgroundTasks) -> JSONResponse:
+async def web_chat(
+    body: ChatRequest,
+    background_tasks: BackgroundTasks,
+    auth: Annotated[ChatAuthContext, Depends(require_chat_auth)],
+) -> JSONResponse:
     """
     Synchronous web chat for the Next.js portal.
     Accepts { user_id, message } and returns { response, elapsed }.
     user_id should be prefixed with "web-" to keep history separate from
     APTANA WhatsApp sessions.
+
+    Auth: see module docstring — either X-Internal-Key or citizen JWT.
     """
+    user_id = _resolve_user_id(body, auth)
     request_id = str(uuid.uuid4())
     logger.info(
-        "Web chat | user_id=%s | msg_len=%d | request_id=%s",
-        body.user_id, len(body.message), request_id,
+        "Web chat | user_id=%s | msg_len=%d | request_id=%s | via=%s",
+        user_id, len(body.message), request_id,
+        "internal-key" if auth.via_internal_key else "jwt",
     )
     # Sanitise + audit before any LLM work. ChatRequest already enforces a
     # 2000-char ceiling at the Pydantic layer; the sanitiser layers on
@@ -81,16 +146,16 @@ async def web_chat(body: ChatRequest, background_tasks: BackgroundTasks) -> JSON
 
     t0 = _time.monotonic()
     try:
-        response = await generate_ai_response(body.user_id, sanitized)
+        response = await generate_ai_response(user_id, sanitized)
         elapsed = round(_time.monotonic() - t0, 2)
         logger.info(
             "Web chat done | user_id=%s | elapsed=%.2fs | request_id=%s",
-            body.user_id, elapsed, request_id,
+            user_id, elapsed, request_id,
         )
-        background_tasks.add_task(log_to_backend, body.user_id, sanitized, response, "web")
+        background_tasks.add_task(log_to_backend, user_id, sanitized, response, "web")
         return JSONResponse({"response": response, "elapsed": elapsed})
     except Exception:
-        logger.exception("Web chat failed | user_id=%s | request_id=%s", body.user_id, request_id)
+        logger.exception("Web chat failed | user_id=%s | request_id=%s", user_id, request_id)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"status": "error", "code": 500, "message": "Gagal memproses pesan. Silakan coba lagi."},
@@ -110,11 +175,17 @@ def _sse(payload: dict) -> str:
 
 
 @router.post("/webhook/chat/stream")
-async def web_chat_stream(body: ChatRequest, background_tasks: BackgroundTasks) -> StreamingResponse:
+async def web_chat_stream(
+    body: ChatRequest,
+    background_tasks: BackgroundTasks,
+    auth: Annotated[ChatAuthContext, Depends(require_chat_auth)],
+) -> StreamingResponse:
     """
     Streaming web chat for the Next.js portal (Server-Sent Events).
 
     Accepts the SAME `{ user_id, message }` body as `POST /webhook/chat`.
+    Same auth posture — see module docstring.
+
     Responds with `text/event-stream`. Each frame is:
 
         event: delta
@@ -137,10 +208,12 @@ async def web_chat_stream(body: ChatRequest, background_tasks: BackgroundTasks) 
     The non-streaming `POST /webhook/chat` is unchanged; WhatsApp (aptana.py)
     keeps using `generate_ai_response` and never touches this endpoint.
     """
+    user_id = _resolve_user_id(body, auth)
     request_id = str(uuid.uuid4())
     logger.info(
-        "Web chat (stream) | user_id=%s | msg_len=%d | request_id=%s",
-        body.user_id, len(body.message), request_id,
+        "Web chat (stream) | user_id=%s | msg_len=%d | request_id=%s | via=%s",
+        user_id, len(body.message), request_id,
+        "internal-key" if auth.via_internal_key else "jwt",
     )
 
     # Sanitise + audit BEFORE entering the SSE generator. If we did it inside
@@ -161,14 +234,14 @@ async def web_chat_stream(body: ChatRequest, background_tasks: BackgroundTasks) 
         t0 = _time.monotonic()
         final_reply = ""
         try:
-            async for event in generate_ai_response_stream(body.user_id, body_message):
+            async for event in generate_ai_response_stream(user_id, body_message):
                 if event.get("event") == "done":
                     final_reply = event.get("text", "")
                 yield _sse(event)
         except Exception:
             logger.exception(
                 "Web chat stream failed | user_id=%s | request_id=%s",
-                body.user_id, request_id,
+                user_id, request_id,
             )
             yield _sse({
                 "event": "error",
@@ -178,12 +251,12 @@ async def web_chat_stream(body: ChatRequest, background_tasks: BackgroundTasks) 
             elapsed = round(_time.monotonic() - t0, 2)
             logger.info(
                 "Web chat stream done | user_id=%s | elapsed=%.2fs | request_id=%s",
-                body.user_id, elapsed, request_id,
+                user_id, elapsed, request_id,
             )
             # Fire-and-forget backend log, only when we produced a real reply.
             if final_reply:
                 background_tasks.add_task(
-                    log_to_backend, body.user_id, body_message, final_reply, "web"
+                    log_to_backend, user_id, body_message, final_reply, "web"
                 )
 
     return StreamingResponse(
