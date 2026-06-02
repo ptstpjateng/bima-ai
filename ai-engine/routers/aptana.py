@@ -283,7 +283,16 @@ async def aptana_greeting(path_secret: str, request: Request, background: Backgr
     msisdn = data.get("phoneNumber")
     name = data.get("name")
 
-    logger.info("APTANA greeting | from=%s name=%s", _mask(msisdn or ""), name)
+    # Log the top-level body keys (and the full body at DEBUG) so we can SEE
+    # whatever payload was configured in the APTANA greeting worker. Phone is
+    # masked; any nested Meta envelope is left intact in the DEBUG line only.
+    logger.info(
+        "APTANA greeting | from=%s name=%s body_keys=%s",
+        _mask(msisdn or ""),
+        name,
+        sorted(data.keys()) if isinstance(data, dict) else type(data).__name__,
+    )
+    logger.debug("APTANA greeting raw | %s", data)
 
     if not msisdn:
         # 200 so APTANA doesn't retry — payload bug, not transient.
