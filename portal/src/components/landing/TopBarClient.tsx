@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { WHATSAPP_URL } from "@/lib/constants";
 import type { SsoUser } from "@/lib/auth-client";
 
@@ -35,17 +36,19 @@ export function TopBarClient({ initialUser }: TopBarClientProps) {
       initial={{ opacity: 0, y: -4 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.2, ease: "easeOut" }}
-      className="sticky top-0 z-50 w-full bg-surface-base/80 backdrop-blur-md"
+      className="sticky top-0 z-50 w-full border-b border-border/60 bg-bg/80 backdrop-blur-md"
     >
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6 lg:px-8">
         <Link
           href="/"
-          className="font-display text-xl font-semibold tracking-tight text-text-primary"
+          className="font-display text-xl font-semibold tracking-tight text-ink"
         >
           BIMA
         </Link>
 
-        <div className="flex items-center gap-2 sm:gap-3">
+        <div className="flex items-center gap-1 sm:gap-2">
+          <ThemeToggle />
+
           {initialUser ? (
             <Button asChild variant="ghost" size="sm" className="hidden sm:inline-flex">
               <Link href="/me" aria-label={`Lihat akun ${firstName}`}>

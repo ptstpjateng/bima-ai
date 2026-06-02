@@ -23,10 +23,10 @@ export function HowItWorks() {
           transition={{ duration: 0.2, ease: "easeOut" }}
           className="mb-12 max-w-2xl"
         >
-          <p className="text-xs font-medium uppercase tracking-[0.18em] text-brand-amber">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-brand-green-text">
             Cara kerja
           </p>
-          <h2 className="mt-3 font-display text-2xl font-semibold tracking-tight text-text-primary sm:text-3xl md:text-4xl">
+          <h2 className="mt-3 font-display text-2xl font-semibold tracking-tight text-ink sm:text-3xl md:text-4xl">
             Tiga langkah, selesai.
           </h2>
         </motion.div>
@@ -47,11 +47,11 @@ export function HowItWorks() {
             >
               <span
                 aria-hidden="true"
-                className="inline-flex h-10 w-10 items-center justify-center rounded-pill bg-brand-navy/15 font-display text-base font-semibold text-brand-navy-hover"
+                className="inline-flex h-10 w-10 items-center justify-center rounded-pill border border-primary/30 bg-primary/15 font-display text-base font-semibold text-ink"
               >
                 {i + 1}
               </span>
-              <p className="mt-5 text-base leading-relaxed text-text-primary">
+              <p className="mt-5 text-base leading-relaxed text-ink">
                 {step}
               </p>
             </motion.li>

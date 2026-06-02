@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Plus_Jakarta_Sans, Lexend } from "next/font/google";
 import { cn } from "@/lib/utils";
+import { ThemeScript } from "@/components/ThemeScript";
 import "./globals.css";
 
 // BIMA design system fonts (see BIMA-Vault/BIMA Design System.md).
@@ -39,8 +40,14 @@ export default function RootLayout({
       className={cn(display.variable, sans.variable)}
       suppressHydrationWarning
     >
+      <head>
+        {/* Applies the stored theme synchronously before first paint so there
+            is no flash of the wrong palette. Mirrors ThemeToggle's resolver. */}
+        <ThemeScript />
+      </head>
       {/* Light-first per the Bima Guidelines; dark mode follows the OS via
-          prefers-color-scheme (and a future .dark/.light toggle). */}
+          prefers-color-scheme, overridden by the .dark/.light toggle in the
+          top bar (persisted to localStorage `bima-theme`). */}
       <body className="bg-bg text-ink antialiased min-h-screen">{children}</body>
     </html>
   );
