@@ -19,6 +19,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from logging_setup import configure_logging, mask_url_secrets
 from routers import aptana, copilot, notify, telegram, validator, vectorize, webhooks
 from services.transparency_poller import run_transparency_poller_loop
 
@@ -30,6 +31,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+# Install secret-redacting filters on outbound-HTTP loggers (httpx etc.) BEFORE
+# the first httpx call. Otherwise the Telegram bot token / Meta access token
+# would already be in stdout by the time we got around to redacting.
+configure_logging()
 logger = logging.getLogger("bima_ai")
 
 
@@ -169,9 +174,14 @@ async def attach_request_id(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
 
+    # Mask path-secret segments in webhook URLs before logging — otherwise
+    # /webhook/telegram/<secret> and /webhook/aptana/inbound/<secret> get
+    # written to stdout on every hit and any operator with log access can
+    # forge inbound traffic. See logging_setup.mask_url_secrets for the
+    # specific patterns.
     logger.info(
         "path=%s method=%s status=%s duration_ms=%s request_id=%s",
-        request.url.path,
+        mask_url_secrets(request.url.path),
         request.method,
         response.status_code,
         elapsed_ms,
