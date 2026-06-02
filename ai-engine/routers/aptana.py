@@ -31,6 +31,7 @@ import hmac
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
@@ -53,6 +54,25 @@ if not _PATH_SECRET:
         "Generate one with `openssl rand -hex 32`, set both in ai-engine/.env and "
         "in the APTANA webhook URL path before going live."
     )
+
+
+# Watchdog: timestamp of the last authenticated inbound from APTANA. The
+# transparency poller reads this every tick and emits a WARNING when APTANA
+# stops talking to us for >6 hours. Caught the 2026-05-27 → 2026-06-02
+# inbound-blackout (Autopilot Worker on, but no callbacks landing) only after
+# the user flagged "I can't text BIMA"; this surfaces the same failure mode
+# in logs proactively.
+#
+# State is in-memory: lost on container restart. That's fine — a restart
+# resets the "since boot" grace, and the watchdog warns again after 6h of
+# real silence. No file/Redis dependency.
+_LAST_INBOUND_AT: float | None = None
+
+
+def get_last_inbound_at() -> float | None:
+    """Unix timestamp of the last authenticated APTANA inbound, or None if
+    no inbound has been received since this process started."""
+    return _LAST_INBOUND_AT
 
 
 def _check_path_secret(provided: str) -> None:
@@ -81,6 +101,12 @@ def _check_path_secret(provided: str) -> None:
 async def aptana_inbound(path_secret: str, request: Request, background: BackgroundTasks):
     """Receive an inbound WhatsApp user message from APTANA Autopilot."""
     _check_path_secret(path_secret)
+
+    # Record AFTER the secret check so junk probes don't reset the watchdog,
+    # but BEFORE parse/processing so payload bugs don't either. We care that
+    # APTANA is reaching us at all.
+    global _LAST_INBOUND_AT
+    _LAST_INBOUND_AT = time.time()
 
     try:
         data = await request.json()

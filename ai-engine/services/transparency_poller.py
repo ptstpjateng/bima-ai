@@ -76,11 +76,13 @@ import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 
+from routers.aptana import get_last_inbound_at
 from services.notifications import notify
 from services.siap_db import get_siap_pool, is_siap_db_configured
 
@@ -562,9 +564,15 @@ async def _process_change(change: dict) -> None:
             "license_type": license_label,
             "ticket": ticket,
             "next_stage": _stage_label(change),
-            # ETA is not in the change payload; "—" is an honest placeholder
-            # (the template still renders, the citizen is not misled).
-            "eta_days": "—",
+            # ETA is not in the change payload. Until SIAP exposes a per-stage
+            # SOP estimate we use "1-3" as the conservative-but-natural default
+            # — Meta's approved template body is "Estimasi selesai {{5}} hari
+            # kerja", and "1-3" reads naturally where "—" produced the awkward
+            # "Estimasi selesai — hari kerja" seen in the APTANA inbox on
+            # 2026-05-27. Conservative because at any single state transition
+            # the *next* hop typically lands within a few business days at
+            # DPMPTSP; "estimasi" already softens the claim.
+            "eta_days": "1-3",
         }
     elif event == "citizen_completed":
         params = {
@@ -695,6 +703,50 @@ async def _poll_once() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Watchdog: when APTANA stops forwarding inbound messages we want to know
+# from logs, not from a user screenshot. Threshold is conservative (6 h)
+# because BIMA's traffic is bursty — quiet stretches at night are normal.
+# Throttle to once-per-hour so a real outage doesn't flood logs.
+_INBOUND_SILENCE_THRESHOLD_S = 6 * 3600
+_WATCHDOG_REWARN_INTERVAL_S = 3600
+_last_watchdog_warn_at: float | None = None
+
+
+def _check_inbound_watchdog() -> None:
+    """Emit a WARNING when APTANA inbound has been silent for too long.
+
+    Runs every poller tick (independent of the notification feature flag).
+    Catches the 2026-05-27 → 2026-06-02 failure mode: outbound BIMA→APTANA
+    kept working, but APTANA stopped forwarding inbound messages — invisible
+    in logs until a user reported "I can't text BIMA".
+    """
+    global _last_watchdog_warn_at
+    last_inbound = get_last_inbound_at()
+    if last_inbound is None:
+        # No inbound since this process booted. Could be a fresh restart, or
+        # could be a real outage that predates boot — either way, nothing to
+        # compare against. The first real inbound arms the watchdog.
+        return
+    age_s = time.time() - last_inbound
+    if age_s < _INBOUND_SILENCE_THRESHOLD_S:
+        return
+    now = time.time()
+    if (
+        _last_watchdog_warn_at is not None
+        and (now - _last_watchdog_warn_at) < _WATCHDOG_REWARN_INTERVAL_S
+    ):
+        return  # already warned within the throttle window
+    _last_watchdog_warn_at = now
+    logger.warning(
+        "APTANA inbound silent for %.1f hours (threshold %.1f h). "
+        "Check: APTANA Autopilot Worker enabled, webhook URL matches "
+        "BIMA's APTANA_PATH_SECRET, Meta WhatsApp number status + quality "
+        "rating. Outbound BIMA→APTANA is independent of this signal.",
+        age_s / 3600,
+        _INBOUND_SILENCE_THRESHOLD_S / 3600,
+    )
+
+
 async def run_transparency_poller_loop(stop_event: asyncio.Event) -> None:
     """Background loop: poll the SIAP changes feed every interval until
     `stop_event` is set.
@@ -713,6 +765,9 @@ async def run_transparency_poller_loop(stop_event: asyncio.Event) -> None:
         try:
             if _is_enabled():
                 await _poll_once()
+            # Watchdog runs every tick regardless of feature flag — we still
+            # want to know about inbound silence even if notifications are off.
+            _check_inbound_watchdog()
         except Exception:  # pragma: no cover — last-resort guard
             logger.exception("transparency poller tick crashed — loop continues")
         try:
