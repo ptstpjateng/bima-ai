@@ -18,7 +18,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from routers import aptana, copilot, notify, validator, vectorize, webhooks
+from routers import aptana, copilot, notify, privy_callback, validator, vectorize, webhooks
 from services.transparency_poller import run_transparency_poller_loop
 
 # ---------------------------------------------------------------------------
@@ -192,6 +192,12 @@ app.include_router(aptana.router, tags=["APTANA WhatsApp"])
 app.include_router(validator.router)
 app.include_router(copilot.router)
 app.include_router(notify.router)
+# Privy.id e-signing webhook (Phase 5 — BIMA-Vault/Phase 5+ Plan.md §6).
+# HMAC-verified inside the router. The endpoint is reachable even when
+# PRIVY_ENABLED=false so Caddy routing can be smoke-tested before KYC
+# clears; with the flag off it's an HMAC-guarded no-op at the state-
+# machine level.
+app.include_router(privy_callback.router, tags=["Privy"])
 
 
 # ---------------------------------------------------------------------------

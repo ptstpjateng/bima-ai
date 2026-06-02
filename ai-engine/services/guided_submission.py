@@ -263,6 +263,14 @@ _FIELD_BY_KEY: dict[str, FieldSpec] = {f.key: f for f in _FIELD_SPECS}
 class Stage(str, Enum):
     RESOLVING_LICENSE = "resolving_license"
     COLLECTING_FIELDS = "collecting_fields"
+    # AWAITING_PRIVY_SIGN sits BETWEEN field collection and review when the
+    # licence requires legally-binding signed documents (Phase 5 — vault
+    # doc §6). BIMA has POSTed PDFs to Privy and surfaced the signing URL
+    # to the citizen; the session waits for the Privy webhook (or a
+    # citizen "sudah belum?" poll) to advance. Sessions only enter this
+    # stage when PRIVY_ENABLED is on AND the licence has a legal-doc
+    # requirement — otherwise the flow goes COLLECTING_FIELDS → REVIEW.
+    AWAITING_PRIVY_SIGN = "awaiting_privy_sign"
     REVIEW = "review"
     DONE = "done"
     FAILED = "failed"
@@ -283,6 +291,15 @@ class SubmissionSession:
     candidates: list[dict[str, Any]] = field(default_factory=list)
     # collected applicant fields: key -> cleaned value.
     fields: dict[str, str] = field(default_factory=dict)
+    # Privy state — populated only when the session enters
+    # AWAITING_PRIVY_SIGN. request_id is the Privy signing request we
+    # match incoming webhooks against; signing_url is what we hand the
+    # citizen as a tap-to-sign link; signed_pdf is the result Privy
+    # returns on signing_complete (held in memory for the SIAP attach
+    # step, then cleared).
+    privy_request_id: Optional[str] = None
+    privy_signing_url: Optional[str] = None
+    signed_pdf: Optional[bytes] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -322,7 +339,11 @@ def _put_session(sess: SubmissionSession) -> None:
 
 
 def _clear_session(user_id: str) -> None:
-    _sessions.pop(user_id, None)
+    sess = _sessions.pop(user_id, None)
+    # Clear the Privy reverse-index too — stale entries would otherwise
+    # let a late webhook for an abandoned session find a closed user_id.
+    if sess and sess.privy_request_id:
+        _privy_request_to_user.pop(sess.privy_request_id, None)
 
 
 def has_active_session(user_id: str) -> bool:
@@ -331,6 +352,7 @@ def has_active_session(user_id: str) -> bool:
     return sess is not None and sess.stage in (
         Stage.RESOLVING_LICENSE,
         Stage.COLLECTING_FIELDS,
+        Stage.AWAITING_PRIVY_SIGN,
         Stage.REVIEW,
     )
 
@@ -343,6 +365,21 @@ def _mask(value: Optional[str]) -> str:
     if len(s) <= 4:
         return "*" * len(s)
     return s[:2] + "*" * (len(s) - 4) + s[-2:]
+
+
+# Reverse index: Privy request_id → user_id. Lets the inbound webhook
+# (services/routers/privy_callback) find which citizen session a callback
+# belongs to without scanning the LRU. Populated when we enter
+# AWAITING_PRIVY_SIGN, cleared when the session terminates.
+_privy_request_to_user: dict[str, str] = {}
+
+
+# Citizen-facing question that nudges them when waiting on Privy.
+_PRIVY_POLL_PATTERN = re.compile(
+    r"\b(sudah\s+belum|sudah\s+selesai|udah\s+belum|cek\s+(?:status\s+)?ttd|"
+    r"status\s+tanda\s+tangan)\b",
+    re.IGNORECASE,
+)
 
 
 # ===========================================================================
@@ -621,6 +658,15 @@ async def _collect_field(sess: SubmissionSession, message: str) -> str:
 
     nxt = sess.next_missing_field()
     if nxt is None:
+        # All applicant fields are in. If this licence requires a signed
+        # legal document AND Privy is configured, branch into the signing
+        # flow before REVIEW. Otherwise fall through to the existing
+        # behaviour (straight to REVIEW). The Privy branch is opt-in and
+        # additive — when off, the flow looks exactly as it did before
+        # Phase 5.
+        privy_reply = await _maybe_enter_privy_sign(sess)
+        if privy_reply is not None:
+            return privy_reply
         sess.stage = Stage.REVIEW
         _put_session(sess)
         return "✅ Semua data pemohon terkumpul.\n\n" + _fmt_review(sess)
@@ -628,6 +674,243 @@ async def _collect_field(sess: SubmissionSession, message: str) -> str:
     _put_session(sess)
     collected = len(sess.fields)
     return f"✅ Tercatat.\n\n{collected + 1}️⃣ {nxt.question}"
+
+
+# ===========================================================================
+# Privy integration (Phase 5)
+#
+# Branches the state machine through Privy.id for citizen e-signing +
+# e-meterai when the licence requires it. Lives in this file (not
+# privy_client.py) because every transition is a guided-submission state
+# change — privy_client.py only owns the HTTP shape.
+# ===========================================================================
+
+
+def _license_requires_privy(license_name: Optional[str]) -> bool:
+    """Heuristic — does this licence need a signed Pakta Integritas /
+    Surat Pernyataan via Privy?
+
+    For Phase 5 every guided submission produces a signed Pakta
+    Integritas + meteraied Surat Pernyataan (vault doc §6 step 4),
+    so once Privy is enabled this is just "do we have a licence_name
+    at all". When DPMPTSP's legal team carves out exceptions later,
+    extend this to consult a per-licence allowlist instead.
+    """
+    return bool(license_name)
+
+
+async def _maybe_enter_privy_sign(sess: SubmissionSession) -> Optional[str]:
+    """Move the session into AWAITING_PRIVY_SIGN if Privy is on for this licence.
+
+    Returns a citizen-facing reply when the branch fires; None to mean
+    "no Privy step needed — proceed to REVIEW as before". This shape is
+    the integration contract used by `_collect_field` above.
+
+    Best-effort: any Privy failure here is reported to the citizen but
+    leaves the session at REVIEW so the citizen can still try to file
+    (DPMPTSP will then process the unsigned-document path manually) —
+    Privy being down must NOT block the existing happy path. This is
+    important during the KYC window when Privy may be intermittently
+    unavailable.
+    """
+    from services import legal_templates
+    from services.privy_client import get_privy_client
+
+    client = get_privy_client()
+    if not client.is_configured():
+        # Phase 5 is opt-in. Keep the legacy flow when Privy is off.
+        return None
+    if not _license_requires_privy(sess.license_name):
+        return None
+
+    try:
+        ctx = legal_templates.build_signing_context(
+            license_name=sess.license_name or "",
+            applicant_name=sess.fields.get("applicant_name", ""),
+            nik=sess.fields.get("nik", ""),
+            business_name=sess.fields.get("business_name", ""),
+            phone=sess.fields.get("phone", ""),
+        )
+        pdf_bytes = legal_templates.render_pdf("pakta_integritas", ctx)
+    except Exception:
+        logger.exception(
+            "Guided-submission: legal template render failed | user=%s",
+            _mask(sess.user_id),
+        )
+        # Skip Privy and let the citizen continue with REVIEW (degrade).
+        return None
+
+    initiated = await client.initiate_signing(
+        pdf_bytes=pdf_bytes,
+        signer_nik=sess.fields.get("nik", ""),
+        signer_name=sess.fields.get("applicant_name", ""),
+        document_title=f"Pakta Integritas — {sess.license_name}",
+    )
+    if not initiated.get("ok"):
+        logger.warning(
+            "Guided-submission: Privy initiate_signing failed | user=%s | note=%s",
+            _mask(sess.user_id), initiated.get("note"),
+        )
+        # Privy unavailable — fall back to REVIEW (manual processing).
+        return None
+
+    sess.stage = Stage.AWAITING_PRIVY_SIGN
+    sess.privy_request_id = str(initiated["request_id"])
+    sess.privy_signing_url = str(initiated["signing_url"])
+    sess.touch()
+    _put_session(sess)
+    _privy_request_to_user[sess.privy_request_id] = sess.user_id
+    logger.info(
+        "Guided-submission entering AWAITING_PRIVY_SIGN | user=%s | request_id=%s",
+        _mask(sess.user_id), sess.privy_request_id[:8] + "…",
+    )
+
+    return (
+        "✅ Semua data pemohon terkumpul.\n\n"
+        "Permohonan Anda memerlukan tanda tangan digital pada *Pakta "
+        "Integritas* yang sah secara hukum (UU ITE / UU 10/2020).\n\n"
+        "Silakan buka tautan berikut di handphone Anda untuk verifikasi "
+        "dan tanda tangan (sekali saja, ~3 menit):\n"
+        f"{sess.privy_signing_url}\n\n"
+        "Setelah selesai, saya akan otomatis mengirim permohonan Anda ke "
+        "SIAP Jateng. Anda juga bisa mengetik *SUDAH BELUM?* untuk "
+        "memeriksa status, atau *BATAL* untuk membatalkan."
+    )
+
+
+async def _poll_privy_status(sess: SubmissionSession) -> str:
+    """Citizen asks "sudah belum?" — poll Privy's status endpoint."""
+    from services.privy_client import get_privy_client
+
+    if not sess.privy_request_id:
+        return (
+            "Belum ada permintaan tanda tangan yang aktif. Ketik *BATAL* "
+            "untuk membatalkan dan memulai ulang."
+        )
+    client = get_privy_client()
+    result = await client.get_signed_doc(sess.privy_request_id)
+    if result.get("ok") and result.get("pdf_bytes"):
+        # Race: webhook hasn't arrived yet but the doc is ready. Take the
+        # PDF here so the citizen does not have to keep polling.
+        await _advance_after_privy_signed(sess, bytes(result["pdf_bytes"]))
+        return await _submit(sess)
+    if result.get("pending"):
+        return (
+            "Tanda tangan Anda *belum selesai diproses* di Privy. Mohon "
+            "selesaikan verifikasi pada tautan yang saya kirim sebelumnya, "
+            "atau cek kotak masuk WhatsApp/Email dari Privy. "
+            "Coba ketik *SUDAH BELUM?* lagi sebentar lagi."
+        )
+    note = str(result.get("note") or "Terjadi kesalahan saat mengecek status.")
+    return f"⚠️ {note}\n\nKetik *BATAL* untuk membatalkan."
+
+
+async def _advance_after_privy_signed(
+    sess: SubmissionSession, signed_pdf: bytes,
+) -> None:
+    """Move the session out of AWAITING_PRIVY_SIGN onto the REVIEW path."""
+    sess.signed_pdf = signed_pdf
+    sess.stage = Stage.REVIEW
+    sess.touch()
+    _put_session(sess)
+    if sess.privy_request_id:
+        _privy_request_to_user.pop(sess.privy_request_id, None)
+    logger.info(
+        "Guided-submission Privy signed — moving to REVIEW | user=%s | size=%dB",
+        _mask(sess.user_id), len(signed_pdf or b""),
+    )
+
+
+# Public hooks invoked by the inbound webhook router. Kept tiny so the
+# router doesn't reach into private state machine internals. Best-effort
+# — any failure is logged but does not propagate.
+
+async def notify_privy_signed(*, request_id: str, signed_pdf: bytes) -> None:
+    """Webhook reports the citizen finished signing. Submit to SIAP."""
+    user_id = _privy_request_to_user.get(request_id)
+    if not user_id:
+        logger.info(
+            "Privy webhook signed: no matching session | request_id=%s",
+            (request_id or "")[:8] + "…",
+        )
+        return
+    sess = _get_session(user_id)
+    if sess is None or sess.stage != Stage.AWAITING_PRIVY_SIGN:
+        logger.info(
+            "Privy webhook signed: session not in AWAITING_PRIVY_SIGN | user=%s",
+            _mask(user_id),
+        )
+        return
+    await _advance_after_privy_signed(sess, signed_pdf)
+    # Submit and push the result through whatever outbound channel the
+    # citizen used (the webhook router has no inbound message context;
+    # the reply is delivered via the notifications dispatcher).
+    reply = await _submit(sess)
+    await _push_citizen_message(user_id, reply)
+
+
+async def notify_privy_failed(*, request_id: str, reason: str) -> None:
+    """Webhook reports the citizen abandoned / signing expired."""
+    user_id = _privy_request_to_user.pop(request_id, None)
+    if not user_id:
+        logger.info(
+            "Privy webhook failed: no matching session | request_id=%s | reason=%s",
+            (request_id or "")[:8] + "…", reason,
+        )
+        return
+    sess = _get_session(user_id)
+    if sess is None:
+        return
+    # Put them back at REVIEW so they can either retype "KIRIM" to retry
+    # (which will rebuild the Privy request) or "BATAL" to abort.
+    sess.stage = Stage.REVIEW
+    sess.privy_request_id = None
+    sess.privy_signing_url = None
+    sess.touch()
+    _put_session(sess)
+    await _push_citizen_message(
+        user_id,
+        (
+            f"⚠️ Proses tanda tangan digital tidak dapat diselesaikan "
+            f"({reason}). Permohonan Anda *belum terkirim*. Ketik *KIRIM* "
+            f"untuk mencoba lagi, atau *BATAL* untuk membatalkan."
+        ),
+    )
+
+
+async def _push_citizen_message(user_id: str, text: str) -> None:
+    """Send a proactive message to the citizen.
+
+    Channel routing is intentionally simple in this slice: the webhook
+    runs out-of-band of an inbound message so we have no implicit
+    channel context. We log + best-effort dispatch through the
+    notifications module when available; the real Phase-5 wiring of
+    multi-channel push is tracked in vault doc §7 and will fill this in.
+    """
+    try:
+        # Late import — notifications module pulls in network deps.
+        from services import notifications
+    except Exception:
+        notifications = None  # type: ignore[assignment]
+    if notifications is None:
+        logger.info(
+            "Privy push fallback: notifications module unavailable | user=%s",
+            _mask(user_id),
+        )
+        return
+    push = getattr(notifications, "push_freeform", None)
+    if push is None:
+        logger.info(
+            "Privy push fallback: notifications.push_freeform unavailable | "
+            "user=%s — message buffered.", _mask(user_id),
+        )
+        return
+    try:
+        await push(user_id=user_id, text=text)
+    except Exception:
+        logger.exception(
+            "Privy push_freeform crashed | user=%s", _mask(user_id),
+        )
 
 
 async def _submit(sess: SubmissionSession) -> str:
@@ -807,6 +1090,25 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
 
         if sess.stage == Stage.COLLECTING_FIELDS:
             return await _collect_field(sess, msg)
+
+        if sess.stage == Stage.AWAITING_PRIVY_SIGN:
+            # Citizen is waiting on Privy. Only two interactions are
+            # meaningful here: "sudah belum?" → poll Privy, or any other
+            # message → gently re-share the signing link.
+            if _PRIVY_POLL_PATTERN.search(msg):
+                return await _poll_privy_status(sess)
+            if sess.privy_signing_url:
+                return (
+                    "Mohon selesaikan tanda tangan digital Anda di:\n"
+                    f"{sess.privy_signing_url}\n\n"
+                    "Ketik *SUDAH BELUM?* untuk mengecek status, atau "
+                    "*BATAL* untuk membatalkan."
+                )
+            return (
+                "Sedang menunggu konfirmasi tanda tangan digital. Ketik "
+                "*SUDAH BELUM?* untuk mengecek status, atau *BATAL* untuk "
+                "membatalkan."
+            )
 
         if sess.stage == Stage.REVIEW:
             if _AFFIRM_PATTERN.match(msg):
