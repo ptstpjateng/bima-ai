@@ -36,6 +36,8 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from services.ai_handler import generate_ai_response, log_to_backend
+from services.input_sanitizer import sanitize_user_input
+from services.prompt_injection_detector import audit_user_input
 from services.whatsapp_sender import acknowledge_received, send_text
 
 # Indonesian apology shown when Gemma fails (rate-limited / 5xx / timeout) AFTER
@@ -113,8 +115,24 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
         # not a transient failure. Investigate from logs.
         return {"ok": True, "skipped": "missing_fields"}
 
+    # Sanitise BEFORE handing off to the background task. Done synchronously
+    # here (cheap, O(n)) so the audit log line happens in the same logical
+    # request that received the message — easier to correlate with APTANA's
+    # request id during incident review.
+    sanitized = sanitize_user_input(text)
+    if not sanitized:
+        # Message collapsed to empty after stripping control chars / bidi /
+        # zero-width markers. Almost always a hostile payload (or a sticker
+        # / image misrouted as text). 200 + skipped so APTANA doesn't retry.
+        logger.warning(
+            "APTANA inbound dropped | reason=sanitized_empty user=%s",
+            _mask(msisdn),
+        )
+        return {"ok": True, "skipped": "sanitized_empty"}
+    audit_user_input(f"wa-{msisdn}", sanitized)
+
     background.add_task(
-        _process_inbound, msisdn=msisdn, text=text, name=name, message_id=message_id
+        _process_inbound, msisdn=msisdn, text=sanitized, name=name, message_id=message_id
     )
     return {"ok": True}
 

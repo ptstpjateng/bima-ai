@@ -25,6 +25,8 @@ from services.ai_handler import (
     generate_ai_response_stream,
     log_to_backend,
 )
+from services.input_sanitizer import sanitize_user_input
+from services.prompt_injection_detector import audit_user_input
 
 logger = logging.getLogger("bima_ai.webhooks")
 
@@ -66,15 +68,26 @@ async def web_chat(body: ChatRequest, background_tasks: BackgroundTasks) -> JSON
         "Web chat | user_id=%s | msg_len=%d | request_id=%s",
         body.user_id, len(body.message), request_id,
     )
+    # Sanitise + audit before any LLM work. ChatRequest already enforces a
+    # 2000-char ceiling at the Pydantic layer; the sanitiser layers on
+    # control-char / bidi / encoded-blob defences that Pydantic doesn't do.
+    sanitized = sanitize_user_input(body.message)
+    if not sanitized:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"status": "error", "code": 400, "message": "Pesan kosong setelah pembersihan."},
+        )
+    audit_user_input(body.user_id, sanitized)
+
     t0 = _time.monotonic()
     try:
-        response = await generate_ai_response(body.user_id, body.message)
+        response = await generate_ai_response(body.user_id, sanitized)
         elapsed = round(_time.monotonic() - t0, 2)
         logger.info(
             "Web chat done | user_id=%s | elapsed=%.2fs | request_id=%s",
             body.user_id, elapsed, request_id,
         )
-        background_tasks.add_task(log_to_backend, body.user_id, body.message, response, "web")
+        background_tasks.add_task(log_to_backend, body.user_id, sanitized, response, "web")
         return JSONResponse({"response": response, "elapsed": elapsed})
     except Exception:
         logger.exception("Web chat failed | user_id=%s | request_id=%s", body.user_id, request_id)
@@ -130,11 +143,25 @@ async def web_chat_stream(body: ChatRequest, background_tasks: BackgroundTasks) 
         body.user_id, len(body.message), request_id,
     )
 
+    # Sanitise + audit BEFORE entering the SSE generator. If we did it inside
+    # event_source(), we'd already have committed to the 200/text-event-stream
+    # response headers and would have to ship an error frame instead — fine,
+    # but harder to monitor and easier to miss in dashboards. Bouncing here
+    # with a 400 surfaces obviously malformed input loud and clear.
+    sanitized = sanitize_user_input(body.message)
+    if not sanitized:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"status": "error", "code": 400, "message": "Pesan kosong setelah pembersihan."},
+        )
+    audit_user_input(body.user_id, sanitized)
+    body_message = sanitized  # use the cleaned text from here on
+
     async def event_source():
         t0 = _time.monotonic()
         final_reply = ""
         try:
-            async for event in generate_ai_response_stream(body.user_id, body.message):
+            async for event in generate_ai_response_stream(body.user_id, body_message):
                 if event.get("event") == "done":
                     final_reply = event.get("text", "")
                 yield _sse(event)
@@ -156,7 +183,7 @@ async def web_chat_stream(body: ChatRequest, background_tasks: BackgroundTasks) 
             # Fire-and-forget backend log, only when we produced a real reply.
             if final_reply:
                 background_tasks.add_task(
-                    log_to_backend, body.user_id, body.message, final_reply, "web"
+                    log_to_backend, body.user_id, body_message, final_reply, "web"
                 )
 
     return StreamingResponse(
