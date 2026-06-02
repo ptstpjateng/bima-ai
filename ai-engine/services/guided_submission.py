@@ -94,7 +94,7 @@ load_dotenv()
 
 logger = logging.getLogger("bima_ai.guided_submission")
 
-_PORTAL_TRACK_URL = "https://portal.nolongin.com/track/{ticket}"
+_PORTAL_TRACK_URL = "https://portal.bimaptsp.com/track/{ticket}"
 
 
 # ===========================================================================

@@ -174,7 +174,7 @@ class SiapSubmissionClient:
           failed → {"ok": False, "configured": True|False, "note": str, ...}
 
         On success the caller surfaces `ticket` to the citizen plus a
-        portal.nolongin.com/track/<ticket> deep link.
+        portal.bimaptsp.com/track/<ticket> deep link.
         """
         if not self.is_configured():
             return self._not_configured()

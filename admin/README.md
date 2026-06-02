@@ -3,10 +3,10 @@
 Internal admin web app for **BIMA-AI** (DPMPTSP Jawa Tengah). Replaces the
 Laravel/Filament admin under `backend-tall/` as part of the FastAPI migration.
 
-Deploys to `admin.nolongin.com` as a **separate Vercel project** (decided in
+Deploys to `admin.bimaptsp.com` as a **separate Vercel project** (decided in
 `BIMA-Vault/Decisions.md` §7, hosting strategy in `BIMA-Vault/frontend.md`).
 Keeping the admin bundle on its own Vercel project prevents the admin chunk
-from leaking into the MSME portal at `app.nolongin.com`.
+from leaking into the MSME portal at `portal.bimaptsp.com`.
 
 ## Phase 1 scope
 
@@ -89,7 +89,7 @@ admin/
 ## Deployment
 
 **Do not deploy yet.** Sprint B.2 will wire the Vercel project + DNS for
-`admin.nolongin.com`. The build must already succeed via `npm run build` —
+`admin.bimaptsp.com`. The build must already succeed via `npm run build` —
 that's enforced before every commit.
 
 ## What's NOT in Phase 1

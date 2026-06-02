@@ -131,9 +131,9 @@ _HTTP_TIMEOUT_SECONDS: float = float(
 )
 
 # Portal deep-link base for the citizen_needs_fix `fix_url` param. Must be a
-# host on the notifications.py URL allowlist (nolongin.com is).
+# host on the notifications.py URL allowlist (portal.bimaptsp.com is).
 _PORTAL_TRACK_URL_BASE: str = os.getenv(
-    "PORTAL_TRACK_URL_BASE", "https://portal.nolongin.com/track"
+    "PORTAL_TRACK_URL_BASE", "https://portal.bimaptsp.com/track"
 ).rstrip("/")
 
 

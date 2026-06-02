@@ -98,9 +98,10 @@ services:
       # admin-api/.env contains a properly-encoded URL.
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-me-in-production}
       # admin-api's TrustedHostMiddleware derives allowed hosts from this list.
-      # Include nolongin.com so requests proxied via Caddy (Host: nolongin.com)
-      # are accepted, in addition to admin.nolongin.com (the eventual Vercel host).
-      ADMIN_FRONTEND_URL: https://admin.nolongin.com,https://nolongin.com
+      # Include bimaptsp.com so requests proxied via Caddy (Host: bimaptsp.com)
+      # are accepted, in addition to admin.bimaptsp.com (the Vercel host).
+      # nolongin.com hosts are also kept during the cutover deprecation window.
+      ADMIN_FRONTEND_URL: https://admin.bimaptsp.com,https://bimaptsp.com,https://admin.nolongin.com,https://nolongin.com
       LOG_LEVEL: INFO
       # Sprint C ingestion-upload: tell admin-api where data-pipeline lives
       # so /ingestion/upload can trigger /pipeline/etl-excel on the internal
@@ -125,7 +126,7 @@ services:
       retries: 3
 
   # ──────────────────────────────────────────────
-  # Reverse Proxy (Caddy — auto Let's Encrypt for nolongin.com)
+  # Reverse Proxy (Caddy — auto Let's Encrypt for bimaptsp.com + nolongin.com)
   # Replaces nginx; legacy config kept at nginx/default.conf for rollback.
   # ──────────────────────────────────────────────
   proxy:
@@ -219,7 +220,7 @@ services:
 
 
   # Beta-SIAP Jateng — staging clone of DPMPTSP licensing system at
-  # beta-siap.nolongin.com. Used by BIMA for end-to-end integration testing
+  # beta-siap.bimaptsp.com. Used by BIMA for end-to-end integration testing
   # (validator + officer copilot + portal SSO + WA status fast-path) without
   # touching real production SIAP. PII risk explicitly accepted by user on
   # 2026-05-19. Built from FrankenPHP image mirroring backend-tall pattern.

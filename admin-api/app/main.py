@@ -118,7 +118,7 @@ app = FastAPI(
 #
 # ai-engine still has wildcard CORS (its README flags this as a known TODO);
 # admin-api ships locked-down from day one. Origins come from env so DevOps
-# can swap localhost ↔ admin.nolongin.com without a code change.
+# can swap localhost ↔ admin.bimaptsp.com without a code change.
 # ---------------------------------------------------------------------------
 app.add_middleware(
     TrustedHostMiddleware,

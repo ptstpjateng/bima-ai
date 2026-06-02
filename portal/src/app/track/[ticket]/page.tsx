@@ -12,10 +12,10 @@ import { Button } from "@/components/ui/button";
  * never sees the X-Internal-Key or the SIAP bearer. Renders three states
  * inline: success (status card), 404 (ticket not found), 503 (SIAP down).
  *
- * URL: portal.nolongin.com/track/{ticket}  (links from WhatsApp replies)
+ * URL: portal.bimaptsp.com/track/{ticket}  (links from WhatsApp replies)
  *
  * Env required (server-only — do NOT prefix with NEXT_PUBLIC_):
- *   BIMA_ADMIN_API_URL    e.g. https://nolongin.com/admin-api
+ *   BIMA_ADMIN_API_URL    e.g. https://bimaptsp.com/admin-api
  *   BIMA_INTERNAL_API_KEY same value as ai-engine / admin-api / Laravel
  */
 

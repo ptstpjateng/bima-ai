@@ -26,7 +26,7 @@
           "id": "vercel-portal",
           "label": "bima-portal",
           "kind": "frontend",
-          "subtitle": "portal.nolongin.com",
+          "subtitle": "portal.bimaptsp.com",
           "x": 320,
           "y": 60
         },
@@ -34,7 +34,7 @@
           "id": "vercel-admin",
           "label": "bima-admin",
           "kind": "frontend",
-          "subtitle": "admin.nolongin.com",
+          "subtitle": "admin.bimaptsp.com",
           "x": 320,
           "y": 540
         },
@@ -42,7 +42,7 @@
           "id": "caddy",
           "label": "Caddy",
           "kind": "edge",
-          "subtitle": "nolongin.com TLS",
+          "subtitle": "bimaptsp.com TLS",
           "x": 600,
           "y": 320
         },
@@ -308,8 +308,8 @@
             {
               "from": "browser",
               "to": "vercel-portal",
-              "label": "GET portal.nolongin.com",
-              "payload": "GET https://portal.nolongin.com/ (Vercel Edge, SSG, no backend call)"
+              "label": "GET portal.bimaptsp.com",
+              "payload": "GET https://portal.bimaptsp.com/ (Vercel Edge, SSG, no backend call)"
             },
             {
               "from": "vercel-portal",
@@ -328,25 +328,25 @@
         {
           "id": "bare-domain-redirect",
           "label": "Bare Domain Redirect",
-          "summary": "Pengunjung mengetik nolongin.com dan diarahkan ke portal.",
+          "summary": "Pengunjung mengetik bimaptsp.com dan diarahkan ke portal.",
           "steps": [
             {
               "from": "browser",
               "to": "caddy",
-              "label": "GET nolongin.com/",
-              "payload": "GET https://nolongin.com/ (TLS via Caddy auto-cert)"
+              "label": "GET bimaptsp.com/",
+              "payload": "GET https://bimaptsp.com/ (TLS via Caddy auto-cert)"
             },
             {
               "from": "caddy",
               "to": "browser",
-              "label": "301 → portal.nolongin.com",
-              "payload": "HTTP/1.1 301 Moved Permanently\\nLocation: https://portal.nolongin.com/"
+              "label": "301 → portal.bimaptsp.com",
+              "payload": "HTTP/1.1 301 Moved Permanently\\nLocation: https://portal.bimaptsp.com/"
             },
             {
               "from": "browser",
               "to": "vercel-portal",
               "label": "follow redirect",
-              "payload": "GET https://portal.nolongin.com/ (Vercel Edge)"
+              "payload": "GET https://portal.bimaptsp.com/ (Vercel Edge)"
             }
           ]
         }

@@ -1,7 +1,7 @@
 """
 Portal-facing permit tracking.
 
-A citizen visits `portal.nolongin.com/track/{ticket}` to check the status of
+A citizen visits `portal.bimaptsp.com/track/{ticket}` to check the status of
 their license application. The portal renders server-side (Next.js Server
 Component) and fetches from this admin-api endpoint, which in turn calls SIAP
 Jateng's read-only Sanctum API. The browser never sees the SIAP bearer.
@@ -79,7 +79,7 @@ async def get_tracking(
     """
     Return the current status of one permit application.
 
-    Used by the portal SSR page `portal.nolongin.com/track/{ticket}` to render
+    Used by the portal SSR page `portal.bimaptsp.com/track/{ticket}` to render
     a public-facing tracking view. Requires `X-Internal-Key` header — only the
     portal's server side knows it; the browser does not.
     """

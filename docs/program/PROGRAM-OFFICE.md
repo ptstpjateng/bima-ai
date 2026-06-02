@@ -155,7 +155,7 @@ A cycle that finds nothing worth doing is a valid cycle — it reports
   3). Builds the write endpoints, the read-only Postgres role, and the
   security fixes BIMA depends on.
 - **Develops + tests EXCLUSIVELY against Beta-SIAP** (the restored
-  clone at `beta-siap.nolongin.com` / DB `dbsiapjateng`).
+  clone at `beta-siap.bimaptsp.com` / DB `dbsiapjateng`).
 - **May touch:** the SIAP repo; the Beta-SIAP deployment.
 - **May NOT touch:** production SIAP (`perizinan.jatengprov.go.id`) —
   see Guardrails. The BIMA repo.

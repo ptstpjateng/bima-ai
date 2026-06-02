@@ -48,7 +48,7 @@ _SIAP_API_TOKEN: str = os.getenv("SIAP_API_TOKEN", "")
 _SIAP_TIMEOUT_SECONDS: float = float(os.getenv("SIAP_TIMEOUT_SECONDS", "8"))
 _PORTAL_TRACK_URL_BASE: str = os.getenv(
     "PORTAL_TRACK_URL_BASE",
-    "https://portal.nolongin.com/track",
+    "https://portal.bimaptsp.com/track",
 ).rstrip("/")
 
 
@@ -244,7 +244,7 @@ def format_status_reply(record: dict) -> str:
     message. Pure data-driven — no Gemma call, so no hallucination risk on the
     permit details.
 
-    Includes a deep-link to portal.nolongin.com/track/{ticket} for citizens
+    Includes a deep-link to portal.bimaptsp.com/track/{ticket} for citizens
     who want a richer view.
     """
     ticket = record.get("no_tiket", "??")

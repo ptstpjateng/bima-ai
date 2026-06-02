@@ -212,7 +212,7 @@ def evaluate_llm(tc: dict, response: str, latency: float, gemini_ok: bool) -> di
             issues.append(f"Hallucination / forbidden content: '{kw}' found in response")
 
     # Portal link check for Phase 2
-    if tc["llm_expect_portal_link"] and "https://portal.nolongin.com" not in response:
+    if tc["llm_expect_portal_link"] and "https://portal.bimaptsp.com" not in response:
         warnings.append("Phase 2 response missing required portal CTA link")
 
     # Fabricated legal references

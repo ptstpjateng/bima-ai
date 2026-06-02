@@ -152,7 +152,7 @@ export interface CopilotChatResponse {
  * `NEXT_PUBLIC_SIAP_BASE_URL` in Vercel only when explicitly cut over.
  */
 const SIAP_BASE_URL = (
-  process.env.NEXT_PUBLIC_SIAP_BASE_URL ?? "https://beta-siap.nolongin.com"
+  process.env.NEXT_PUBLIC_SIAP_BASE_URL ?? "https://beta-siap.bimaptsp.com"
 ).replace(/\/+$/, "");
 
 /**
