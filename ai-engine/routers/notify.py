@@ -188,3 +188,38 @@ async def notify_events_endpoint(
     return EventsResponse(
         events=[EventInfo(**row) for row in notifications.describe_events()]
     )
+
+
+@router.get(
+    "/delivery/{ticket}",
+    summary="WhatsApp delivery status (sent/delivered/read) for a ticket's notifications",
+)
+async def notify_delivery_endpoint(
+    ticket: str,
+    _internal: Annotated[bool, Depends(require_internal_key)],
+) -> dict:
+    """Return the delivery lifecycle of notifications BIMA sent for `ticket`.
+
+    Powers the admin/case "✓✓ Pemohon membaca notifikasi" surface. Each record:
+        {event, status: sent|delivered|read|failed, phone (masked),
+         sent_at, status_at}
+    `status_at` for a 'read' record is when the citizen read the notification.
+    Returns an empty list if no notification was sent (or it predates tracking).
+    """
+    from services import delivery_tracker
+
+    records = delivery_tracker.get_by_ticket(ticket)
+    return {
+        "ticket": ticket,
+        "count": len(records),
+        "records": [
+            {
+                "event": r.get("event"),
+                "status": r.get("status"),
+                "phone": r.get("phone_masked"),
+                "sent_at": r.get("sent_at"),
+                "status_at": r.get("status_at"),
+            }
+            for r in records
+        ],
+    }

@@ -401,16 +401,28 @@ def _log_meta_webhook_summary(envelope: dict[str, Any]) -> None:
             for st in statuses:
                 err = st.get("errors") or []
                 err_codes = [e.get("code") for e in err] if err else None
+                st_value = st.get("status")               # sent|delivered|read|failed
+                recipient = st.get("recipient_id", "")
                 logger.info(
                     "APTANA status | field=%s status=%s recipient=%s wamid=…%s "
                     "category=%s errors=%s",
                     field,
-                    st.get("status"),                       # sent|delivered|read|failed
-                    _mask(st.get("recipient_id", "")),
+                    st_value,
+                    _mask(recipient),
                     str(st.get("id", ""))[-8:],
                     (st.get("conversation") or {}).get("origin", {}).get("type"),
                     err_codes,
                 )
+                # Attach this status to the ticket whose notification we sent
+                # to this recipient (read-receipt tracking). Never fatal.
+                try:
+                    from services import delivery_tracker
+                    if recipient and st_value:
+                        delivery_tracker.update_status(
+                            recipient, st_value, st.get("timestamp")
+                        )
+                except Exception:
+                    logger.exception("delivery tracker update_status failed (non-fatal)")
 
             for msg in messages:
                 # Inbound messages also arrive via the raw passthrough; the
