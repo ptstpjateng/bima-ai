@@ -127,9 +127,12 @@ services:
   # ──────────────────────────────────────────────
   # Reverse Proxy (Caddy — auto Let's Encrypt for nolongin.com)
   # Replaces nginx; legacy config kept at nginx/default.conf for rollback.
+  # Custom build adds the caddy-ratelimit plugin (see ./caddy/Dockerfile).
   # ──────────────────────────────────────────────
   proxy:
-    image: caddy:2-alpine
+    build:
+      context: ./caddy
+    image: bima-caddy:ratelimit
     restart: unless-stopped
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
