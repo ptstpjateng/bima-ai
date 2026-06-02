@@ -35,8 +35,13 @@
   --color-sage: #76877d;             /* primary·dark shade */
   --color-accent: #82a6b1;           /* dusty blue — fills/illustration */
   --color-accent-ink: #3e6470;       /* darkened dusty blue for text-on-light */
-  --color-brand-green: #1f4d33;      /* forest green — CTAs, ink-green emphasis */
+  --color-brand-green: #1f4d33;      /* forest green — CTA FILL (white label) */
   --color-brand-green-hover: #173b27;
+  /* Green used as TEXT (eyebrows, small-caps emphasis). Same forest in light
+     (~9.3:1 on bg); in dark it must lift to stay AA as text — see dark block.
+     Kept separate from --color-brand-green so the CTA fill can stay dark
+     enough for white labels while green text stays light enough to read. */
+  --color-brand-green-text: #1f4d33;
 
   /* ---- Surfaces & ink (light defaults) ---- */
   --color-bg: #fbfaf8;               /* warm off-white page */
@@ -107,8 +112,9 @@
     --color-primary-hover: #9d9072;
     --color-accent: #82a6b1;
     --color-accent-ink: #a7c6cf;     /* light dusty-blue for text on dark */
-    --color-brand-green: #2f7a52;    /* lifted forest for dark CTAs */
+    --color-brand-green: #2f7a52;    /* lifted forest for dark CTAs (white label ~5.2:1) */
     --color-brand-green-hover: #379060;
+    --color-brand-green-text: #4ca576; /* lighter green for TEXT on dark surfaces (~5.6:1) */
     --color-sage: #93a39a;
     --color-success: #6aa37c;
     --color-warning: #d09a3c;
@@ -134,6 +140,7 @@
       --color-accent-ink: #a7c6cf;
       --color-brand-green: #2f7a52;
       --color-brand-green-hover: #379060;
+      --color-brand-green-text: #4ca576;
       --color-sage: #93a39a;
       --color-success: #6aa37c;
       --color-warning: #d09a3c;
@@ -163,6 +170,26 @@
     outline-offset: 2px;
     border-radius: 4px;
   }
+}
+
+/*
+ * One-beat entrance used by Server Components that can't run framer-motion
+ * (e.g. /track result card, /dashboard cards rendered server-side). A single
+ * fade + 8px rise. The global reduced-motion rule below flattens it to a
+ * near-instant, no-movement appearance.
+ */
+@keyframes bima-fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-fade-in-up {
+  animation: bima-fade-in-up 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* Respect reduced-motion globally — kill non-essential animation. */

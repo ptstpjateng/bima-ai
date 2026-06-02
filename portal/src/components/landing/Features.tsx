@@ -39,10 +39,10 @@ export function Features() {
           transition={{ duration: 0.2, ease: "easeOut" }}
           className="mb-12 max-w-2xl"
         >
-          <p className="text-xs font-medium uppercase tracking-[0.18em] text-brand-amber">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-brand-green-text">
             Fitur
           </p>
-          <h2 className="mt-3 font-display text-2xl font-semibold tracking-tight text-text-primary sm:text-3xl md:text-4xl">
+          <h2 className="mt-3 font-display text-2xl font-semibold tracking-tight text-ink sm:text-3xl md:text-4xl">
             Semua yang Anda butuhkan untuk memulai usaha.
           </h2>
         </motion.div>
@@ -60,18 +60,15 @@ export function Features() {
                 delay: i * 0.05,
               }}
               whileHover={{ scale: 1.01 }}
-              className="group rounded-card bg-surface-card p-6 transition-shadow duration-150 hover:bg-surface-card-hover hover:shadow-[0_8px_24px_-8px_rgba(46,77,204,0.3)]"
+              className="group rounded-card border border-border bg-surface p-6 transition-all duration-200 hover:border-border-strong hover:bg-surface-hover hover:shadow-[0_8px_24px_-10px_rgba(31,77,51,0.28)]"
             >
-              <div className="mb-5 inline-flex h-10 w-10 items-center justify-center rounded-pill bg-brand-amber/10">
-                <Icon
-                  className="size-5 text-brand-amber"
-                  aria-hidden="true"
-                />
+              <div className="mb-5 inline-flex h-10 w-10 items-center justify-center rounded-pill bg-brand-green/10">
+                <Icon className="size-5 text-brand-green" aria-hidden="true" />
               </div>
-              <h3 className="font-display text-lg font-semibold text-text-primary">
+              <h3 className="font-display text-lg font-semibold text-ink">
                 {title}
               </h3>
-              <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+              <p className="mt-2 text-sm leading-relaxed text-ink-2">
                 {description}
               </p>
             </motion.article>

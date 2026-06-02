@@ -1,31 +1,31 @@
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, FileText, MapPin, Phone, User as UserIcon } from "lucide-react";
+import {
+  ArrowLeft,
+  MapPin,
+  Phone,
+  User as UserIcon,
+  LayoutDashboard,
+  FileText,
+} from "lucide-react";
 
 import { LogoutButton } from "@/components/me/LogoutButton";
+import { Button } from "@/components/ui/button";
 import { getServerUser } from "@/lib/auth-server";
 
 /**
- * Profile page — protected route, gated by middleware AND by a fresh
- * admin-api check here. Middleware blocks at the edge for cheap; this
- * page-level check catches the edge case where the cookie is present but
- * the JWT has been revoked or admin-api rejects it.
- *
- * Per the Phase 1 brief, the permit list ("active_permits") is stubbed.
- * The placeholder makes the empty state look intentional.
+ * Profile page — protected (middleware + page-level getServerUser). Identity-
+ * only: the rich post-licensing data lives at /dashboard, which this page
+ * links to prominently. Migrated to the Bima token system.
  */
-
 export const metadata: Metadata = {
   title: "Akun Saya · BIMA",
   description: "Profil akun BIMA dan ringkasan permohonan perizinan.",
   robots: { index: false },
 };
 
-/**
- * Mask all but the last 4 digits of a credential. Works for both NIK (16)
- * and NPWP (15). PII surface hygiene.
- */
+/** Mask all but the last 4 digits of NIK (16) / NPWP (15). PII hygiene. */
 function maskIdentity(value: string): string {
   if (value.length < 5) return value;
   const visible = value.slice(-4);
@@ -36,8 +36,6 @@ function maskIdentity(value: string): string {
 export default async function MePage() {
   const user = await getServerUser();
   if (!user) {
-    // Middleware should have caught this, but defense in depth — if a stale
-    // cookie made it past, push the user back through login with a return.
     redirect("/login?next=/me");
   }
 
@@ -47,7 +45,7 @@ export default async function MePage() {
         <div className="flex items-center justify-between gap-4">
           <Link
             href="/"
-            className="inline-flex items-center gap-2 text-sm text-text-secondary transition hover:text-brand-amber"
+            className="inline-flex items-center gap-2 text-sm text-ink-2 transition-colors hover:text-ink"
           >
             <ArrowLeft className="size-4" aria-hidden="true" />
             <span>Beranda</span>
@@ -56,17 +54,17 @@ export default async function MePage() {
         </div>
 
         <header className="mt-2">
-          <p className="text-xs font-medium uppercase tracking-[0.18em] text-brand-amber">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-brand-green-text">
             Akun Saya
           </p>
-          <h1 className="mt-3 font-display text-2xl font-semibold leading-tight tracking-tight text-text-primary sm:text-3xl md:text-4xl">
+          <h1 className="mt-3 font-display text-2xl font-bold leading-tight tracking-tight text-ink sm:text-3xl md:text-4xl">
             {user.name}
           </h1>
         </header>
 
         <section
           aria-labelledby="profile-heading"
-          className="rounded-card bg-surface-card p-6 sm:p-8"
+          className="rounded-card border border-border bg-surface p-6 sm:p-8"
         >
           <h2 id="profile-heading" className="sr-only">
             Informasi profil
@@ -79,11 +77,7 @@ export default async function MePage() {
               value={maskIdentity(user.identity_number)}
               valueClassName="font-mono"
             />
-            <ProfileField
-              icon={Phone}
-              label="Nomor HP"
-              value={user.mobile ?? "—"}
-            />
+            <ProfileField icon={Phone} label="Nomor HP" value={user.mobile ?? "—"} />
             <ProfileField
               icon={MapPin}
               label="Kabupaten / Kota"
@@ -93,25 +87,32 @@ export default async function MePage() {
         </section>
 
         <section
-          aria-labelledby="permits-heading"
-          className="rounded-card bg-surface-card p-6 sm:p-8"
+          aria-labelledby="summary-heading"
+          className="rounded-card border border-border bg-surface p-6 sm:p-8"
         >
           <div className="flex items-center gap-3">
-            <span className="inline-flex h-9 w-9 items-center justify-center rounded-pill bg-brand-amber/10">
-              <FileText className="size-4 text-brand-amber" aria-hidden="true" />
+            <span className="inline-flex size-9 items-center justify-center rounded-pill bg-surface-2">
+              <FileText className="size-4 text-primary" aria-hidden="true" />
             </span>
             <h2
-              id="permits-heading"
-              className="font-display text-lg font-semibold text-text-primary sm:text-xl"
+              id="summary-heading"
+              className="font-display text-lg font-semibold text-ink sm:text-xl"
             >
-              Permohonan Aktif
+              Ringkasan izin
             </h2>
           </div>
 
-          <p className="mt-4 text-sm text-text-secondary sm:text-base">
-            Belum ada permohonan aktif yang ter-link dengan akun ini di SIAP
-            Jateng. Ajukan izin lewat OSS RBA — BIMA akan memandu di WhatsApp.
+          <p className="mt-4 text-sm text-ink-2 sm:text-base">
+            Lihat izin aktif, SK yang terbit, jadwal perpanjangan, dan riwayat
+            permohonan Anda di Dashboard Izin.
           </p>
+
+          <Button asChild variant="primary" size="lg" className="mt-5">
+            <Link href="/dashboard">
+              <LayoutDashboard aria-hidden="true" />
+              <span>Buka Dashboard</span>
+            </Link>
+          </Button>
         </section>
       </div>
     </main>
@@ -122,7 +123,7 @@ function ProfileField({
   icon: Icon,
   label,
   value,
-  valueClassName = "text-text-primary",
+  valueClassName = "text-ink",
 }: {
   icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
   label: string;
@@ -131,13 +132,11 @@ function ProfileField({
 }) {
   return (
     <div className="flex items-start gap-3">
-      <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-pill bg-surface-base">
-        <Icon className="size-4 text-text-secondary" aria-hidden />
+      <span className="mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-pill bg-surface-2">
+        <Icon className="size-4 text-ink-2" aria-hidden />
       </span>
       <div className="min-w-0">
-        <dt className="text-xs uppercase tracking-wide text-text-secondary">
-          {label}
-        </dt>
+        <dt className="text-xs uppercase tracking-wide text-ink-3">{label}</dt>
         <dd className={`mt-1 break-words ${valueClassName}`}>{value}</dd>
       </div>
     </div>

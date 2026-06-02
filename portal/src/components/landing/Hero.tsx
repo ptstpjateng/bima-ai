@@ -22,8 +22,8 @@ export function Hero() {
           transition={{ duration: 0.25, ease: "easeOut" }}
           className="flex flex-col items-start"
         >
-          <p className="inline-flex items-center gap-2 rounded-pill bg-surface-2 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-brand-green">
-            <span className="size-1.5 rounded-pill bg-brand-green" aria-hidden="true" />
+          <p className="inline-flex items-center gap-2 rounded-pill border border-border bg-surface-2 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-brand-green-text">
+            <span className="size-1.5 rounded-pill bg-brand-green-text" aria-hidden="true" />
             DPMPTSP Jawa Tengah · Asisten AI Perizinan
           </p>
 

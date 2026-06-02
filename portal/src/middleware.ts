@@ -22,7 +22,7 @@ import { NextRequest, NextResponse } from "next/server";
 const COOKIE_NAME = "bima_pemohon_token";
 
 // Exact prefix match. If we add /dokumen, /tagihan, etc. they go here.
-const PROTECTED_PREFIXES = ["/me"];
+const PROTECTED_PREFIXES = ["/me", "/dashboard"];
 
 export function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
@@ -49,5 +49,5 @@ export function middleware(req: NextRequest) {
  * page and static assets. Add prefixes here when adding new protected routes.
  */
 export const config = {
-  matcher: ["/me/:path*"],
+  matcher: ["/me/:path*", "/dashboard/:path*"],
 };

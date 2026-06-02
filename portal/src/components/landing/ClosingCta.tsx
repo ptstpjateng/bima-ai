@@ -18,12 +18,12 @@ export function ClosingCta() {
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: "-80px" }}
         transition={{ duration: 0.2, ease: "easeOut" }}
-        className="mx-auto flex max-w-4xl flex-col items-center gap-6 rounded-card bg-brand-navy/10 px-6 py-12 text-center sm:gap-8 sm:px-12 sm:py-14"
+        className="mx-auto flex max-w-4xl flex-col items-center gap-6 rounded-lg border border-brand-green/20 bg-brand-green/8 px-6 py-12 text-center sm:gap-8 sm:px-12 sm:py-14"
       >
-        <h2 className="font-display text-xl font-semibold tracking-tight text-text-primary sm:text-2xl md:text-3xl">
+        <h2 className="font-display text-xl font-semibold tracking-tight text-ink sm:text-2xl md:text-3xl">
           Siap mulai? Chat BIMA sekarang.
         </h2>
-        <Button asChild variant="primary" size="lg">
+        <Button asChild variant="amber" size="lg">
           <a
             href={WHATSAPP_URL}
             target="_blank"

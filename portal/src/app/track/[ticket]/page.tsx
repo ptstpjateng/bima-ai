@@ -1,9 +1,16 @@
-import { ArrowLeft, MessageCircle } from "lucide-react";
+import {
+  ArrowLeft,
+  MessageCircle,
+  FileText,
+  AlertTriangle,
+} from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 
 import { Button } from "@/components/ui/button";
+import { StatusBadge } from "@/components/ui/StatusBadge";
+import { formatDateID } from "@/lib/format";
 
 /**
  * Citizen-facing tracking page.
@@ -17,6 +24,9 @@ import { Button } from "@/components/ui/button";
  * Env required (server-only — do NOT prefix with NEXT_PUBLIC_):
  *   BIMA_ADMIN_API_URL    e.g. https://nolongin.com/admin-api
  *   BIMA_INTERNAL_API_KEY same value as ai-engine / admin-api / Laravel
+ *
+ * This is a REAL surface (live SIAP data via admin-api). Only the styling
+ * was migrated to the Bima system; behavior is unchanged.
  */
 
 type TrackingRecord = {
@@ -33,32 +43,6 @@ type FetchResult =
   | { kind: "ok"; record: TrackingRecord }
   | { kind: "not_found" }
   | { kind: "service_down"; reason: string };
-
-const BULAN_ID = [
-  "",
-  "Januari",
-  "Februari",
-  "Maret",
-  "April",
-  "Mei",
-  "Juni",
-  "Juli",
-  "Agustus",
-  "September",
-  "Oktober",
-  "November",
-  "Desember",
-];
-
-function formatDateID(raw: string | null): string {
-  if (!raw) return "—";
-  // Accepts '2026-05-17 18:40:06' OR ISO 8601. We treat the SIAP timestamp as
-  // local time (it is) and format day + month name + year only.
-  const isoish = raw.includes("T") ? raw : raw.replace(" ", "T");
-  const d = new Date(isoish);
-  if (Number.isNaN(d.getTime())) return raw;
-  return `${d.getDate()} ${BULAN_ID[d.getMonth() + 1]} ${d.getFullYear()}`;
-}
 
 async function fetchTracking(ticket: string): Promise<FetchResult> {
   const baseUrl = process.env.BIMA_ADMIN_API_URL;
@@ -141,29 +125,25 @@ export default async function TrackingPage({
       <div className="mx-auto flex w-full max-w-2xl flex-col gap-6">
         <Link
           href="/"
-          className="inline-flex items-center gap-2 text-sm text-text-secondary transition hover:text-brand-amber"
+          className="inline-flex items-center gap-2 text-sm text-ink-2 transition-colors hover:text-ink"
         >
           <ArrowLeft className="size-4" aria-hidden="true" />
           <span>Kembali ke beranda BIMA</span>
         </Link>
 
         <header className="mt-2">
-          <p className="text-xs font-medium uppercase tracking-[0.18em] text-brand-amber">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-brand-green-text">
             Lacak Permohonan Izin
           </p>
-          <h1 className="mt-3 font-display text-2xl font-semibold leading-tight tracking-tight text-text-primary sm:text-3xl md:text-4xl">
+          <h1 className="mt-3 font-display text-2xl font-bold leading-tight tracking-tight text-ink sm:text-3xl md:text-4xl">
             Tiket{" "}
-            <span className="font-mono text-xl text-brand-amber sm:text-3xl md:text-4xl">
+            <span className="font-mono text-xl text-primary sm:text-3xl md:text-4xl">
               {padded}
             </span>
           </h1>
         </header>
 
-        {result.kind === "ok" && <StatusCard record={result.record} />}
-        {result.kind === "not_found" && <NotFoundCard ticket={padded} />}
-        {result.kind === "service_down" && (
-          <ServiceDownCard ticket={padded} reason={result.reason} />
-        )}
+        <ResultCard result={result} ticket={padded} />
 
         <CtaFooter />
       </div>
@@ -173,37 +153,60 @@ export default async function TrackingPage({
 
 // ----- Subviews --------------------------------------------------------------
 
+/** Wraps the chosen card in a one-beat fade+rise (reduced-motion safe via CSS). */
+function ResultCard({
+  result,
+  ticket,
+}: {
+  result: FetchResult;
+  ticket: string;
+}) {
+  return (
+    <div className="animate-fade-in-up">
+      {result.kind === "ok" && <StatusCard record={result.record} />}
+      {result.kind === "not_found" && <NotFoundCard ticket={ticket} />}
+      {result.kind === "service_down" && (
+        <ServiceDownCard ticket={ticket} reason={result.reason} />
+      )}
+    </div>
+  );
+}
+
 function StatusCard({ record }: { record: TrackingRecord }) {
   return (
     <section
       aria-labelledby="status-heading"
-      className="rounded-2xl bg-surface p-6 ring-1 ring-border  sm:p-8"
+      className="rounded-card border border-border bg-surface p-6 sm:p-8"
     >
       <h2 id="status-heading" className="sr-only">
         Status permohonan
       </h2>
 
-      <div className="space-y-1">
-        <p className="text-xs uppercase tracking-wide text-text-secondary">
-          Permohonan
-        </p>
-        <p className="font-display text-xl font-semibold leading-snug text-text-primary">
-          {record.license_name}
-        </p>
-        {record.sector_name && (
-          <p className="text-sm text-text-secondary">{record.sector_name}</p>
-        )}
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 inline-flex size-10 shrink-0 items-center justify-center rounded-pill bg-surface-2">
+          <FileText className="size-5 text-primary" aria-hidden="true" />
+        </span>
+        <div className="min-w-0 space-y-1">
+          <p className="text-xs uppercase tracking-wide text-ink-3">Permohonan</p>
+          <p className="font-display text-xl font-semibold leading-snug text-ink">
+            {record.license_name}
+          </p>
+          {record.sector_name && (
+            <p className="text-sm text-ink-2">{record.sector_name}</p>
+          )}
+        </div>
       </div>
 
       <dl className="mt-8 grid gap-x-6 gap-y-5 sm:grid-cols-2">
         <Field label="Pemohon" value={record.applicant_name} />
         <Field label="Tanggal daftar" value={formatDateID(record.submitted_at)} />
         <Field label="Posisi berkas" value={record.current_desk} />
-        <Field
-          label="Status"
-          value={record.status}
-          valueClassName="text-brand-amber font-semibold capitalize"
-        />
+        <div>
+          <dt className="text-xs uppercase tracking-wide text-ink-3">Status</dt>
+          <dd className="mt-1.5">
+            <StatusBadge status={record.status} />
+          </dd>
+        </div>
       </dl>
     </section>
   );
@@ -211,15 +214,15 @@ function StatusCard({ record }: { record: TrackingRecord }) {
 
 function NotFoundCard({ ticket }: { ticket: string }) {
   return (
-    <section className="rounded-2xl bg-surface p-6 ring-1 ring-border  sm:p-8">
-      <h2 className="font-display text-xl font-semibold text-text-primary">
+    <section className="rounded-card border border-border bg-surface p-6 sm:p-8">
+      <h2 className="font-display text-xl font-semibold text-ink">
         Tiket tidak ditemukan
       </h2>
-      <p className="mt-3 text-text-secondary">
+      <p className="mt-3 text-ink-2">
         Kami tidak menemukan permohonan dengan tiket{" "}
-        <span className="font-mono text-text-primary">{ticket}</span>. Coba
-        periksa kembali nomor tiket Anda — biasanya 9 digit angka yang tercetak
-        pada tanda terima saat Anda mendaftar.
+        <span className="font-mono text-ink">{ticket}</span>. Coba periksa
+        kembali nomor tiket Anda — biasanya 9 digit angka yang tercetak pada
+        tanda terima saat Anda mendaftar.
       </p>
     </section>
   );
@@ -227,19 +230,25 @@ function NotFoundCard({ ticket }: { ticket: string }) {
 
 function ServiceDownCard({ ticket, reason }: { ticket: string; reason: string }) {
   return (
-    <section className="rounded-2xl bg-brand-amber/[0.04] p-6 ring-1 ring-brand-amber/20  sm:p-8">
-      <h2 className="font-display text-xl font-semibold text-text-primary">
-        Sementara tidak dapat memeriksa
-      </h2>
-      <p className="mt-3 text-text-secondary">
-        {reason} Silakan coba lagi beberapa menit ke depan.
-      </p>
-      <p className="mt-2 text-sm text-text-secondary">
-        Atau tanyakan langsung ke BIMA via WhatsApp:{" "}
-        <span className="text-text-primary">
-          status izin {ticket}
-        </span>
-      </p>
+    <section className="rounded-card border border-warning/30 bg-warning/6 p-6 sm:p-8">
+      <div className="flex items-start gap-3">
+        <AlertTriangle
+          className="mt-0.5 size-5 shrink-0 text-warning"
+          aria-hidden="true"
+        />
+        <div>
+          <h2 className="font-display text-xl font-semibold text-ink">
+            Sementara tidak dapat memeriksa
+          </h2>
+          <p className="mt-3 text-ink-2">
+            {reason} Silakan coba lagi beberapa menit ke depan.
+          </p>
+          <p className="mt-2 text-sm text-ink-2">
+            Atau tanyakan langsung ke BIMA via WhatsApp:{" "}
+            <span className="font-medium text-ink">status izin {ticket}</span>
+          </p>
+        </div>
+      </div>
     </section>
   );
 }
@@ -247,7 +256,7 @@ function ServiceDownCard({ ticket, reason }: { ticket: string; reason: string })
 function Field({
   label,
   value,
-  valueClassName = "text-text-primary",
+  valueClassName = "text-ink",
 }: {
   label: string;
   value: string;
@@ -255,9 +264,7 @@ function Field({
 }) {
   return (
     <div>
-      <dt className="text-xs uppercase tracking-wide text-text-secondary">
-        {label}
-      </dt>
+      <dt className="text-xs uppercase tracking-wide text-ink-3">{label}</dt>
       <dd className={`mt-1 ${valueClassName}`}>{value || "—"}</dd>
     </div>
   );
@@ -265,11 +272,11 @@ function Field({
 
 function CtaFooter() {
   return (
-    <div className="mt-6 rounded-xl border border-border bg-surface-2 p-5">
-      <p className="text-sm text-text-secondary">
+    <div className="mt-2 rounded-card border border-border bg-surface-2 p-5">
+      <p className="text-sm text-ink-2">
         Ada pertanyaan lanjutan? BIMA siap membantu di WhatsApp.
       </p>
-      <Button asChild variant="primary" size="lg" className="mt-4">
+      <Button asChild variant="amber" size="lg" className="mt-4">
         <a
           href="https://wa.me/6285117557091"
           target="_blank"
