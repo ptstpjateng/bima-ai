@@ -48,6 +48,7 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 
 from services.ai_handler import generate_ai_response, log_to_backend
+from services.notifications import record_engagement, record_opt_out
 from services.telegram_sender import acknowledge_typing, send_text
 
 logger = logging.getLogger(__name__)
@@ -179,12 +180,34 @@ async def _process_inbound(
     # user_id; we have WhatsApp users at "wa-<msisdn>", now Telegram at
     # "tg-<chat_id>").
     user_id = f"tg-{chat_id}"
+    # Telegram chat_ids are integers; use a tg: prefix for the engagement store
+    # so there's no collision with WhatsApp msisdn strings.
+    tg_phone_key = f"tg:{chat_id}"
 
     # /start is Telegram's bot-bootstrap command — send the static welcome
     # instead of routing through the AI. Cheaper, instant, no LLM call.
     if text.strip() == "/start":
+        record_engagement(tg_phone_key)
         await send_text(chat_id=chat_id, body=_START_BODY)
         return
+
+    # Opt-out handling. Telegram notifications are rare (no WhatsApp template
+    # system here) but citizens may still want to stop automated messages.
+    _OPT_OUT_TOKENS = {"stop", "berhenti", "unsubscribe", "opt out", "optout", "hentikan notif"}
+    if text.lower().strip() in _OPT_OUT_TOKENS:
+        record_opt_out(tg_phone_key)
+        await send_text(
+            chat_id=chat_id,
+            body=(
+                "Oke, notifikasi otomatis dari BIMA untuk akun ini sudah kami nonaktifkan. "
+                "Anda masih bisa tanya apa saja kapan saja — BIMA tetap siap membantu 🙏"
+            ),
+        )
+        return
+
+    # Record engagement (implicit opt-in). Happens for every real message,
+    # including after /start, so repeated use keeps the record fresh.
+    record_engagement(tg_phone_key)
 
     # Fire-and-forget typing indicator. Telegram's native one is ~5s; for our
     # ~9-13s reply latency one ack is enough — the actual reply usually arrives

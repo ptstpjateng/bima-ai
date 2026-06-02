@@ -214,11 +214,140 @@ def _validate_param_urls(params: dict[str, str]) -> str | None:
 # Redis dependency to this service. If ai-engine is ever horizontally
 # scaled, move this state to Redis.
 # ---------------------------------------------------------------------------
-_RATE_WINDOW_SECONDS = 3600.0          # 1-hour rolling window
-_MAX_PER_RECIPIENT_PER_WINDOW = 10     # one number shouldn't get >10 pings/hr
-_MAX_GLOBAL_PER_WINDOW = 500           # whole-system ceiling per hour
+# ---------------------------------------------------------------------------
+# Meta compliance hardening — 2026-06-02 post-ban analysis.
+#
+# Root cause: automated bulk citizen_progress sends to citizens who had
+# never texted BIMA directly. Meta's automated classifiers flagged the
+# outbound pattern as cold-outreach / promotional despite UTILITY
+# templates, leading to a Permanent WABA disable on 2026-05-21 that
+# required a formal review (reinstated 2026-06-02).
+#
+# Four safeguards added:
+#
+# 1. CITIZEN ENGAGEMENT REQUIREMENT (the main fix)
+#    Only notify a citizen if they have previously sent at least one
+#    message to BIMA on that channel. Tracked in _engaged_phones: a
+#    phone number is added to the set the moment BIMA receives any
+#    inbound from it (routers/aptana.py, routers/telegram.py). Persisted
+#    to disk between restarts so a container restart doesn't erase opt-in
+#    history. Default OFF — callers skip this check when force=True
+#    (test-fire path).
+#
+# 2. TIGHTER RATE LIMITS
+#    Old: 10 sends/recipient/hr, 500 sends/global/hr → easily triggers
+#    Meta quality-rating drops even for engaged users.
+#    New: 2 sends/recipient/24h, 50 sends/global/24h — conservative
+#    enough to keep BIMA below Meta's scrutiny thresholds at current
+#    (~100-500 active permit applications/day) scale.
+#
+# 3. HIGH-VALUE EVENTS ONLY
+#    citizen_progress intermediate hops (status="in_review", "checked"
+#    etc.) are low-value to citizens and high-volume. The new env flag
+#    NOTIFICATION_CITIZEN_PROGRESS_ENABLED (default false) keeps the
+#    event type available but off by default. Only citizen_completed and
+#    citizen_needs_fix are on by default — those are the moments citizens
+#    actually care about and would not mark as spam.
+#
+# 4. STOP/BERHENTI OPT-OUT (handled in the inbound routers)
+#    See routers/aptana.py and routers/telegram.py for the opt-out path.
+#    Opt-out adds the phone to _opted_out_phones (also persisted to disk).
+#    A phone in _opted_out_phones is silently skipped regardless of other
+#    flags. Opt-out is reversible — any subsequent inbound REMOVES the
+#    phone from the opted-out set (they're re-engaging).
+# ---------------------------------------------------------------------------
+
+_RATE_WINDOW_SECONDS = 86400.0         # 24-hour rolling window (was 1-hour)
+_MAX_PER_RECIPIENT_PER_WINDOW = 2      # max 2 WA messages/day per citizen (was 10/hr)
+_MAX_GLOBAL_PER_WINDOW = 50            # whole-system ceiling per day (was 500/hr)
 _send_ts_by_recipient: dict[str, list[float]] = defaultdict(list)
 _send_ts_global: list[float] = []
+
+# ---------------------------------------------------------------------------
+# Engagement registry + opt-out store (safeguard 1 + 4).
+# ---------------------------------------------------------------------------
+import json as _json
+from pathlib import Path as _Path
+
+_ENGAGEMENT_PATH = _Path(
+    os.getenv("NOTIFICATION_ENGAGEMENT_PATH", "/app/data/notification_engagement.json")
+)
+_OPTED_OUT_PATH = _Path(
+    os.getenv("NOTIFICATION_OPTED_OUT_PATH", "/app/data/notification_opted_out.json")
+)
+
+def _load_set(path: _Path) -> set[str]:
+    try:
+        if path.exists():
+            return set(_json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    return set()
+
+def _save_set(path: _Path, data: set[str]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(_json.dumps(sorted(data)), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        logger.warning("Could not persist notification set to %s: %s", path, exc)
+
+# Load at module start — populated by inbound routers calling record_engagement()
+_engaged_phones: set[str] = _load_set(_ENGAGEMENT_PATH)
+_opted_out_phones: set[str] = _load_set(_OPTED_OUT_PATH)
+
+
+def record_engagement(phone: str) -> None:
+    """Mark a phone number as having engaged with BIMA (sent at least one
+    message). Called from the inbound handlers in routers/aptana.py and
+    routers/telegram.py immediately after any inbound message is received.
+
+    Also removes the number from the opted-out set — the citizen is
+    re-engaging by texting us, so that counts as implicit re-consent.
+    """
+    global _engaged_phones, _opted_out_phones
+    if phone in _opted_out_phones:
+        _opted_out_phones.discard(phone)
+        _save_set(_OPTED_OUT_PATH, _opted_out_phones)
+        logger.info("notification opt-out reversed (re-engaged) | phone=%s", _mask_phone(phone))
+    if phone not in _engaged_phones:
+        _engaged_phones.add(phone)
+        _save_set(_ENGAGEMENT_PATH, _engaged_phones)
+        logger.info("notification engagement recorded | phone=%s", _mask_phone(phone))
+
+
+def record_opt_out(phone: str) -> None:
+    """Mark a phone number as opted out. Called from the inbound handler
+    when the citizen sends STOP / BERHENTI / UNSUBSCRIBE. The next inbound
+    from the same number auto-reverses this via record_engagement().
+    """
+    global _opted_out_phones
+    if phone not in _opted_out_phones:
+        _opted_out_phones.add(phone)
+        _save_set(_OPTED_OUT_PATH, _opted_out_phones)
+        logger.info("notification opt-out recorded | phone=%s", _mask_phone(phone))
+
+
+def is_engaged(phone: str) -> bool:
+    """Return True if this phone has previously sent a message to BIMA."""
+    return phone in _engaged_phones
+
+
+def is_opted_out(phone: str) -> bool:
+    """Return True if this phone has explicitly opted out of notifications."""
+    return phone in _opted_out_phones
+
+
+# citizen_progress intermediate-hop flag. OFF by default — only
+# citizen_completed + citizen_needs_fix are sent unless explicitly enabled.
+# Rationale: intermediate hops (in_review, checked etc.) are low-value
+# to citizens and high-volume, exactly the pattern that triggered Meta's
+# 2026-05-21 ban. Flip to 'true' only after quality-rating is Green.
+def _citizen_progress_enabled() -> bool:
+    return os.getenv("NOTIFICATION_CITIZEN_PROGRESS_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 # Idempotency — a retrying reconciler must not double-send the same logical
 # notification. Keyed on (event, dedupe_key) — caller supplies dedupe_key
@@ -355,6 +484,41 @@ async def notify(
             event,
             _mask_phone(recipient_phone),
         )
+
+    # Meta compliance safeguard 4 — opt-out. Always enforced, even under force,
+    # even in test-fire mode. A citizen who sent STOP must never receive another
+    # message regardless of what the test infrastructure asks for.
+    if is_opted_out(recipient_phone):
+        logger.info(
+            "notify suppressed (opted out) | event=%s phone=%s",
+            event, _mask_phone(recipient_phone),
+        )
+        return False
+
+    # Meta compliance safeguard 1 — engagement requirement.
+    # Only notify citizens who have previously sent at least one message to BIMA.
+    # force=True (test-fire) bypasses this so operators can test without having
+    # to send a message first from every test number.
+    if not force and not is_engaged(recipient_phone):
+        logger.info(
+            "notify suppressed (no engagement) | event=%s phone=%s "
+            "— citizen has never messaged BIMA; not eligible for push notifications",
+            event, _mask_phone(recipient_phone),
+        )
+        return False
+
+    # Meta compliance safeguard 3 — citizen_progress is off by default.
+    # Intermediate workflow hops are high-volume + low-value; they were the
+    # main trigger for Meta's 2026-05-21 WABA ban. Only flip
+    # NOTIFICATION_CITIZEN_PROGRESS_ENABLED=true after quality-rating recovers
+    # to Green and per-citizen opt-in is confirmed.
+    if event == "citizen_progress" and not force and not _citizen_progress_enabled():
+        logger.info(
+            "notify suppressed (citizen_progress disabled) | phone=%s "
+            "— set NOTIFICATION_CITIZEN_PROGRESS_ENABLED=true to re-enable",
+            _mask_phone(recipient_phone),
+        )
+        return False
 
     spec = _TEMPLATES.get(event)
     if spec is None:
