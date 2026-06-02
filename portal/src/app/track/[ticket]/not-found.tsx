@@ -34,7 +34,7 @@ export default function TrackNotFound() {
           </h1>
         </header>
 
-        <section className="rounded-2xl bg-white/[0.03] p-6 ring-1 ring-white/[0.04] backdrop-blur-sm sm:p-8">
+        <section className="rounded-2xl bg-surface p-6 ring-1 ring-border  sm:p-8">
           <p className="text-text-secondary">
             Nomor tiket BIMA biasanya{" "}
             <span className="text-text-primary">9 digit angka</span> yang
