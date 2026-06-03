@@ -13,3 +13,7 @@ chromadb==0.6.3
 huggingface-hub==0.27.0
 transformers==4.47.0
 sentence-transformers>=3.0,<6.0
+# JWT verification for citizen-SSO tokens on /webhook/chat (security gate).
+# Pinned to the same range admin-api uses so a JWT minted there validates
+# here byte-for-byte. Keep them in lock-step.
+python-jose[cryptography]>=3.3.0,<4
