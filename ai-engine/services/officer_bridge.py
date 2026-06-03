@@ -569,6 +569,18 @@ async def notify_officer_of_submission(
             officer_whatsapps = []
 
     if officer_whatsapps:
+        # Make every just-resolved officer immediately recognizable on their
+        # FIRST reply: union the normalized numbers into the same _officer_cache
+        # set is_officer_channel_id reads. Without this, an officer whose roster
+        # row changed after the last 5-min refresh (or if the startup warm
+        # failed) would fall through to the citizen path until the next refresh.
+        # resolve_step_officers already returns APTANA-normalized (62…) numbers,
+        # so they're directly comparable to the cache. We only ADD — the TTL /
+        # background-refresh logic is untouched (a later refresh still rebuilds
+        # the authoritative set from the directory).
+        global _officer_cache
+        _officer_cache |= {n for n in officer_whatsapps if n}
+
         # Register a session + send the brief for EACH resolved officer. A
         # send/session failure for one officer must not block the others.
         any_sent = False

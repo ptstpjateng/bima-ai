@@ -566,6 +566,57 @@ class TestOfficerMediaShortCircuit(unittest.TestCase):
         self.assertEqual(len(bg.tasks), 1)
         self.assertIs(bg.tasks[0][0], aptana._process_inbound_media)
 
+    def _unparseable_media_payload(self):
+        # A media-typed message that _extract_media_from_payload CANNOT parse
+        # (image with neither id nor link → returns None) and that carries no
+        # text → falls through to the missing_fields branch.
+        return {"phoneNumber": "628999000111",
+                "payload": {"messages": [{"type": "image", "id": "wamid.X",
+                                          "image": {"mime_type": "image/jpeg"}}]}}
+
+    def test_officer_unparseable_media_not_given_citizen_nudge(self):
+        # FIX 4: an officer whose media can't be parsed must NOT receive the
+        # citizen "kirim ulang sebagai foto/PDF" nudge. The endpoint returns the
+        # officer_media_ignored skip marker and schedules NO send task.
+        from routers import aptana as ap
+        # Sanity: this payload truly yields no parseable media and no text.
+        self.assertIsNone(ap._extract_media_from_payload(
+            self._unparseable_media_payload()["payload"]))
+        self.assertIsNone(ap._extract_text_from_payload(
+            self._unparseable_media_payload()["payload"]))
+
+        env = {"BIMA_OFFICER_NOTIFY_ENABLED": "true",
+               "BIMA_OFFICER_WA_PHONE": "628999000111",
+               "BIMA_OFFICER_TG_CHAT": ""}
+        bg = _FakeBackground()
+        with patch.dict(os.environ, env, clear=False):
+            with patch.object(aptana, "_PATH_SECRET", "s3cret"):
+                with _capture_sends():
+                    res = _run(aptana.aptana_inbound(
+                        "s3cret", _FakeRequest(self._unparseable_media_payload()), bg))
+        self.assertEqual(res.get("skipped"), "officer_media_ignored")
+        self.assertEqual(bg.tasks, [])      # no send task scheduled for officer
+        self.assertEqual(_SENT, [])         # officer received nothing
+
+    def test_citizen_unparseable_media_still_gets_nudge(self):
+        # A NON-officer sender with the same unparseable payload still gets the
+        # citizen attachment nudge (the existing behaviour is preserved).
+        env = {"BIMA_OFFICER_NOTIFY_ENABLED": "true",
+               "BIMA_OFFICER_WA_PHONE": "628000000000",   # a different number
+               "BIMA_OFFICER_TG_CHAT": ""}
+        bg = _FakeBackground()
+        with patch.dict(os.environ, env, clear=False):
+            with patch.object(aptana, "_PATH_SECRET", "s3cret"):
+                res = _run(aptana.aptana_inbound(
+                    "s3cret", _FakeRequest(self._unparseable_media_payload()), bg))
+        self.assertEqual(res.get("skipped"), "missing_fields")
+        # The citizen nudge is scheduled as a send_text background task.
+        self.assertEqual(len(bg.tasks), 1)
+        fn, _a, kw = bg.tasks[0]
+        self.assertIs(fn, aptana.send_text)
+        self.assertIn("foto", kw["body"].lower())
+        self.assertIn("pdf", kw["body"].lower())
+
 
 # ===========================================================================
 # (1) session_store round-trip through the PUBLIC async API + in-memory

@@ -901,21 +901,21 @@ def _fmt_validation_issues(result: dict[str, Any]) -> str:
 # ===========================================================================
 
 async def _start_session(user_id: str, message: str) -> str:
-    """Begin a new guided submission: resolve the licence the citizen named."""
-    from services.siap_tools import siap_lookup_license
+    """Begin a new guided submission: resolve the licence the citizen named.
+
+    Resolution is LLM-driven and grounded in the WHOLE SIAP licence catalogue
+    (`services.license_resolver.resolve_license_intent`). We pass the RAW
+    message — the model understands intent, expands acronyms, and tolerates
+    typos/word-order/synonyms, so the old regex stopword-stripping (which
+    polluted a substring ILIKE) is no longer needed. The resolver returns the
+    same {found, matches, note} shape the previous `siap_lookup_license` path
+    did, so the downstream logic below is unchanged.
+    """
+    from services.license_resolver import resolve_license_intent
 
     sess = SubmissionSession(user_id=user_id)
 
-    # Strip the intent verbs so the leftover is a cleaner licence query.
-    query = _SUBMISSION_INTENT_PATTERN.sub(" ", message)
-    query = re.sub(
-        r"\b(saya|aku|untuk|usaha|sebuah|tolong|bantu|mau|ingin|pengen|"
-        r"please|a|an|new|the)\b",
-        " ", query, flags=re.IGNORECASE,
-    )
-    query = re.sub(r"\s+", " ", query).strip()
-
-    lookup = await siap_lookup_license(query) if query else {"found": False}
+    lookup = await resolve_license_intent(message)
 
     if not lookup.get("found"):
         # Could not resolve — keep the session in RESOLVING_LICENSE and ask
@@ -924,8 +924,8 @@ async def _start_session(user_id: str, message: str) -> str:
         await _put_session(sess)
         note = lookup.get("note", "")
         logger.info(
-            "Guided-submission start — licence unresolved | user=%s | query=%r",
-            _mask(user_id), query,
+            "Guided-submission start — licence unresolved | user=%s",
+            _mask(user_id),
         )
         return (
             "Saya siap membantu Anda mengajukan izin lewat SIAP Jateng. 🙌\n\n"
@@ -1104,7 +1104,12 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     # fixture path only when there are no in-session documents at all.
     result: dict[str, Any]
     score = sess.last_score
-    if score is None and sess.documents:
+    # Re-score when there's no score yet OR when only the JSON-safe score
+    # survived a Redis rehydrate (the rich `result` dataclass is dropped on
+    # encode — see _score_for_redis). Without the `result` the score can't drive
+    # the officer brief / sub-threshold message correctly, so a post-restart
+    # KIRIM must re-score from the rehydrated document bytes.
+    if (score is None or "result" not in score) and sess.documents:
         score = await _run_content_score(sess)
         sess.last_score = score
     if score is not None:
@@ -1202,6 +1207,31 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     # --- Success --------------------------------------------------------
     ticket = submit.get("ticket")
     request_id = submit.get("request_id")
+
+    # SIAP's create endpoint returns a ticket but can omit the id/request_id on
+    # a successful submit. Flow-based officer resolution
+    # (officer_bridge.notify_officer_of_submission → siap_db.resolve_step_officers)
+    # is gated on a non-None request_id, so without it the officer notify
+    # silently skips flow resolution and (absent a BIMA_OFFICER_WA_PHONE
+    # fallback) notifies nobody. Recover the request_id from the freshly
+    # allocated ticket BEFORE the hand-off. Never let this crash the submit path.
+    if request_id is None and ticket:
+        try:
+            from services.siap_tools import siap_resolve_request_id
+
+            request_id = await siap_resolve_request_id(ticket)
+        except Exception:
+            logger.exception(
+                "Guided-submission: request_id resolution from ticket crashed "
+                "(non-fatal) | user=%s", _mask(sess.user_id),
+            )
+            request_id = None
+        if request_id is None:
+            logger.warning(
+                "officer notify: ticket=%s has no request_id; flow resolution "
+                "skipped", _mask(ticket),
+            )
+
     sess.ticket = ticket
     sess.request_id = request_id
     sess.stage = Stage.DONE
@@ -1318,7 +1348,11 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
                     "ketik *BATAL* untuk membatalkan."
                 )
             # No candidates pending → treat the message as a licence query.
-            return await _start_session(user_id, f"ajukan izin {msg}")
+            # Pass the RAW message: the LLM resolver understands intent on its
+            # own, so prepending "ajukan izin " (as before) only added filler
+            # the old substring matcher then choked on — e.g. "PKPP" became
+            # "ajukan izin PKPP" → 0 matches.
+            return await _start_session(user_id, msg)
 
         if sess.stage == Stage.COLLECTING_FIELDS:
             return await _collect_field(sess, msg)

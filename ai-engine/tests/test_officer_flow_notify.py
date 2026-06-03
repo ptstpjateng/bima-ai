@@ -295,6 +295,83 @@ class TestNotifyFlow(unittest.TestCase):
         targets = {call.args[1] for call in send.await_args_list}
         self.assertEqual(targets, {"6285117557091", "628123456789"})
 
+    def test_resolved_numbers_unioned_into_officer_cache(self):
+        # FIX 2: a just-resolved officer must be recognizable by the SYNC
+        # is_officer_channel_id immediately — even with a cold/stale cache and
+        # no env fallback — because notify unions the resolved numbers into the
+        # same _officer_cache set the predicate reads. (Without this, an officer
+        # whose roster row changed since the last 5-min refresh would fall
+        # through to the citizen path on their first reply.)
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        resolution = {
+            "wa_active": True,
+            "is_applicant_step": False,
+            "officer_whatsapps": ["6285117557091", "628123456789"],
+            "group_id": 6,
+            "sort_order": 1,
+        }
+        # Start cold: cache empty, but marked loaded+fresh so the sync predicate
+        # answers from the (now-augmented) set without kicking a refresh.
+        ob._reset_officer_cache()
+        import time as _t
+        ob._officer_cache_loaded = True
+        ob._officer_cache_at = _t.monotonic()
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+                with patch(
+                    "services.siap_db.resolve_step_officers",
+                    new=AsyncMock(return_value=resolution),
+                ):
+                    _run(ob.notify_officer_of_submission(
+                        ticket="000123456", request_id=777, license_id=459,
+                        license_name="PKPP", applicant_name="Budi",
+                        score=None, documents=[],
+                    ))
+        # Both resolved numbers are now in the cache directory set...
+        self.assertEqual(ob._officer_cache, {"6285117557091", "628123456789"})
+        # ...so the SYNC predicate recognizes them on a first reply, including
+        # under 08…/+62… equivalence.
+        with patch.dict("os.environ", env, clear=False):
+            self.assertTrue(ob.is_officer_channel_id("6285117557091"))
+            self.assertTrue(ob.is_officer_channel_id("085117557091"))
+            self.assertTrue(ob.is_officer_channel_id("628123456789"))
+            # A number that was NOT resolved is still not an officer.
+            self.assertFalse(ob.is_officer_channel_id("628000111222"))
+
+    def test_resolved_union_preserves_existing_cache_entries(self):
+        # FIX 2 (additive, not replace): unioning the resolved numbers must NOT
+        # drop numbers already warmed in the cache by the startup refresh.
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        resolution = {
+            "wa_active": True, "is_applicant_step": False,
+            "officer_whatsapps": ["628123456789"], "group_id": 6, "sort_order": 1,
+        }
+        ob._reset_officer_cache()
+        ob._officer_cache = {"6280000000000"}  # pre-warmed entry
+        import time as _t
+        ob._officer_cache_loaded = True
+        ob._officer_cache_at = _t.monotonic()
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+                with patch(
+                    "services.siap_db.resolve_step_officers",
+                    new=AsyncMock(return_value=resolution),
+                ):
+                    _run(ob.notify_officer_of_submission(
+                        ticket="1", request_id=777, license_id=459,
+                        license_name="PKPP", applicant_name="A",
+                        score=None, documents=[],
+                    ))
+        self.assertEqual(ob._officer_cache, {"6280000000000", "628123456789"})
+
     def test_falls_back_to_env_when_resolution_empty(self):
         env = {
             "BIMA_OFFICER_NOTIFY_ENABLED": "true",

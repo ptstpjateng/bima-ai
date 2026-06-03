@@ -141,6 +141,19 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
             _mask(msisdn or ""), _payload_shape_keys(raw_payload),
         )
         if msisdn:
+            # An officer whose media we couldn't parse must NOT receive the
+            # citizen-worded "kirim ulang sebagai foto/PDF" nudge — the officer
+            # surface has no document-upload path. (The media branch above only
+            # short-circuits officers when _extract_media_from_payload SUCCEEDS;
+            # an unparseable attachment falls through to here.) Drop silently for
+            # officers; keep the citizen nudge for everyone else.
+            from services import officer_bridge
+            if officer_bridge.is_officer_channel_id(msisdn):
+                logger.info(
+                    "APTANA inbound unparseable media from officer — ignored | "
+                    "user=%s", _mask(msisdn),
+                )
+                return {"ok": True, "skipped": "officer_media_ignored"}
             background.add_task(
                 send_text,
                 recipient_phone=msisdn,
