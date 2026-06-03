@@ -11,7 +11,8 @@ What it covers:
   * detect_submission_intent — positive + negative phrasing.
   * SiapSubmissionClient — not-configured, 2xx success, 4xx, timeout,
     network error, all with `httpx.AsyncClient` mocked.
-  * The guided-submission state machine end to end with SIAP lookup /
+  * The guided-submission state machine end to end with the LLM licence
+    resolver (services.license_resolver.resolve_license_intent) / SIAP
     requirements and the SIAP submission client mocked:
       - feature flag off → maybe_handle returns None;
       - happy path: intent → single licence → collect 4 fields → review →
@@ -239,7 +240,7 @@ class TestHappyPath(_GuidedFlowBase):
         mock_client.is_configured.return_value = True
         mock_client.create_request = AsyncMock(return_value=submit_result)
 
-        with patch("services.siap_tools.siap_lookup_license",
+        with patch("services.license_resolver.resolve_license_intent",
                    new=AsyncMock(return_value=_ONE_MATCH)), \
              patch("services.siap_tools.siap_get_requirements",
                    new=AsyncMock(return_value=_REQUIREMENTS)), \
@@ -278,7 +279,7 @@ class TestHappyPath(_GuidedFlowBase):
             mock_client.create_request.assert_awaited_once()
 
     def test_bad_nik_is_rejected_and_reasked(self):
-        with patch("services.siap_tools.siap_lookup_license",
+        with patch("services.license_resolver.resolve_license_intent",
                    new=AsyncMock(return_value=_ONE_MATCH)), \
              patch("services.siap_tools.siap_get_requirements",
                    new=AsyncMock(return_value=_REQUIREMENTS)):
@@ -302,7 +303,7 @@ class TestValidationGate(_GuidedFlowBase):
         mock_client.is_configured.return_value = True
         mock_client.create_request = AsyncMock()
 
-        with patch("services.siap_tools.siap_lookup_license",
+        with patch("services.license_resolver.resolve_license_intent",
                    new=AsyncMock(return_value=_ONE_MATCH)), \
              patch("services.siap_tools.siap_get_requirements",
                    new=AsyncMock(return_value=_REQUIREMENTS)), \
@@ -328,7 +329,7 @@ class TestDegradeGracefully(_GuidedFlowBase):
         mock_client = MagicMock()
         mock_client.is_configured.return_value = False
 
-        with patch("services.siap_tools.siap_lookup_license",
+        with patch("services.license_resolver.resolve_license_intent",
                    new=AsyncMock(return_value=_ONE_MATCH)), \
              patch("services.siap_tools.siap_get_requirements",
                    new=AsyncMock(return_value=_REQUIREMENTS)), \
@@ -349,7 +350,7 @@ class TestDegradeGracefully(_GuidedFlowBase):
 class TestCancel(_GuidedFlowBase):
 
     def test_cancel_clears_session(self):
-        with patch("services.siap_tools.siap_lookup_license",
+        with patch("services.license_resolver.resolve_license_intent",
                    new=AsyncMock(return_value=_ONE_MATCH)), \
              patch("services.siap_tools.siap_get_requirements",
                    new=AsyncMock(return_value=_REQUIREMENTS)):

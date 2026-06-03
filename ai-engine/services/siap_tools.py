@@ -47,7 +47,9 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import re
+import time
 from html.parser import HTMLParser
 from typing import Any, Optional
 
@@ -683,3 +685,130 @@ async def siap_list_licenses_by_sektor(sektor: str) -> dict:
             "sektor": s,
             "note": f"Gagal membaca daftar izin per sektor dari basis data SIAP: {exc}",
         }
+
+
+# ===========================================================================
+# Licence catalogue — the WHOLE SIAP licence list, cached in memory.
+#
+# This powers the LLM-driven resolver (services/license_resolver.py): instead
+# of a brittle `name ILIKE '%query%'` over a regex-cleaned message, BIMA hands
+# the COMPLETE catalogue (id | name | sektor, ~384 LICENSE rows) to Gemini and
+# lets the model map the citizen's free-text intent to the right licence.
+#
+# The catalogue is near-static (DPMPTSP's licence list changes rarely), so we
+# cache it with a TTL — exactly the in-memory-set-with-TTL + non-blocking
+# refresh pattern officer_bridge.py uses for the officer directory. The cache
+# is shared across every resolve_license_intent call so each citizen turn only
+# costs one (cached) read, and the per-call Gemini grounding block is stable
+# (helps implicit prompt caching).
+#
+# NEVER raises: on a SIAP-DB miss/outage it returns [] so the resolver can fall
+# straight through to the fuzzy SQL fallback. License names are NOT PII — only
+# the count is logged either way.
+# ===========================================================================
+
+# Same parent-join shape as _SQL_LOOKUP_LICENSE but UNFILTERED — the whole
+# LICENSE catalogue ordered by name. parent name = the SECTOR row the licence
+# hangs under.
+_SQL_LICENSE_CATALOGUE = """
+    SELECT c.license_id,
+           c.name,
+           p.name AS sektor
+      FROM ptsp.license c
+      LEFT JOIN ptsp.license p ON p.license_id = c.parent_id
+     WHERE c.stereotype = 'LICENSE'
+     ORDER BY c.name ASC
+"""
+
+# Catalogue TTL — the licence roster is near-static, mirror the officer-cache
+# 5-min default; override with SIAP_LICENSE_CATALOGUE_TTL_SECONDS.
+_CATALOGUE_TTL_SECONDS: float = float(
+    os.getenv("SIAP_LICENSE_CATALOGUE_TTL_SECONDS", "600") or "600"
+)
+
+# Last-known catalogue rows (list of {license_id, name, sektor}).
+_catalogue_cache: list[dict] = []
+_catalogue_cache_at: float = 0.0       # monotonic timestamp of last successful load
+_catalogue_cache_loaded: bool = False  # has a load ever succeeded?
+
+
+def _catalogue_is_stale() -> bool:
+    return (time.monotonic() - _catalogue_cache_at) > _CATALOGUE_TTL_SECONDS
+
+
+async def _load_license_catalogue() -> list[dict]:
+    """Read the whole LICENSE catalogue from SIAP. Never raises — [] on error.
+
+    Returns a fresh list of {license_id:int, name:str, sektor:str|None}. The
+    caller owns caching; this is the raw fetch.
+    """
+    if not is_siap_db_configured():
+        logger.info("get_license_catalogue: SIAP DB not configured")
+        return []
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_LICENSE_CATALOGUE)
+        catalogue = [
+            {
+                "license_id": int(r["license_id"]),
+                "name": (r["name"] or "").strip(),
+                "sektor": (r["sektor"].strip() if r["sektor"] else None),
+            }
+            for r in rows
+            if r["license_id"] is not None and (r["name"] or "").strip()
+        ]
+        logger.info("license catalogue loaded | rows=%d", len(catalogue))
+        return catalogue
+    except Exception:  # pragma: no cover — defensive; never break the resolver
+        logger.exception("_load_license_catalogue failed (returning empty)")
+        return []
+
+
+async def get_license_catalogue(*, force_refresh: bool = False) -> list[dict]:
+    """
+    Return the WHOLE SIAP licence catalogue, cached in memory with a TTL.
+
+    Each entry is {"license_id": int, "name": str, "sektor": str|None}
+    (~384 LICENSE rows). The list is the LLM resolver's grounding corpus —
+    Gemini picks the best licence id from it, and we validate the model's
+    answer against it so a hallucinated id is dropped.
+
+    Caching: a successful fetch is held for `_CATALOGUE_TTL_SECONDS`. While the
+    cache is warm we return it directly. When it is stale (or never loaded) we
+    re-fetch synchronously — unlike the officer cache we await the refresh,
+    because the resolver NEEDS the catalogue to do its job this turn; a stale
+    fetch returning [] simply routes the resolver to its fuzzy fallback.
+
+    NEVER raises. On a SIAP outage returns the last-known catalogue if we have
+    one (better stale than empty), else [].
+    """
+    global _catalogue_cache, _catalogue_cache_at, _catalogue_cache_loaded
+
+    if not force_refresh and _catalogue_cache_loaded and not _catalogue_is_stale():
+        return _catalogue_cache
+
+    fresh = await _load_license_catalogue()
+    if fresh:
+        _catalogue_cache = fresh
+        _catalogue_cache_at = time.monotonic()
+        _catalogue_cache_loaded = True
+        return _catalogue_cache
+
+    # Fetch failed/empty. Keep the last-known set if we have one (a SIAP blip
+    # shouldn't wipe a good catalogue); otherwise return [].
+    if _catalogue_cache_loaded and _catalogue_cache:
+        logger.info(
+            "get_license_catalogue: refresh empty — serving last-known | rows=%d",
+            len(_catalogue_cache),
+        )
+        return _catalogue_cache
+    return []
+
+
+def _reset_license_catalogue_cache() -> None:
+    """Test helper — clear the catalogue cache so each test starts cold."""
+    global _catalogue_cache, _catalogue_cache_at, _catalogue_cache_loaded
+    _catalogue_cache = []
+    _catalogue_cache_at = 0.0
+    _catalogue_cache_loaded = False
