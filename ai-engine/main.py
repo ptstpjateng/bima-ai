@@ -54,6 +54,17 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("session_store startup ping raised (non-fatal)")
 
+    # Officer-directory cache (flow-based notify): warm the in-memory set of
+    # registered officer WhatsApp numbers so the first inbound officer message
+    # hits a warm cache instead of a cold sync miss. is_officer_channel_id
+    # refreshes it on a TTL via a non-blocking background task thereafter.
+    # Never fatal — degrades to the BIMA_OFFICER_WA_PHONE env fallback.
+    try:
+        from services import officer_bridge
+        await officer_bridge.warm_officer_cache()
+    except Exception:
+        logger.exception("officer cache warm raised (non-fatal)")
+
     # Transparency-notification poller: a background task that polls SIAP's
     # license-request changes feed and dispatches proactive citizen WhatsApp
     # updates. The task is always created; it no-ops every tick until

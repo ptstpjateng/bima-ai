@@ -151,3 +151,255 @@ async def close_siap_pool() -> None:
         await _pool.close()
         _pool = None
         logger.info("SIAP read-only pool closed.")
+
+
+# ===========================================================================
+# Flow-based officer resolution ([[BIMA Officer Notify Model]])
+#
+# BIMA decides WHO to notify from SIAP's "Alur Izin" (license_approval_step),
+# not a single static env phone. For a license_request at its CURRENT
+# approval_step_id we read that step's owning role (group_id → public.roles)
+# and its `properties.wa_notification` flag, then resolve the officer(s)
+# assigned to that step on this specific izin.
+#
+# These are the SAME pool + SELECT-only pattern suitability_judge uses
+# (get_siap_pool → pool.acquire → conn.fetch/fetchrow). Read-only by contract;
+# the pool `setup` hook forces every connection read-only.
+#
+# Failure model: NEVER raise. resolve_step_officers / get_officer_directory
+# return a safe empty result on any error so a SIAP hiccup degrades the
+# notify path to the BIMA_OFFICER_WA_PHONE fallback rather than crashing the
+# citizen's submission. PII (whatsapp / names) is never logged.
+# ===========================================================================
+
+# The applicant ("Pemohon Online") role anchors sort_order 0 / the terminal
+# step. It must never be treated as an officer (it's the CITIZEN). Matched
+# case-insensitively against the role NAME (the id is environment-specific;
+# the spec cites 99 for Beta-SIAP but the name is the stable contract).
+APPLICANT_ROLE_NAME = "pemohon online"
+
+# request_id → (approval_step_id, license_id)
+_SQL_REQUEST_STEP = """
+    SELECT approval_step_id, license_id
+      FROM ptsp.license_request
+     WHERE request_id = $1
+     LIMIT 1
+"""
+
+# approval_step_id → (group_id, sort_order, wa_notification flag)
+_SQL_APPROVAL_STEP = """
+    SELECT group_id,
+           sort_order,
+           properties ->> 'wa_notification' AS wa_notification
+      FROM ptsp.license_approval_step
+     WHERE approval_step_id = $1
+     LIMIT 1
+"""
+
+# role id → role name (to detect the applicant role by name)
+_SQL_ROLE_NAME = """
+    SELECT name
+      FROM public.roles
+     WHERE id = $1
+     LIMIT 1
+"""
+
+# Officer(s) who BOTH hold the step's role (Spatie model_has_roles) AND are
+# assigned to this specific izin (Privilege Izin → scmcoresystem.tblroleizin).
+# Mirrors how SIAP itself scopes the officer worklist (DataPerizinanController).
+_SQL_STEP_OFFICER_WHATSAPPS = """
+    SELECT DISTINCT u.whatsapp
+      FROM scmcoresystem.tblroleizin t
+      JOIN public.users u ON u.id = t.users_id
+      JOIN public.model_has_roles m ON m.model_id = u.id
+     WHERE t.tblizin_id = $1
+       AND m.role_id = $2
+       AND u.whatsapp IS NOT NULL
+       AND btrim(u.whatsapp) <> ''
+"""
+
+# Every officer WhatsApp across all real officer roles — i.e. roles that own
+# at least one license_approval_step, excluding the applicant role. Powers the
+# inbound officer-identification cache (any registered petugas may chat as
+# themselves). PII never logged; only the COUNT is.
+_SQL_OFFICER_DIRECTORY = """
+    SELECT DISTINCT u.whatsapp
+      FROM public.users u
+      JOIN public.model_has_roles m ON m.model_id = u.id
+      JOIN public.roles r ON r.id = m.role_id
+     WHERE r.id IN (SELECT DISTINCT group_id FROM ptsp.license_approval_step)
+       AND lower(r.name) <> $1
+       AND u.whatsapp IS NOT NULL
+       AND btrim(u.whatsapp) <> ''
+"""
+
+
+def _empty_step_result() -> dict:
+    """Safe default — no officer, not the applicant step, wa not active."""
+    return {
+        "wa_active": False,
+        "is_applicant_step": False,
+        "officer_whatsapps": [],
+        "group_id": None,
+        "sort_order": None,
+    }
+
+
+async def resolve_step_officers(request_id: int) -> dict:
+    """
+    Resolve the officer(s) BIMA should notify for a license_request at its
+    CURRENT approval step.
+
+    Returns a dict:
+      {
+        "wa_active":         bool,        # step's wa_notification == 'ACTIVE'
+        "is_applicant_step": bool,        # owning role is 'Pemohon Online'
+        "officer_whatsapps": list[str],   # NORMALIZED (62…) officer numbers
+        "group_id":          int | None,  # the step's role id
+        "sort_order":        int | None,  # 0 = applicant anchor
+      }
+
+    NEVER raises. On any DB error / missing row / unconfigured SIAP DB it
+    returns a safe empty result (callers fall back to BIMA_OFFICER_WA_PHONE).
+    Officer numbers are normalized to APTANA's inbound form so they match the
+    inbound channel_id directly. Numbers/names are never logged.
+    """
+    result = _empty_step_result()
+
+    if not is_siap_db_configured():
+        logger.info(
+            "resolve_step_officers: SIAP DB not configured | request_id=%s",
+            request_id,
+        )
+        return result
+
+    try:
+        rid = int(request_id)
+    except (TypeError, ValueError):
+        logger.warning("resolve_step_officers: bad request_id=%r", request_id)
+        return result
+
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            req_row = await conn.fetchrow(_SQL_REQUEST_STEP, rid)
+            if req_row is None:
+                logger.info(
+                    "resolve_step_officers: request not found | request_id=%s", rid
+                )
+                return result
+
+            approval_step_id = req_row["approval_step_id"]
+            license_id = req_row["license_id"]
+            if approval_step_id is None:
+                logger.info(
+                    "resolve_step_officers: no approval_step_id | request_id=%s", rid
+                )
+                return result
+
+            step_row = await conn.fetchrow(_SQL_APPROVAL_STEP, approval_step_id)
+            if step_row is None:
+                logger.info(
+                    "resolve_step_officers: step not found | request_id=%s step=%s",
+                    rid, approval_step_id,
+                )
+                return result
+
+            group_id = step_row["group_id"]
+            sort_order = step_row["sort_order"]
+            wa_flag = (step_row["wa_notification"] or "").strip().upper()
+            wa_active = wa_flag == "ACTIVE"
+            result["group_id"] = group_id
+            result["sort_order"] = sort_order
+            result["wa_active"] = wa_active
+
+            # Resolve the owning role NAME to decide applicant-vs-officer.
+            is_applicant_step = False
+            if group_id is not None:
+                role_row = await conn.fetchrow(_SQL_ROLE_NAME, group_id)
+                role_name = (role_row["name"] if role_row else "") or ""
+                is_applicant_step = (
+                    role_name.strip().lower() == APPLICANT_ROLE_NAME
+                )
+            result["is_applicant_step"] = is_applicant_step
+
+            # Only resolve officer numbers for a wa-active OFFICER step. An
+            # applicant step (citizen notify) and a NON-ACTIVE step both yield
+            # no officer numbers here.
+            if wa_active and not is_applicant_step and group_id is not None:
+                rows = await conn.fetch(
+                    _SQL_STEP_OFFICER_WHATSAPPS, license_id, group_id
+                )
+                seen: set[str] = set()
+                numbers: list[str] = []
+                for r in rows:
+                    norm = _normalize_msisdn(r["whatsapp"])
+                    if norm and norm not in seen:
+                        seen.add(norm)
+                        numbers.append(norm)
+                result["officer_whatsapps"] = numbers
+
+        logger.info(
+            "resolve_step_officers | request_id=%s group_id=%s sort_order=%s "
+            "wa_active=%s applicant=%s officers=%d",
+            rid, result["group_id"], result["sort_order"],
+            result["wa_active"], result["is_applicant_step"],
+            len(result["officer_whatsapps"]),
+        )
+        return result
+    except Exception:  # pragma: no cover — defensive; never break the citizen path
+        logger.exception(
+            "resolve_step_officers failed (returning empty) | request_id=%s", rid
+        )
+        return _empty_step_result()
+
+
+async def get_officer_directory() -> list[str]:
+    """
+    Return the set of ALL officer WhatsApp numbers (normalized, deduped) —
+    every `public.users.whatsapp` whose role owns at least one
+    `license_approval_step`, excluding the applicant role.
+
+    Powers the inbound officer-identification cache in officer_bridge. NEVER
+    raises — returns [] on any error / unconfigured SIAP DB. Numbers are never
+    logged (only the count).
+    """
+    if not is_siap_db_configured():
+        logger.info("get_officer_directory: SIAP DB not configured")
+        return []
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_OFFICER_DIRECTORY, APPLICANT_ROLE_NAME)
+        seen: set[str] = set()
+        numbers: list[str] = []
+        for r in rows:
+            norm = _normalize_msisdn(r["whatsapp"])
+            if norm and norm not in seen:
+                seen.add(norm)
+                numbers.append(norm)
+        logger.info("get_officer_directory | officers=%d", len(numbers))
+        return numbers
+    except Exception:  # pragma: no cover — defensive
+        logger.exception("get_officer_directory failed (returning empty)")
+        return []
+
+
+def _normalize_msisdn(raw: Optional[str]) -> str:
+    """Canonicalize a stored WhatsApp number to APTANA's inbound form (62…).
+
+    Strip everything but digits; a leading 0 → 62; otherwise ensure a 62
+    prefix. Mirrors services.whatsapp_sender.normalize_phone but is kept local
+    so this read-only module carries no outbound-sender import. Returns "" for
+    empty/garbage input.
+    """
+    if not raw:
+        return ""
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    if not digits:
+        return ""
+    if digits.startswith("0"):
+        return "62" + digits[1:]
+    if digits.startswith("62"):
+        return digits
+    return "62" + digits
