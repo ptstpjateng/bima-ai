@@ -10,12 +10,19 @@ alembic>=1.14.0,<1.15
 pydantic>=2.9.0,<3
 pydantic-settings>=2.6.0,<3
 email-validator>=2.2.0,<3
-python-jose[cryptography]>=3.3.0,<4
+# python-jose: bumped to >=3.4.0 to pull in the fix for CVE-2024-33664
+# (JWE decompression DoS — "JWT bomb"). We use the JWS code path, not JWE,
+# but the lib still ships the vulnerable decompress path and the upstream
+# fix is purely a resource limit — safe to take.
+python-jose[cryptography]>=3.4.0,<4
 passlib[bcrypt]>=1.7.4,<2
-# passlib 1.7.4 has a known incompatibility with bcrypt 4.x:
-# AttributeError: module 'bcrypt' has no attribute '__about__'
-# Pin bcrypt to 3.x until passlib ships a fix.
-bcrypt>=3.2,<4.0
+# bcrypt: bumped off the EOL 3.x line to 4.x. The historical
+# `AttributeError: module 'bcrypt' has no attribute '__about__'` from passlib
+# 1.7.4 reading `bcrypt.__about__` is handled internally by passlib as a
+# trapped warning — hash/verify still works correctly against both new and
+# Laravel-issued ('$2y$' / '$2b$') hashes. Verified against the project's
+# auth.py CryptContext(schemes=["bcrypt"], deprecated="auto").
+bcrypt>=4.0,<5
 httpx>=0.27.0,<0.28
 # Required by FastAPI's UploadFile / Form for /ingestion/upload.
 python-multipart>=0.0.12,<0.0.20
