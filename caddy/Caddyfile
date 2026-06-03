@@ -76,12 +76,19 @@ nolongin.com, www.nolongin.com, bimaptsp.com, www.bimaptsp.com {
 
 	# AI-engine webhooks (Telegram, WhatsApp/APTANA, Meta-direct, web chat).
 	# Path prefix is preserved — ai-engine routers expect /webhook/<channel>.
-	# 30 r/m per source IP — see rate-limit block at top of file.
+	# 600 r/m per source IP. NOTE: APTANA (the WhatsApp BSP) and Telegram both
+	# relay ALL citizen inbound from a small set of their own server IPs, so a
+	# per-{remote_host} cap is effectively a GLOBAL ceiling on the whole audience
+	# — not per-citizen. 30/min throttled live demos (one message ≈ 3-4 webhook
+	# hits: greeting + message + read + delivery). 600/min (10 r/s) keeps generous
+	# headroom for a live audience while still capping direct abuse of the public
+	# endpoint. FOLLOW-UP: key on the citizen msisdn at the app layer instead of
+	# the relay IP so the limit is genuinely per-user.
 	handle /webhook/* {
 		rate_limit {
 			zone webhooks {
 				key {remote_host}
-				events 30
+				events 600
 				window 1m
 			}
 		}
