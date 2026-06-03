@@ -251,7 +251,7 @@ class TestHappyPath(_GuidedFlowBase):
             r1 = _run(gs.maybe_handle(uid, "saya mau ajukan izin pemakaian tanah"))
             self.assertIsNotNone(r1)
             self.assertIn("Izin Pemakaian Tanah", r1)
-            self.assertTrue(gs.has_active_session(uid))
+            self.assertTrue(_run(gs.has_active_session(uid)))
 
             # 2. applicant name.
             r2 = _run(gs.maybe_handle(uid, "Budi Santoso"))
@@ -274,7 +274,7 @@ class TestHappyPath(_GuidedFlowBase):
             self.assertIn("000088002", r6)
             self.assertIn("track/000088002", r6)
             # Session cleared after a successful submit.
-            self.assertFalse(gs.has_active_session(uid))
+            self.assertFalse(_run(gs.has_active_session(uid)))
             mock_client.create_request.assert_awaited_once()
 
     def test_bad_nik_is_rejected_and_reasked(self):
@@ -319,7 +319,7 @@ class TestValidationGate(_GuidedFlowBase):
         self.assertIn("belum bisa dikirim", reply)
         mock_client.create_request.assert_not_awaited()
         # Session stays at REVIEW so the citizen can retry.
-        self.assertTrue(gs.has_active_session(uid))
+        self.assertTrue(_run(gs.has_active_session(uid)))
 
 
 class TestDegradeGracefully(_GuidedFlowBase):
@@ -355,10 +355,10 @@ class TestCancel(_GuidedFlowBase):
                    new=AsyncMock(return_value=_REQUIREMENTS)):
             uid = "wa-632"
             _run(gs.maybe_handle(uid, "mau ajukan izin pemakaian tanah"))
-            self.assertTrue(gs.has_active_session(uid))
+            self.assertTrue(_run(gs.has_active_session(uid)))
             reply = _run(gs.maybe_handle(uid, "batal"))
             self.assertIn("dibatalkan", reply)
-            self.assertFalse(gs.has_active_session(uid))
+            self.assertFalse(_run(gs.has_active_session(uid)))
 
 
 if __name__ == "__main__":

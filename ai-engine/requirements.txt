@@ -5,6 +5,11 @@ pydantic-settings==2.7.1
 python-dotenv==1.0.1
 requests==2.32.3
 httpx==0.28.1
+# Async Redis client for durable chat sessions (services/session_store.py).
+# Uses redis.asyncio (ships inside the `redis` wheel since 4.2 — no aioredis).
+# Optional at runtime: session_store lazy-imports it and degrades to in-memory
+# when absent, but it ships so BIMA_REDIS_SESSIONS_ENABLED works on the VPS.
+redis>=5.0,<6.0
 # Direct Postgres driver for the SIAP tool layer (services/siap_db.py).
 # Read-only reads against dbsiapjateng — same driver admin-api uses.
 asyncpg>=0.30.0,<0.31

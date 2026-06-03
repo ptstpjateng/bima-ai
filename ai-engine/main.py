@@ -44,6 +44,16 @@ _POLLER_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 async def lifespan(app: FastAPI):
     logger.info("BIMA-AI engine starting up.")
 
+    # Durable chat sessions (Redis): probe connectivity once at startup so the
+    # logs say up-front whether guided-submission + officer sessions will
+    # survive a restart. No-op (logs "disabled") when the flag is off; never
+    # fatal — session_store degrades to in-memory on any failure.
+    try:
+        from services import session_store
+        await session_store.ping()
+    except Exception:
+        logger.exception("session_store startup ping raised (non-fatal)")
+
     # Transparency-notification poller: a background task that polls SIAP's
     # license-request changes feed and dispatches proactive citizen WhatsApp
     # updates. The task is always created; it no-ops every tick until

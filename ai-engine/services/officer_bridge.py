@@ -58,6 +58,7 @@ PII
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
@@ -66,6 +67,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from dotenv import load_dotenv
+
+from services import session_store
 
 load_dotenv()
 
@@ -137,25 +140,116 @@ _MAX_HISTORY_TURNS = 30  # mirror copilot router cap headroom
 _sessions: "OrderedDict[str, OfficerCaseSession]" = OrderedDict()
 
 
-def _get_session(channel_id: str) -> Optional[OfficerCaseSession]:
+# ---------------------------------------------------------------------------
+# Redis serialization (durable sessions — services/session_store.py).
+#
+# The validation dict is already JSON-safe (it's the projected copilot shape,
+# not the raw SuitabilityResult). The only binary is each document's `content`
+# bytes inside the `documents` map → base64 on encode, bytes on decode. Bytes
+# are NEVER logged (session_store logs only payload lengths).
+# ---------------------------------------------------------------------------
+
+def _encode_officer_session(sess: OfficerCaseSession) -> str:
+    import json
+
+    docs = {
+        fid: {
+            "filename": d.get("filename", fid),
+            "mime_type": d.get("mime_type", "application/octet-stream"),
+            "claimed_type": d.get("claimed_type", ""),
+            "content_b64": base64.b64encode(d.get("content") or b"").decode("ascii"),
+        }
+        for fid, d in (sess.documents or {}).items()
+    }
+    payload = {
+        "channel_id": sess.channel_id,
+        "channel": sess.channel,
+        "ticket": sess.ticket,
+        "request_id": sess.request_id,
+        "license_name": sess.license_name,
+        "validation": sess.validation,
+        "documents": docs,
+        "history": sess.history,
+        "created_at": sess.created_at,
+        "updated_at": sess.updated_at,
+    }
+    return json.dumps(payload)
+
+
+def _decode_officer_session(blob: str) -> OfficerCaseSession:
+    import json
+
+    raw = json.loads(blob)
+    docs = {
+        fid: {
+            "filename": d.get("filename", fid),
+            "mime_type": d.get("mime_type", "application/octet-stream"),
+            "claimed_type": d.get("claimed_type", ""),
+            "content": base64.b64decode(d["content_b64"]) if d.get("content_b64") else b"",
+        }
+        for fid, d in (raw.get("documents") or {}).items()
+    }
+    return OfficerCaseSession(
+        channel_id=str(raw["channel_id"]),
+        channel=str(raw.get("channel", CHANNEL_WHATSAPP)),
+        ticket=str(raw.get("ticket", "")),
+        request_id=raw.get("request_id"),
+        license_name=raw.get("license_name"),
+        validation=raw.get("validation"),
+        documents=docs,
+        history=list(raw.get("history") or []),
+        created_at=float(raw.get("created_at", time.time())),
+        updated_at=float(raw.get("updated_at", time.time())),
+    )
+
+
+async def _get_session(channel_id: str) -> Optional[OfficerCaseSession]:
+    """Read an officer case: in-memory first, then Redis (rehydrating the LRU
+    on a durable hit so a restarted process re-warms on first officer reply)."""
     sess = _sessions.get(channel_id)
+    if sess is None:
+        sess = await session_store.load(
+            session_store.officer_key(channel_id), decode=_decode_officer_session
+        )
+        if sess is not None:
+            _sessions[channel_id] = sess
+            _sessions.move_to_end(channel_id)
     if sess is None:
         return None
     if time.time() - sess.updated_at > _OFFICER_SESSION_TTL_SECONDS:
         _sessions.pop(channel_id, None)
+        await session_store.delete(session_store.officer_key(channel_id))
         return None
     return sess
 
 
-def _put_session(sess: OfficerCaseSession) -> None:
+async def _put_session(sess: OfficerCaseSession) -> None:
+    """Write-through: in-memory LRU + best-effort Redis (TTL = session TTL)."""
     _sessions[sess.channel_id] = sess
     _sessions.move_to_end(sess.channel_id)
     while len(_sessions) > _MAX_OFFICER_SESSIONS:
         _sessions.popitem(last=False)
+    saved = await session_store.save(
+        session_store.officer_key(sess.channel_id),
+        sess,
+        encode=_encode_officer_session,
+        ttl_seconds=_OFFICER_SESSION_TTL_SECONDS,
+    )
+    # When durable sessions are supposed to be ON but the write didn't land,
+    # surface it: the in-memory copy is fine, but the case won't survive a
+    # restart. Masked key only — never the payload. (session_store already
+    # warns-once on the underlying Redis error; this makes the missed durable
+    # write observable at the call site too.)
+    if not saved and session_store.is_enabled():
+        logger.warning(
+            "officer session durable write missed (flag on) | key=%s",
+            _mask(sess.channel_id),
+        )
 
 
-def clear_session(channel_id: str) -> None:
+async def clear_session(channel_id: str) -> None:
     _sessions.pop(channel_id, None)
+    await session_store.delete(session_store.officer_key(channel_id))
 
 
 def _mask(value: Optional[str]) -> str:
@@ -343,7 +437,7 @@ async def notify_officer_of_submission(
         validation=validation,
         documents=docs_map,
     )
-    _put_session(sess)
+    await _put_session(sess)
 
     sent = await _send(channel, channel_id, brief)
     logger.info(
@@ -371,6 +465,38 @@ def is_officer_channel_id(channel_id: str) -> bool:
     return cid in {_demo_officer_wa(), _demo_officer_tg()} - {""}
 
 
+# The two copilot tools that take a case OFF this officer's desk. A confirmed,
+# successful call to either means the session should be cleared.
+_CASE_CLOSING_TOOLS = {"forward_case", "record_decision"}
+
+
+def _case_was_closed(tool_calls: list) -> bool:
+    """True when the copilot turn included a SUCCESSFUL, CONFIRMED forward or
+    decision write — i.e. the case left this desk and the session is stale.
+
+    The copilot reports each call as {name, args, result_preview}; result_preview
+    is the JSON-dumped tool result. A successful confirmed write looks like
+    `{"executed": true, "ok": true, ...}` AND was invoked with
+    `confirmed=true`. A draft (`"executed": false`) or a failed write
+    (`"ok": false`) must NOT clear the session, so we require all three signals.
+    """
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        if call.get("name") not in _CASE_CLOSING_TOOLS:
+            continue
+        args = call.get("args")
+        if not (isinstance(args, dict) and args.get("confirmed") is True):
+            continue
+        preview = str(call.get("result_preview") or "")
+        # Normalise whitespace so we match the json.dumps form regardless of
+        # spacing ("ok": true / "ok":true).
+        compact = preview.replace(" ", "")
+        if '"executed":true' in compact and '"ok":true' in compact:
+            return True
+    return False
+
+
 async def maybe_handle_officer_reply(
     *,
     channel: str,
@@ -395,7 +521,7 @@ async def maybe_handle_officer_reply(
     if not is_officer_channel_id(channel_id):
         return None
 
-    sess = _get_session(channel_id)
+    sess = await _get_session(channel_id)
     if sess is None:
         # Officer texted but no active case — tell them there's nothing queued
         # rather than dropping into the citizen RAG (which would be confusing
@@ -438,28 +564,35 @@ async def maybe_handle_officer_reply(
             "Mohon coba lagi sebentar."
         )
 
-    # Persist the rolling history the copilot returned (it includes the new
-    # user turn + the model reply).
-    new_history = result.get("history")
-    if isinstance(new_history, list):
-        sess.history = new_history[-(_MAX_HISTORY_TURNS * 2):]
-    sess.touch()
-    _put_session(sess)
-
     reply = result.get("reply") or (
         "Maaf, saya belum bisa menjawab itu. Mohon ulangi dengan kalimat lain."
     )
 
-    # If the officer's action closed the case (a successful forward/decision),
-    # the copilot reply will say so; we keep the session open so the officer
-    # can ask follow-ups, but a real implementation would clear it on a
-    # confirmed write. Left open deliberately for the demo Q&A.
+    tool_calls = result.get("tool_calls") or []
+    closed = _case_was_closed(tool_calls)
+
     logger.info(
         "officer copilot bridge turn | officer=%s | ticket=%s | "
-        "tool_calls=%d | reply_len=%d",
+        "tool_calls=%d | reply_len=%d | closed=%s",
         _mask(channel_id), sess.ticket,
-        len(result.get("tool_calls") or []), len(reply),
+        len(tool_calls), len(reply), closed,
     )
+
+    if closed:
+        # A confirmed forward/decision write succeeded → the case left this
+        # officer's desk. Clear the session so a stale ticket can't hijack the
+        # officer's next, unrelated message for up to the 12h TTL. The desk
+        # returns to "nothing queued" until the next brief arrives.
+        await clear_session(channel_id)
+        return reply
+
+    # Otherwise persist the rolling history the copilot returned (it includes
+    # the new user turn + the model reply) so follow-up Q&A keeps context.
+    new_history = result.get("history")
+    if isinstance(new_history, list):
+        sess.history = new_history[-(_MAX_HISTORY_TURNS * 2):]
+    sess.touch()
+    await _put_session(sess)
     return reply
 
 
