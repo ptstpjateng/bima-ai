@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -95,6 +96,13 @@ load_dotenv()
 logger = logging.getLogger("bima_ai.guided_submission")
 
 _PORTAL_TRACK_URL = "https://portal.nolongin.com/track/{ticket}"
+
+# The demo-slice license: "Surat Keterangan Penelitian" (Izin Penelitian) on
+# Beta-SIAP. Used as the default license_id for content-scoring when the
+# resolved session has no license_id yet (shouldn't happen in the normal
+# flow, but the scorer needs a registry key). Overridable via env so the
+# same code can score any license in a later slice.
+_DEMO_LICENSE_ID = int(os.getenv("GUIDED_SUBMISSION_DEMO_LICENSE_ID", "358"))
 
 
 # ===========================================================================
@@ -263,9 +271,27 @@ _FIELD_BY_KEY: dict[str, FieldSpec] = {f.key: f for f in _FIELD_SPECS}
 class Stage(str, Enum):
     RESOLVING_LICENSE = "resolving_license"
     COLLECTING_FIELDS = "collecting_fields"
+    # COLLECTING_DOCS: applicant fields are done; we are waiting for the
+    # citizen's document images/PDFs so BIMA can CONTENT-score them before
+    # review. When no documents arrive (the chat transport has not delivered
+    # media yet) the flow falls back to the demo-fixture validation path.
+    COLLECTING_DOCS = "collecting_docs"
     REVIEW = "review"
     DONE = "done"
     FAILED = "failed"
+
+
+@dataclass
+class SessionDocument:
+    """One document the citizen sent in-session, held in memory for live
+    content-scoring + officer doc-Q&A. Bytes never touch disk and are never
+    logged."""
+
+    file_id: str            # opaque per-session id (e.g. "doc-1")
+    claimed_type: str       # what the citizen / packet labelled it
+    filename: str
+    mime_type: str
+    content: bytes
 
 
 @dataclass
@@ -283,6 +309,20 @@ class SubmissionSession:
     candidates: list[dict[str, Any]] = field(default_factory=list)
     # collected applicant fields: key -> cleaned value.
     fields: dict[str, str] = field(default_factory=dict)
+    # documents the citizen sent in-session (bytes held in memory only) — the
+    # input to live content-scoring and to the officer's doc-Q&A.
+    documents: list[SessionDocument] = field(default_factory=list)
+    # the last content-scoring result (kept so a 'KIRIM' retry and the officer
+    # brief can reuse it without re-running Gemini Vision).
+    last_score: Optional[dict[str, Any]] = None
+    # True once the citizen has been shown the "send as-is" override prompt for
+    # a sub-threshold packet. The NEXT KIRIM/YA then force-submits past the
+    # ok-gate (otherwise KIRIM loops forever — a flawed packet could never be
+    # filed). Reset implicitly per session.
+    override_offered: bool = False
+    # the resulting SIAP ticket once submitted (for officer-brief wiring).
+    ticket: Optional[str] = None
+    request_id: Optional[int] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -331,6 +371,7 @@ def has_active_session(user_id: str) -> bool:
     return sess is not None and sess.stage in (
         Stage.RESOLVING_LICENSE,
         Stage.COLLECTING_FIELDS,
+        Stage.COLLECTING_DOCS,
         Stage.REVIEW,
     )
 
@@ -358,6 +399,194 @@ def _mask(value: Optional[str]) -> str:
 # ===========================================================================
 
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+
+
+# ===========================================================================
+# In-session document intake + LIVE content-scoring (the demo centerpiece).
+#
+# When the chat transport delivers the citizen's documents (real APTANA /
+# Telegram media download — DEFERRED, or the curated demo packet below), they
+# land on the session as `SessionDocument`s. `_run_content_score()` then runs
+# the suitability judge over the real bytes: completeness, type-correctness,
+# and per-requirement suitability via Gemini Vision. This is "3/7 + does-it-
+# comply", not a checkbox — and it runs on documents BIMA holds in memory.
+#
+# Provenance honesty: for the June-4 demo the bytes come from a CURATED
+# PACKET (a clean set + a deliberately-flawed set), NOT the 1,032 real Beta
+# citizen files (whose bytes are not on Beta's disk). The SCORING is 100%
+# real; only the document provenance is staged. See PR notes.
+# ===========================================================================
+
+# A directory of files to auto-attach as the citizen's "uploaded" documents
+# when the chat transport hasn't delivered real media. Each filename is the
+# claimed type: e.g. "surat_permohonan.pdf", "ktp.jpg", "proposal.pdf". Blank
+# → no packet (the flow falls back to the demo-fixture validation path).
+def _demo_packet_dir() -> Optional[Path]:
+    raw = os.getenv("GUIDED_SUBMISSION_DEMO_PACKET", "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    return p if p.is_dir() else None
+
+
+# Hard cap mirrors routers/validator.py so an oversized file can't blow memory.
+_MAX_DOC_BYTES = 8 * 1024 * 1024
+_MAX_DOCS = 10
+
+
+def _claimed_type_from_filename(filename: str) -> str:
+    """Derive a citizen-claimed doc label from a packet filename stem.
+
+    'surat_permohonan_materai.pdf' -> 'surat permohonan materai'. The
+    suitability judge canonicalises this to a DOC_CLASS; unknown labels stay
+    as free text and are still type-checked by Gemini.
+    """
+    stem = Path(filename).stem
+    return re.sub(r"[_\-]+", " ", stem).strip() or "dokumen"
+
+
+def attach_documents(
+    user_id: str,
+    docs: list[SessionDocument],
+) -> bool:
+    """Public seam: attach documents the chat transport received to a citizen's
+    in-flight session. This is the ONE function a real APTANA/Telegram media
+    webhook calls once it has downloaded + decoded the bytes — the state
+    machine and scoring do not change when that lands.
+
+    Returns True when the docs were attached to an active session, False when
+    there is no active session to attach to (caller can decide what to do).
+    Bytes are held in memory only; never logged.
+    """
+    sess = _get_session(user_id)
+    if sess is None or sess.stage in (Stage.DONE, Stage.FAILED):
+        return False
+    # De-dup by file_id; cap total count.
+    have = {d.file_id for d in sess.documents}
+    for d in docs:
+        if d.file_id in have:
+            continue
+        if len(d.content) > _MAX_DOC_BYTES:
+            logger.warning(
+                "attach_documents skipped oversize | user=%s | file=%s | bytes=%d",
+                _mask(user_id), d.filename, len(d.content),
+            )
+            continue
+        if len(sess.documents) >= _MAX_DOCS:
+            break
+        sess.documents.append(d)
+        have.add(d.file_id)
+    sess.touch()
+    _put_session(sess)
+    logger.info(
+        "Guided-submission documents attached | user=%s | count=%d",
+        _mask(user_id), len(sess.documents),
+    )
+    return True
+
+
+def _load_demo_packet(sess: SubmissionSession) -> int:
+    """Load the curated demo packet (if configured) onto the session as
+    SessionDocuments. Returns the number of docs loaded. No-op + returns the
+    existing count when a packet dir isn't configured or the session already
+    has documents (real media won the race)."""
+    if sess.documents:
+        return len(sess.documents)
+    pkt = _demo_packet_dir()
+    if pkt is None:
+        return 0
+    loaded = 0
+    for path in sorted(pkt.iterdir()):
+        if loaded >= _MAX_DOCS:
+            break
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            logger.warning("demo packet read failed | file=%s | err=%s", path.name, exc)
+            continue
+        if not data or len(data) > _MAX_DOC_BYTES:
+            continue
+        mime, _ = mimetypes.guess_type(path.name)
+        sess.documents.append(SessionDocument(
+            file_id=f"doc-{loaded + 1}",
+            claimed_type=_claimed_type_from_filename(path.name),
+            filename=path.name,
+            mime_type=mime or "application/octet-stream",
+            content=data,
+        ))
+        loaded += 1
+    if loaded:
+        logger.info(
+            "Guided-submission demo packet loaded | user=%s | docs=%d",
+            _mask(sess.user_id), loaded,
+        )
+    return loaded
+
+
+async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]]:
+    """Run the LIVE suitability judge over the session's in-memory documents.
+
+    Returns a normalised result dict the flow + officer brief reuse:
+      {"ok": bool, "status": str, "score_percent": int, "summary": str,
+       "message": str (rendered WhatsApp text), "issues": [{severity, message}],
+       "result": SuitabilityResult}
+
+    Returns None when there are no in-session documents — the caller then
+    falls back to the demo-fixture validation path. Never raises.
+    """
+    if not sess.documents:
+        return None
+
+    from services import citizen_scorer
+    from services.agents.suitability_judge import UploadedDoc
+
+    uploaded = [
+        UploadedDoc(
+            file_id=d.file_id,
+            claimed_type=d.claimed_type,
+            filename=d.filename,
+            mime_type=d.mime_type,
+            content=d.content,
+        )
+        for d in sess.documents
+    ]
+    license_id = sess.license_id or _DEMO_LICENSE_ID
+    try:
+        result = await citizen_scorer.score_session_documents(
+            license_id=license_id,
+            documents=uploaded,
+        )
+    except Exception:
+        logger.exception(
+            "Guided-submission content-score crashed | user=%s", _mask(sess.user_id)
+        )
+        return None
+
+    ready = citizen_scorer.is_submission_ready(result)
+    percent = int(round(result.overall_suitability_score * 100))
+    message = citizen_scorer.render_score_message(
+        result, license_name=sess.license_name
+    )
+    issues = [
+        {"severity": i.severity, "message": i.title}
+        for i in result.issues
+    ]
+    logger.info(
+        "Guided-submission content-score | user=%s | license_id=%s | "
+        "percent=%d | ready=%s | issues=%d",
+        _mask(sess.user_id), license_id, percent, ready, len(issues),
+    )
+    return {
+        "ok": ready,
+        "status": "ready" if ready else "needs_fix",
+        "score_percent": percent,
+        "summary": message,
+        "message": message,
+        "issues": issues,
+        "result": result,
+    }
 
 
 def _demo_fixture_name() -> str:
@@ -621,31 +850,97 @@ async def _collect_field(sess: SubmissionSession, message: str) -> str:
 
     nxt = sess.next_missing_field()
     if nxt is None:
-        sess.stage = Stage.REVIEW
-        _put_session(sess)
-        return "✅ Semua data pemohon terkumpul.\n\n" + _fmt_review(sess)
+        # All applicant fields collected. Move into document content-scoring.
+        return await _enter_doc_scoring(sess)
 
     _put_session(sess)
     collected = len(sess.fields)
     return f"✅ Tercatat.\n\n{collected + 1}️⃣ {nxt.question}"
 
 
-async def _submit(sess: SubmissionSession) -> str:
+async def _enter_doc_scoring(sess: SubmissionSession) -> str:
+    """Transition COLLECTING_FIELDS → (live content-score) → REVIEW.
+
+    If the chat transport has delivered documents (or the curated demo packet
+    is configured), BIMA CONTENT-scores them live here and shows the citizen
+    the score before asking for confirmation. When no documents are available,
+    fall back to the existing demo-fixture review path so the flow still works
+    on a transport that hasn't wired media yet.
+    """
+    sess.stage = Stage.COLLECTING_DOCS
+    sess.touch()
+
+    # Pull in the curated demo packet if real media hasn't arrived.
+    _load_demo_packet(sess)
+
+    if sess.documents:
+        score = await _run_content_score(sess)
+        if score is not None:
+            sess.last_score = score
+            sess.stage = Stage.REVIEW
+            _put_session(sess)
+            head = "✅ Semua data pemohon terkumpul.\n\n"
+            # The live content-score message is the centerpiece the citizen sees.
+            return (
+                head
+                + score["message"]
+                + "\n\n"
+                + _fmt_review(sess)
+            )
+
+    # No in-session documents (or scoring unavailable) → fixture review path.
+    sess.stage = Stage.REVIEW
+    _put_session(sess)
+    return "✅ Semua data pemohon terkumpul.\n\n" + _fmt_review(sess)
+
+
+async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     """REVIEW + citizen confirmed: run the validator, then submit to SIAP.
 
-    Validation issues → tell the citizen what to fix, do NOT submit.
+    Validation issues → tell the citizen what to fix, do NOT submit, and offer
+    a "send as-is" override.
+    `force=True` → the citizen has explicitly consented to send the
+    sub-threshold packet anyway (second KIRIM); bypass the ok-gate and submit.
     Clean validation  → POST to SIAP, return ticket + portal track link.
     """
     from services.siap_submission_client import get_siap_submission_client
 
-    # --- Step 1: validate the submission --------------------------------
-    result = _run_validation(sess)
-    if not result["ok"]:
-        # Keep the session at REVIEW so the citizen can fix + retry ("KIRIM").
+    # --- Step 1: score / validate the submission ------------------------
+    # Prefer the LIVE content-score (real Gemini Vision over the documents the
+    # citizen sent in-session). Reuse the score computed at the field→review
+    # transition when present; otherwise score now. Fall back to the demo
+    # fixture path only when there are no in-session documents at all.
+    result: dict[str, Any]
+    score = sess.last_score
+    if score is None and sess.documents:
+        score = await _run_content_score(sess)
+        sess.last_score = score
+    if score is not None:
+        result = score
+    else:
+        result = _run_validation(sess)
+
+    if not result["ok"] and not force:
+        # Sub-threshold and not yet force-confirmed. Keep the session at REVIEW,
+        # OFFER the "send as-is" override, and remember we offered it so the
+        # next KIRIM/YA submits past the gate (prevents the KIRIM dead-end loop).
         sess.stage = Stage.REVIEW
+        sess.override_offered = True
         sess.touch()
         _put_session(sess)
-        return _fmt_validation_issues(result)
+        # The content-score path already renders a full WhatsApp message; the
+        # fixture path uses the legacy issue formatter.
+        if score is not None:
+            return (
+                result["message"]
+                + "\n\nKetik *KIRIM* untuk mengirim apa adanya, atau *BATAL* "
+                "untuk membatalkan."
+            )
+        return (
+            _fmt_validation_issues(result)
+            + "\n\nKetik *KIRIM* untuk mengirim apa adanya, atau *BATAL* "
+            "untuk membatalkan."
+        )
 
     # --- Step 2: submit to SIAP -----------------------------------------
     client = get_siap_submission_client()
@@ -714,13 +1009,41 @@ async def _submit(sess: SubmissionSession) -> str:
 
     # --- Success --------------------------------------------------------
     ticket = submit.get("ticket")
+    request_id = submit.get("request_id")
+    sess.ticket = ticket
+    sess.request_id = request_id
     sess.stage = Stage.DONE
     sess.touch()
-    _clear_session(sess.user_id)
     logger.info(
         "Guided-submission SUBMITTED | user=%s | license_id=%s | ticket=%s",
         _mask(sess.user_id), sess.license_id, ticket,
     )
+
+    # --- Officer hand-off: brief + score over WhatsApp/Telegram ---------
+    # Fire-and-forget so a notification hiccup never blocks the citizen's
+    # success reply. The officer bridge is feature-flagged + degrades to a
+    # no-op when unconfigured. We pass the in-session documents + the live
+    # score so the officer can chat with the docs and see the BIMA score.
+    if ticket:
+        try:
+            from services import officer_bridge
+
+            await officer_bridge.notify_officer_of_submission(
+                ticket=ticket,
+                request_id=request_id,
+                license_id=sess.license_id,
+                license_name=sess.license_name,
+                applicant_name=sess.fields.get("applicant_name"),
+                score=sess.last_score,
+                documents=list(sess.documents),
+            )
+        except Exception:
+            logger.exception(
+                "Guided-submission officer hand-off failed (non-fatal) | user=%s",
+                _mask(sess.user_id),
+            )
+
+    _clear_session(sess.user_id)
 
     if ticket:
         track = _PORTAL_TRACK_URL.format(ticket=ticket)
@@ -808,12 +1131,22 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
         if sess.stage == Stage.COLLECTING_FIELDS:
             return await _collect_field(sess, msg)
 
+        if sess.stage == Stage.COLLECTING_DOCS:
+            # Transient stage — normally we transition straight through to
+            # REVIEW inside _enter_doc_scoring. If we land here (e.g. a process
+            # restart left a session mid-flight, or real media intake is being
+            # awaited), re-run the doc-scoring transition.
+            return await _enter_doc_scoring(sess)
+
         if sess.stage == Stage.REVIEW:
+            # If the "send as-is" override has already been offered for a
+            # sub-threshold packet, the next YA/KIRIM force-submits past the
+            # ok-gate. Otherwise it's the first confirm → validate normally.
             if _AFFIRM_PATTERN.match(msg):
-                return await _submit(sess)
+                return await _submit(sess, force=sess.override_offered)
             # "KIRIM" retry after a validation-issues message.
             if re.match(r"^\s*kirim\s*$", msg, re.IGNORECASE):
-                return await _submit(sess)
+                return await _submit(sess, force=sess.override_offered)
             return (
                 "Ketik *YA* untuk memvalidasi dan mengirim permohonan, atau "
                 "*BATAL* untuk membatalkan. Jika ada data yang ingin diubah, "

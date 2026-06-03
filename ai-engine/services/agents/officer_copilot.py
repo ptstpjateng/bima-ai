@@ -292,6 +292,26 @@ _validation_context: contextvars.ContextVar[Optional[dict]] = contextvars.Contex
     "officer_copilot_validation_context", default=None
 )
 
+# ---------------------------------------------------------------------------
+# In-session document context — the chat-bridge demo path (June-4 slice).
+#
+# SIAP exposes no file-download endpoint, so `get_doc_summary` normally
+# returns a canned string. BUT in the WhatsApp/Telegram demo flow the citizen
+# sent their documents straight into the chat session, so BIMA holds the raw
+# bytes. The officer bridge injects those bytes here (keyed by file_id) for
+# the duration of one `chat()` turn, and `get_doc_summary` runs Gemini Vision
+# over them — a real answer to "apa isi proposalnya?".
+#
+# Shape: {file_id: {"filename": str, "mime_type": str, "content": bytes,
+#                    "claimed_type": str}}
+# Empty / None → no in-session docs; `get_doc_summary` falls back to the
+# canned string (admin-api dashboard path, where SIAP file fetch isn't wired).
+# Bytes are never logged.
+# ---------------------------------------------------------------------------
+_doc_context: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "officer_copilot_doc_context", default=None
+)
+
 # Severity ladder — kept in sync with admin/src/lib/case-types.ts SEVERITY_ORDER
 # and ai-engine/services/agents/validator.py IssueLevel. Lower = worse.
 _SEVERITY_RANK: dict[str, int] = {
@@ -386,21 +406,83 @@ async def get_case_full(ticket: str) -> dict:
     return {"found": True, **record}
 
 
+# Gemini Vision schema for a free-text document summary. JSON-mode (the
+# vision client only returns JSON), so we wrap the prose in a `summary` field.
+_DOC_SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "description": (
+                "A concise Indonesian summary (3-5 sentences) of what this "
+                "document is and the key information it contains."
+            ),
+        },
+    },
+    "required": ["summary"],
+}
+
+_DOC_SUMMARY_PROMPT = (
+    "Anda asisten petugas perizinan. Ringkas dokumen terlampir dalam Bahasa "
+    "Indonesia: jenis dokumen, pihak/nama yang tercantum, poin penting "
+    "(nomor, tanggal, materai bila ada), dan apakah dokumen tampak lengkap. "
+    "Jangan mengarang isi yang tidak terlihat. 3-5 kalimat."
+)
+
+
 async def get_doc_summary(file_id: str) -> str:
     """
     Return a short Indonesian summary of one supporting document.
 
-    # TODO Phase 3: real SIAP file fetch + Gemini Vision OCR.
-    Today there is no SIAP file-download endpoint, so we return a canned
-    placeholder. The contract (file_id → str) stays so the front-end and
-    the agent's tool schema do not need to change when the real fetch
-    lands.
+    DEMO PATH (chat bridge): when the citizen sent the document into the
+    WhatsApp/Telegram session, BIMA holds the raw bytes and the officer bridge
+    injects them via `_doc_context`. In that case we run Gemini Vision over
+    the in-session bytes and return a real summary — a genuine answer to
+    "apa isi proposalnya?".
+
+    FALLBACK (admin dashboard): when no in-session bytes are bound (SIAP has
+    no file-download endpoint), we return the canned placeholder. The contract
+    (file_id → str) is unchanged so neither the tool schema nor the front-end
+    needs to change.
     """
+    ctx = _doc_context.get()
+    if ctx and isinstance(ctx, dict):
+        doc = ctx.get(file_id)
+        if doc is None:
+            # The officer named a file_id we don't hold — list what we do have
+            # so the model can re-ask with a valid id.
+            available = ", ".join(sorted(ctx.keys())) or "(tidak ada)"
+            return (
+                f"Dokumen dengan id '{file_id}' tidak tersedia di sesi ini. "
+                f"Dokumen yang ada: {available}."
+            )
+        from services.gemini_vision import extract_structured, is_configured
+
+        if not is_configured():
+            return (
+                f"Ringkasan dokumen {doc.get('filename', file_id)} belum dapat "
+                "dibuat — Gemini Vision belum dikonfigurasi di server."
+            )
+        parsed = await extract_structured(
+            image_bytes=doc["content"],
+            mime_type=doc.get("mime_type", "application/octet-stream"),
+            prompt=_DOC_SUMMARY_PROMPT,
+            response_schema=_DOC_SUMMARY_SCHEMA,
+        )
+        if parsed and isinstance(parsed, dict) and parsed.get("summary"):
+            label = doc.get("filename", file_id)
+            return f"📄 {label}: {str(parsed['summary']).strip()}"
+        return (
+            f"Tidak dapat membaca dokumen {doc.get('filename', file_id)} — "
+            "pastikan berkas jelas (foto/PDF tidak buram)."
+        )
+
+    # No in-session bytes — admin dashboard path; SIAP file fetch not wired.
     return (
-        f"[Ringkasan dokumen file_id={file_id} belum tersedia di Phase 2]. "
-        "Endpoint pengunduhan dokumen SIAP belum diaktifkan. Akan tersedia "
-        "di Phase 3 ketika integrasi pengunduhan dokumen sudah siap, "
-        "menggunakan Gemini Vision OCR."
+        f"[Ringkasan dokumen file_id={file_id} belum tersedia di jalur ini]. "
+        "Endpoint pengunduhan dokumen SIAP belum diaktifkan. Pada alur chat "
+        "(WhatsApp/Telegram) di mana dokumen dikirim langsung ke BIMA, "
+        "ringkasan dibuat otomatis dengan Gemini Vision."
     )
 
 
@@ -1240,6 +1322,7 @@ class OfficerCopilot:
         officer_id: int | None = None,
         validation: dict | None = None,
         mode: str = _MODE_OFFICER,
+        documents: dict | None = None,
     ) -> dict:
         """
         Run one user-message turn. Returns:
@@ -1265,6 +1348,13 @@ class OfficerCopilot:
             Vision req #13). The mode selects the system prompt and the
             tool subset; the agent machinery is otherwise identical. An
             unknown value falls back to "officer".
+          documents: optional in-session document bytes keyed by file_id —
+            {file_id: {"filename", "mime_type", "content" (bytes),
+            "claimed_type"}}. Supplied by the chat bridge (officer_bridge.py)
+            in the WhatsApp/Telegram demo where the citizen sent their docs
+            straight into BIMA. Lets `get_doc_summary` answer with real Gemini
+            Vision instead of the canned placeholder. None on the admin
+            dashboard path (SIAP file-download not wired). Bytes never logged.
         """
         mode = mode if mode in _VALID_MODES else _MODE_OFFICER
 
@@ -1296,17 +1386,20 @@ class OfficerCopilot:
             "parts": [{"text": prompt_template.format(ticket=ticket)}],
         }
 
-        # Bind the validation result for this turn so `get_validation_summary`
-        # can read it. The token reset in `finally` keeps concurrent requests
-        # isolated — each asyncio task gets its own ContextVar copy.
+        # Bind the validation result + any in-session documents for this turn
+        # so `get_validation_summary` / `get_doc_summary` can read them. The
+        # token resets in `finally` keep concurrent requests isolated — each
+        # asyncio task gets its own ContextVar copy.
         ctx_token = _validation_context.set(validation)
+        doc_token = _doc_context.set(documents)
         logger.info(
             "Copilot turn start | mode=%s | officer_id=%s | ticket=%s | "
-            "has_validation=%s | history_turns=%d",
+            "has_validation=%s | in_session_docs=%d | history_turns=%d",
             mode,
             officer_id if officer_id is not None else "<none>",
             ticket,
             validation is not None,
+            len(documents or {}),
             len(history or []),
         )
         try:
@@ -1321,6 +1414,7 @@ class OfficerCopilot:
             )
         finally:
             _validation_context.reset(ctx_token)
+            _doc_context.reset(doc_token)
 
     async def _run_chat_loop(
         self,
