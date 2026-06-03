@@ -254,6 +254,143 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
         self.assertEqual(len(kwargs["documents"]), 1)
         self.assertEqual(kwargs["score"]["score_percent"], 90)
 
+    def test_request_id_resolved_from_ticket_when_siap_omits_it(self):
+        # FIX 1: SIAP returns a ticket but a None request_id on a successful
+        # submit. _submit must recover the request_id from the ticket (so
+        # flow-based officer resolution, which is gated on request_id, runs) and
+        # pass the recovered id into the officer hand-off.
+        sess = _make_session(gs.Stage.REVIEW)
+        sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
+        sess.last_score = {
+            "ok": True, "status": "ready", "score_percent": 90,
+            "summary": "s", "message": "m", "issues": [], "result": _suitability_result(90),
+        }
+        _run(gs._put_session(sess))
+
+        fake_client = types.SimpleNamespace(
+            is_configured=lambda: True,
+            create_request=AsyncMock(return_value={
+                "ok": True, "ticket": "000999888", "request_id": None,  # omitted!
+            }),
+        )
+        notify_mock = AsyncMock(return_value=True)
+        bridge_stub = types.ModuleType("services.officer_bridge")
+        bridge_stub.notify_officer_of_submission = notify_mock
+        # The ticket→request_id recovery seam.
+        resolve_mock = AsyncMock(return_value=4242)
+
+        import services as _services_pkg
+        env = {"GUIDED_SUBMISSION_PROFILE_ID": "12345"}
+        with patch.dict(os.environ, env, clear=False):
+            with patch("services.siap_submission_client.get_siap_submission_client",
+                       return_value=fake_client):
+                with patch("services.siap_tools.siap_resolve_request_id", resolve_mock):
+                    with patch.dict(sys.modules, {"services.officer_bridge": bridge_stub}):
+                        with patch.object(_services_pkg, "officer_bridge", bridge_stub,
+                                          create=True):
+                            reply = _run(gs._submit(sess))
+
+        self.assertIn("000999888", reply)
+        # Recovery was attempted with the freshly-allocated ticket.
+        resolve_mock.assert_awaited_once_with("000999888")
+        # ...and the recovered id flows into the officer hand-off.
+        notify_mock.assert_awaited_once()
+        _, kwargs = notify_mock.call_args
+        self.assertEqual(kwargs["request_id"], 4242)
+
+    def test_submit_succeeds_when_request_id_unrecoverable(self):
+        # FIX 1 degradation: ticket present, request_id None, and the ticket
+        # lookup also yields nothing. _submit must NOT crash — it proceeds with
+        # request_id=None (notify falls back to env as today) and the citizen
+        # still gets the success reply with the ticket.
+        sess = _make_session(gs.Stage.REVIEW)
+        sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
+        sess.last_score = {
+            "ok": True, "status": "ready", "score_percent": 90,
+            "summary": "s", "message": "m", "issues": [], "result": _suitability_result(90),
+        }
+        _run(gs._put_session(sess))
+
+        fake_client = types.SimpleNamespace(
+            is_configured=lambda: True,
+            create_request=AsyncMock(return_value={
+                "ok": True, "ticket": "000999888", "request_id": None,
+            }),
+        )
+        notify_mock = AsyncMock(return_value=False)
+        bridge_stub = types.ModuleType("services.officer_bridge")
+        bridge_stub.notify_officer_of_submission = notify_mock
+        resolve_mock = AsyncMock(return_value=None)  # ticket lookup misses too
+
+        import services as _services_pkg
+        env = {"GUIDED_SUBMISSION_PROFILE_ID": "12345"}
+        with patch.dict(os.environ, env, clear=False):
+            with patch("services.siap_submission_client.get_siap_submission_client",
+                       return_value=fake_client):
+                with patch("services.siap_tools.siap_resolve_request_id", resolve_mock):
+                    with patch.dict(sys.modules, {"services.officer_bridge": bridge_stub}):
+                        with patch.object(_services_pkg, "officer_bridge", bridge_stub,
+                                          create=True):
+                            reply = _run(gs._submit(sess))
+
+        self.assertIn("000999888", reply)
+        notify_mock.assert_awaited_once()
+        _, kwargs = notify_mock.call_args
+        self.assertIsNone(kwargs["request_id"])
+
+
+class TestSubmitRescoresAfterRehydrate(unittest.TestCase):
+    """FIX 3: after a Redis rehydrate, last_score is a non-None dict whose rich
+    `result` was stripped on encode. _submit must re-score (so the officer brief
+    / sub-threshold message get the full result), not reuse the trimmed dict."""
+
+    def setUp(self):
+        gs._sessions.clear()
+
+    def test_rescore_when_result_missing_from_rehydrated_score(self):
+        sess = _make_session(gs.Stage.REVIEW)
+        sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
+        # Rehydrated score: JSON-safe fields only, NO `result` key.
+        sess.last_score = {
+            "ok": True, "status": "ready", "score_percent": 90,
+            "summary": "s", "message": "m", "issues": [],
+        }
+        _run(gs._put_session(sess))
+
+        # SIAP unconfigured → _submit stops right after scoring (before any
+        # network), which is all we need to observe the re-score decision.
+        unconfigured = types.SimpleNamespace(is_configured=lambda: False)
+        fresh = _suitability_result(percent=90)
+        score_mock = AsyncMock(return_value=fresh)
+        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
+            with patch("services.citizen_scorer.score_session_documents", score_mock):
+                with patch("services.siap_submission_client.get_siap_submission_client",
+                           return_value=unconfigured):
+                    _run(gs._submit(sess))
+        # Re-scored from the rehydrated document bytes...
+        score_mock.assert_awaited_once()
+        # ...and the rich result is now present on the session score.
+        self.assertIn("result", sess.last_score)
+        self.assertIs(sess.last_score["result"], fresh)
+
+    def test_no_rescore_when_result_already_present(self):
+        sess = _make_session(gs.Stage.REVIEW)
+        sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
+        # A complete in-memory score (rich result intact) → no re-score.
+        sess.last_score = {
+            "ok": True, "status": "ready", "score_percent": 90,
+            "summary": "s", "message": "m", "issues": [], "result": _suitability_result(90),
+        }
+        _run(gs._put_session(sess))
+        unconfigured = types.SimpleNamespace(is_configured=lambda: False)
+        score_mock = AsyncMock(return_value=_suitability_result(90))
+        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
+            with patch("services.citizen_scorer.score_session_documents", score_mock):
+                with patch("services.siap_submission_client.get_siap_submission_client",
+                           return_value=unconfigured):
+                    _run(gs._submit(sess))
+        score_mock.assert_not_awaited()
+
 
 class TestScoreReminder(unittest.TestCase):
     """Part C: a compact 'Skor terkini: X% (status)' line is prepended to a

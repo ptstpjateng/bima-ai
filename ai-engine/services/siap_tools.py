@@ -399,6 +399,36 @@ _SQL_REQUEST_ID_BY_TICKET = """
      LIMIT 1
 """
 
+
+async def siap_resolve_request_id(ticket: str) -> Optional[int]:
+    """Resolve a license_request's `request_id` from its SIAP ticket.
+
+    A thin, side-effect-free lookup over `_SQL_REQUEST_ID_BY_TICKET` (the same
+    statement `siap_get_status_timeline` uses). Returns the integer request_id,
+    or None on a miss / unconfigured SIAP DB / any error. NEVER raises — callers
+    on the citizen submit path must degrade, not crash.
+
+    Used by the officer-notify hand-off: SIAP's create endpoint can return a
+    ticket without an `id`/`request_id`, but flow-based officer resolution needs
+    the request_id, so we recover it from the freshly-allocated ticket.
+    """
+    if not is_siap_db_configured():
+        return None
+    digits = re.sub(r"\D", "", ticket or "")
+    if not digits:
+        return None
+    norm_ticket = digits.zfill(9)
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_REQUEST_ID_BY_TICKET, norm_ticket)
+        if row is None or row["request_id"] is None:
+            return None
+        return int(row["request_id"])
+    except Exception:  # pragma: no cover — defensive; never break the submit path
+        logger.exception("siap_resolve_request_id failed | ticket=%s", norm_ticket)
+        return None
+
 # The stored function does the heavy lifting; we LEFT JOIN the desk name so
 # the citizen sees "Front Office PTSP" rather than a bare step id. public.roles
 # is a non-credential reference table — safe to read.

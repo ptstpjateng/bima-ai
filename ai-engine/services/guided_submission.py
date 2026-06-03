@@ -1104,7 +1104,12 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     # fixture path only when there are no in-session documents at all.
     result: dict[str, Any]
     score = sess.last_score
-    if score is None and sess.documents:
+    # Re-score when there's no score yet OR when only the JSON-safe score
+    # survived a Redis rehydrate (the rich `result` dataclass is dropped on
+    # encode — see _score_for_redis). Without the `result` the score can't drive
+    # the officer brief / sub-threshold message correctly, so a post-restart
+    # KIRIM must re-score from the rehydrated document bytes.
+    if (score is None or "result" not in score) and sess.documents:
         score = await _run_content_score(sess)
         sess.last_score = score
     if score is not None:
@@ -1202,6 +1207,31 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     # --- Success --------------------------------------------------------
     ticket = submit.get("ticket")
     request_id = submit.get("request_id")
+
+    # SIAP's create endpoint returns a ticket but can omit the id/request_id on
+    # a successful submit. Flow-based officer resolution
+    # (officer_bridge.notify_officer_of_submission → siap_db.resolve_step_officers)
+    # is gated on a non-None request_id, so without it the officer notify
+    # silently skips flow resolution and (absent a BIMA_OFFICER_WA_PHONE
+    # fallback) notifies nobody. Recover the request_id from the freshly
+    # allocated ticket BEFORE the hand-off. Never let this crash the submit path.
+    if request_id is None and ticket:
+        try:
+            from services.siap_tools import siap_resolve_request_id
+
+            request_id = await siap_resolve_request_id(ticket)
+        except Exception:
+            logger.exception(
+                "Guided-submission: request_id resolution from ticket crashed "
+                "(non-fatal) | user=%s", _mask(sess.user_id),
+            )
+            request_id = None
+        if request_id is None:
+            logger.warning(
+                "officer notify: ticket=%s has no request_id; flow resolution "
+                "skipped", _mask(ticket),
+            )
+
     sess.ticket = ticket
     sess.request_id = request_id
     sess.stage = Stage.DONE
