@@ -4,12 +4,60 @@ Application configuration.
 All env reads go through `Settings()` so the codebase has one well-typed source
 of truth instead of scattered `os.getenv` calls. The values listed here mirror
 `.env.example` — keep them in sync.
+
+Production safety
+-----------------
+When ``APP_ENV`` is ``production`` or ``staging`` the loader refuses to start
+with placeholder values for the two secrets that gate trust boundaries:
+
+* ``SECRET_KEY`` — signs every operator JWT. A leaked or guessable value lets
+  any actor mint admin tokens.
+* ``INTERNAL_API_KEY`` — the shared ``X-Internal-Key`` between admin-api,
+  ai-engine, and data-pipeline. A placeholder here means any internet-reachable
+  caller can forge "internal" requests.
+
+The validators below treat anything obviously templated (``change-me``,
+``placeholder``, ``CHANGE_ME``, ``your-...-here``) or shorter than 32 chars as
+"still the default" and ``raise ValueError`` at import time. The service then
+exits with a non-zero status before binding a port, so a misconfigured deploy
+fails loud instead of silently running with predictable secrets.
+
+Local dev (``APP_ENV=development`` / unset) keeps the in-class defaults so
+``docker compose up`` still works without ceremony.
 """
 
+import re
 from functools import lru_cache
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Regex of obviously-templated tokens we never want to see in prod secrets.
+# Case-insensitive: matches "change-me", "CHANGE_ME", "placeholder", "your-
+# secret-here", "replace-me", "example", "TODO". Kept tight on purpose — we
+# don't want false positives on legitimately random hex that happens to
+# contain a dictionary word.
+_PLACEHOLDER_PATTERN = re.compile(
+    r"(change[-_ ]?me|placeholder|replace[-_ ]?me|your[-_ ].*[-_ ]?here|^example$|^todo$|^secret$|^changeme$)",
+    re.IGNORECASE,
+)
+
+# Minimum acceptable secret length in production. 32 chars is the floor for an
+# HS256 key per RFC 7518 §3.2 ("a key of the same size as the hash output"),
+# and a comfortable lower bound for any shared-secret token.
+_MIN_PROD_SECRET_LEN = 32
+
+# Environments where placeholder secrets are a hard failure. Anything else
+# (development, test, local, unset) keeps the lenient defaults so contributors
+# can run `uvicorn` without writing a real .env first.
+_STRICT_ENVS = frozenset({"production", "staging"})
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    """Return True if ``value`` is empty, too short, or matches a template token."""
+    if not value or len(value) < _MIN_PROD_SECRET_LEN:
+        return True
+    return bool(_PLACEHOLDER_PATTERN.search(value))
 
 
 class Settings(BaseSettings):
@@ -18,6 +66,16 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+    )
+
+    # ---- Runtime environment --------------------------------------------
+    # Drives the production/staging placeholder checks below. Anything other
+    # than "production" or "staging" is treated as a dev-style environment
+    # where defaults are acceptable. Matches Laravel's APP_ENV convention so
+    # operators only memorise one value.
+    APP_ENV: str = Field(
+        default="development",
+        description="Runtime environment: development, staging, or production.",
     )
 
     # ---- Database --------------------------------------------------------
@@ -31,13 +89,21 @@ class Settings(BaseSettings):
     # ---- Service-to-service auth ---------------------------------------
     INTERNAL_API_KEY: str = Field(
         default="change-me-internal",
-        description="Shared secret for X-Internal-Key. MUST match ai-engine + data-pipeline.",
+        description=(
+            "Shared secret for X-Internal-Key. MUST match ai-engine + "
+            "data-pipeline. Refused at startup in prod/staging if it still "
+            "looks like a placeholder (see module docstring)."
+        ),
     )
 
     # ---- JWT signing ----------------------------------------------------
     SECRET_KEY: str = Field(
         default="change-me-secret",
-        description="HS256 signing key. Generate with `openssl rand -hex 32`.",
+        description=(
+            "HS256 signing key. Generate with `openssl rand -hex 32`. "
+            "Refused at startup in prod/staging if it still looks like a "
+            "placeholder (see module docstring)."
+        ),
     )
     JWT_ALGORITHM: str = Field(default="HS256")
     JWT_EXPIRY_DAYS: int = Field(default=7, ge=1, le=90)
@@ -95,6 +161,51 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # Validators / derived helpers
     # ---------------------------------------------------------------------
+
+    @field_validator("APP_ENV")
+    @classmethod
+    def _normalize_app_env(cls, v: str) -> str:
+        # Normalise to lower-case so "Production" / "PROD" still match the
+        # strict-env check. We intentionally don't restrict the allowed set
+        # (e.g. "test", "ci") — only "production" and "staging" trigger the
+        # placeholder-secret refusal.
+        return (v or "development").strip().lower()
+
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def _reject_placeholder_secret_key(cls, v: str, info) -> str:
+        # APP_ENV is defined before SECRET_KEY in the class body, so by the
+        # time this validator runs Pydantic has already populated info.data
+        # with the normalised APP_ENV. If APP_ENV failed validation we'd
+        # never reach this point.
+        env = (info.data.get("APP_ENV") or "development").lower()
+        if env in _STRICT_ENVS and _looks_like_placeholder(v):
+            raise ValueError(
+                "SECRET_KEY looks like a placeholder or is shorter than "
+                f"{_MIN_PROD_SECRET_LEN} chars. Refusing to start in "
+                f"APP_ENV={env!r}. Generate one with `openssl rand -hex 32` "
+                "and set it via the SECRET_KEY env var. This guards against "
+                "shipping the in-code default and letting anyone mint admin "
+                "JWTs."
+            )
+        return v
+
+    @field_validator("INTERNAL_API_KEY")
+    @classmethod
+    def _reject_placeholder_internal_key(cls, v: str, info) -> str:
+        # Same posture as SECRET_KEY — a placeholder here would let any
+        # caller forge "internal" requests to ai-engine + data-pipeline.
+        env = (info.data.get("APP_ENV") or "development").lower()
+        if env in _STRICT_ENVS and _looks_like_placeholder(v):
+            raise ValueError(
+                "INTERNAL_API_KEY looks like a placeholder or is shorter "
+                f"than {_MIN_PROD_SECRET_LEN} chars. Refusing to start in "
+                f"APP_ENV={env!r}. Set INTERNAL_API_KEY to the rotated "
+                "shared secret (must match ai-engine + data-pipeline). "
+                "This guards against forged X-Internal-Key calls bypassing "
+                "service-to-service auth."
+            )
+        return v
 
     @field_validator("DATABASE_URL")
     @classmethod
