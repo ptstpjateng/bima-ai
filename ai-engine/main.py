@@ -6,6 +6,7 @@ global exception handlers, and mounts all routers.
 
 import asyncio
 import logging
+import os
 import sys
 import time
 import uuid
@@ -85,17 +86,69 @@ app = FastAPI(
 
 # ---------------------------------------------------------------------------
 # Security middleware
+#
+# Both allow-lists are env-driven so DevOps can rotate domains (e.g.
+# nolongin.com → bimaptsp.com cutover) without a code change. We deliberately
+# default to a *safe* list — never "*" — so a fresh deploy with no env vars
+# set still rejects unknown Host headers and CORS origins instead of silently
+# accepting attackers' DNS rebinding / cross-site requests.
+#
+# TRUSTED_HOSTS:        comma-separated hostnames (no scheme), Starlette
+#                       supports wildcard subdomain entries like "*.foo.com".
+# CORS_ALLOW_ORIGINS:   comma-separated full origins (scheme + host).
 # ---------------------------------------------------------------------------
 
-# Only accept requests from known hosts (extend list via env in production).
+# Hard-coded fallbacks. These mirror today's production reality (the two
+# domains BIMA serves under) plus localhost for dev. Changing this list is a
+# code change on purpose — env override is the supported runtime knob.
+_DEFAULT_TRUSTED_HOSTS: list[str] = [
+    "nolongin.com",
+    "*.nolongin.com",
+    "bimaptsp.com",
+    "*.bimaptsp.com",
+    "localhost",
+]
+_DEFAULT_CORS_ORIGINS: list[str] = [
+    "https://portal.nolongin.com",
+    "https://admin.nolongin.com",
+    "https://portal.bimaptsp.com",
+    "https://admin.bimaptsp.com",
+]
+
+
+def _parse_csv_env(name: str, default: list[str]) -> list[str]:
+    """
+    Parse a comma-separated env var into a clean list.
+
+    Returns the supplied default when the env var is unset or — after stripping
+    whitespace and empties — yields nothing. This is the "no env = safe
+    default" contract: an operator who forgets the var still gets a locked-down
+    allow-list, never a wildcard.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return list(default)
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    return values or list(default)
+
+
+_TRUSTED_HOSTS = _parse_csv_env("TRUSTED_HOSTS", _DEFAULT_TRUSTED_HOSTS)
+_CORS_ALLOW_ORIGINS = _parse_csv_env("CORS_ALLOW_ORIGINS", _DEFAULT_CORS_ORIGINS)
+
+logger.info(
+    "security middleware configured | trusted_hosts=%s | cors_origins=%s",
+    _TRUSTED_HOSTS,
+    _CORS_ALLOW_ORIGINS,
+)
+
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*"],  # Tighten to specific domains before going to prod.
+    allowed_hosts=_TRUSTED_HOSTS,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict to frontend origin(s) in production.
+    allow_origins=_CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
