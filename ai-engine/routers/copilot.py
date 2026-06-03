@@ -30,12 +30,20 @@ Vision req #13). Same agent, different system prompt + tool subset; the
 signature mode is read-only over the case and adds the SIAP signing
 deep-link handoff tool.
 
+`docs` is the per-turn supporting-document attachment list — base64-encoded
+file bytes admin-api re-sends every turn because the copilot is stateless.
+Powers the officer-mode doc-Q&A tools (`read_doc_page`, `extract_field`,
+`find_in_doc`). Aggressively capped by `_MAX_DOCS_PER_TURN`,
+`_MAX_DOC_BYTES`, and `_MAX_TOTAL_DOC_BYTES`.
+
 Auth: gated by X-Internal-Key — mirrors the validator and tracking
 endpoints. The endpoint is *not* meant to be exposed to citizens.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 from typing import Annotated, Any
 
@@ -44,6 +52,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
 from deps import require_internal_key
+from services.agents.doc_qa import DocBytes
 from services.agents.officer_copilot import get_copilot
 
 logger = logging.getLogger("bima_ai.copilot")
@@ -58,6 +67,18 @@ router = APIRouter(prefix="/v1/copilot", tags=["Copilot"])
 _MAX_MESSAGE_CHARS = 4000
 _MAX_HISTORY_TURNS = 40
 _MAX_TURN_CHARS = 4000
+
+# Document-attach guards. The doc-Q&A tools (`read_doc_page`, `extract_field`,
+# `find_in_doc`) accept up to a few supporting docs per turn — KTP + NIB +
+# NPWP is the realistic ceiling for one permit submission. We cap aggressively
+# because admin-api forwards the bytes inline (base64) and we run on a single
+# FastAPI worker.
+_MAX_DOCS_PER_TURN = 8
+# Per-doc and aggregate byte caps. Per-doc is intentionally well below
+# doc_qa.MAX_DOC_BYTES so a single malformed upload can't squeeze through
+# below the loader's check yet still blow the request body.
+_MAX_DOC_BYTES = 12 * 1024 * 1024       # 12 MB per doc
+_MAX_TOTAL_DOC_BYTES = 32 * 1024 * 1024  # 32 MB across all docs in one turn
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +97,29 @@ class HistoryTurn(BaseModel):
         if v not in {"user", "model"}:
             raise ValueError("role must be 'user' or 'model'")
         return v
+
+
+class CopilotDoc(BaseModel):
+    """One supporting document attached for this copilot turn.
+
+    admin-api owns the document store (its upload UI accepted the bytes
+    from the officer); the copilot is stateless, so admin-api re-injects
+    docs on every turn. Bytes ride inline as base64 — small overhead, no
+    second round trip. The `file_id` is whatever stable handle admin-api
+    chooses (an upload UUID today; a SIAP `files.file_id` once that
+    endpoint exists).
+    """
+
+    file_id: str = Field(..., min_length=1, max_length=128)
+    filename: str = Field(..., min_length=1, max_length=255)
+    mime_type: str = Field(..., min_length=1, max_length=128)
+    content_base64: str = Field(
+        ...,
+        description=(
+            "Base64-encoded document bytes. Decoded server-side. The "
+            "per-doc cap (after decoding) is enforced in the endpoint."
+        ),
+    )
 
 
 class CopilotChatRequest(BaseModel):
@@ -124,6 +168,33 @@ class CopilotChatRequest(BaseModel):
             "re-running Gemini Vision. Omit when no validation exists yet."
         ),
     )
+    docs: list[CopilotDoc] = Field(
+        default_factory=list,
+        description=(
+            "Supporting documents attached to this turn. Powers the "
+            "officer-mode doc-Q&A tools (read_doc_page, extract_field, "
+            "find_in_doc). admin-api re-sends docs on every turn — the "
+            "copilot is stateless and does not persist them."
+        ),
+    )
+
+    @field_validator("docs")
+    @classmethod
+    def _docs_within_cap(cls, v: list[CopilotDoc]) -> list[CopilotDoc]:
+        if len(v) > _MAX_DOCS_PER_TURN:
+            raise ValueError(
+                f"docs exceeds {_MAX_DOCS_PER_TURN} entries — "
+                "send fewer attachments per turn."
+            )
+        seen_ids: set[str] = set()
+        for d in v:
+            if d.file_id in seen_ids:
+                raise ValueError(
+                    f"duplicate file_id={d.file_id!r} in docs — "
+                    "each attachment must have a unique handle."
+                )
+            seen_ids.add(d.file_id)
+        return v
 
     @field_validator("history")
     @classmethod
@@ -162,6 +233,54 @@ class CopilotChatResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _decode_docs(payload: list[CopilotDoc]) -> dict[str, DocBytes]:
+    """Decode the wire-format `content_base64` into a `{file_id → DocBytes}`
+    map suitable for `OfficerCopilot.chat(docs=...)`.
+
+    Enforces per-doc and aggregate byte caps and rejects malformed base64
+    with a 400. We do NOT trust the size of the base64 STRING — only the
+    decoded bytes count toward the cap, and we measure them post-decode.
+    """
+    out: dict[str, DocBytes] = {}
+    total = 0
+    for d in payload:
+        try:
+            raw = base64.b64decode(d.content_base64, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"docs[{d.file_id}].content_base64 is not valid base64: {e}",
+            )
+        if len(raw) > _MAX_DOC_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"docs[{d.file_id}] exceeds per-doc cap "
+                    f"({len(raw)} > {_MAX_DOC_BYTES} bytes)."
+                ),
+            )
+        total += len(raw)
+        if total > _MAX_TOTAL_DOC_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"docs aggregate size exceeds {_MAX_TOTAL_DOC_BYTES} bytes."
+                ),
+            )
+        out[d.file_id] = DocBytes(
+            file_id=d.file_id,
+            filename=d.filename,
+            mime_type=d.mime_type,
+            content=raw,
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
 
@@ -176,16 +295,18 @@ async def copilot_chat_endpoint(
     _internal: Annotated[bool, Depends(require_internal_key)],
 ) -> CopilotChatResponse:
     history_payload = [{"role": t.role, "text": t.text} for t in body.history]
+    docs_payload = _decode_docs(body.docs)
 
     logger.info(
         "Copilot chat | mode=%s | ticket=%s | officer_id=%s | message_len=%d | "
-        "history_turns=%d | has_validation=%s",
+        "history_turns=%d | has_validation=%s | doc_count=%d",
         body.mode,
         body.ticket,
         body.officer_id if body.officer_id is not None else "<none>",
         len(body.message),
         len(history_payload),
         body.validation is not None,
+        len(docs_payload),
     )
 
     # Narrow exception handling per QA finding H4 (2026-05-19) — the prior
@@ -204,6 +325,7 @@ async def copilot_chat_endpoint(
             officer_id=body.officer_id,
             validation=body.validation,
             mode=body.mode,
+            docs=docs_payload or None,
         )
     except httpx.TimeoutException as exc:
         logger.warning("Copilot timeout | ticket=%s | err=%s", body.ticket, exc)

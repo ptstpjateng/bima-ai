@@ -13,3 +13,7 @@ chromadb==0.6.3
 huggingface-hub==0.27.0
 transformers==4.47.0
 sentence-transformers>=3.0,<6.0
+# Multi-page PDF reader for the officer-copilot doc-Q&A tools
+# (services/agents/doc_qa.py). Pure Python, no system deps — fits the slim
+# ai-engine container.
+pypdf>=5.0,<6.0
