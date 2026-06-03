@@ -77,6 +77,7 @@ in the in-memory session and the SIAP request body.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import mimetypes
@@ -90,6 +91,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
+
+from services import session_store
 
 load_dotenv()
 
@@ -343,31 +346,144 @@ _SESSION_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 _sessions: "OrderedDict[str, SubmissionSession]" = OrderedDict()
 
 
-def _get_session(user_id: str) -> Optional[SubmissionSession]:
+# ---------------------------------------------------------------------------
+# Redis serialization (durable sessions — services/session_store.py).
+#
+# The store is generic; this module supplies the (encode, decode) pair. The
+# session is JSON with two careful exclusions:
+#   * SessionDocument.content (raw bytes) → base64 string, decoded back to
+#     bytes on load. Bytes are NEVER logged (session_store logs only lengths).
+#   * last_score["result"] is a SuitabilityResult dataclass (not JSON-safe) →
+#     DROPPED on encode. The JSON-safe score fields (ok/status/score_percent/
+#     summary/message/issues) survive, so the score reminder + KIRIM retry +
+#     officer brief still work after a restart. A post-restart KIRIM that needs
+#     the rich `result` simply re-scores from the rehydrated document bytes.
+# ---------------------------------------------------------------------------
+
+def _score_for_redis(score: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Strip the non-JSON `result` dataclass from a last_score dict so it can
+    be persisted. Keeps every JSON-safe field. Returns None unchanged."""
+    if not isinstance(score, dict):
+        return None
+    return {k: v for k, v in score.items() if k != "result"}
+
+
+def _encode_session(sess: SubmissionSession) -> str:
+    docs = [
+        {
+            "file_id": d.file_id,
+            "claimed_type": d.claimed_type,
+            "filename": d.filename,
+            "mime_type": d.mime_type,
+            "content_b64": base64.b64encode(d.content).decode("ascii"),
+        }
+        for d in sess.documents
+    ]
+    payload = {
+        "user_id": sess.user_id,
+        "stage": sess.stage.value,
+        "license_id": sess.license_id,
+        "license_name": sess.license_name,
+        "requirements": sess.requirements,
+        "sla_working_days": sess.sla_working_days,
+        "retribution_fee": sess.retribution_fee,
+        "candidates": sess.candidates,
+        "fields": sess.fields,
+        "documents": docs,
+        "last_score": _score_for_redis(sess.last_score),
+        "override_offered": sess.override_offered,
+        "ticket": sess.ticket,
+        "request_id": sess.request_id,
+        "created_at": sess.created_at,
+        "updated_at": sess.updated_at,
+    }
+    return json.dumps(payload)
+
+
+def _decode_session(blob: str) -> SubmissionSession:
+    raw = json.loads(blob)
+    docs = [
+        SessionDocument(
+            file_id=str(d["file_id"]),
+            claimed_type=str(d.get("claimed_type", "")),
+            filename=str(d.get("filename", "")),
+            mime_type=str(d.get("mime_type", "application/octet-stream")),
+            content=base64.b64decode(d["content_b64"]),
+        )
+        for d in raw.get("documents") or []
+    ]
+    return SubmissionSession(
+        user_id=str(raw["user_id"]),
+        stage=Stage(raw.get("stage", Stage.RESOLVING_LICENSE.value)),
+        license_id=raw.get("license_id"),
+        license_name=raw.get("license_name"),
+        requirements=list(raw.get("requirements") or []),
+        sla_working_days=raw.get("sla_working_days"),
+        retribution_fee=raw.get("retribution_fee"),
+        candidates=list(raw.get("candidates") or []),
+        fields=dict(raw.get("fields") or {}),
+        documents=docs,
+        last_score=raw.get("last_score"),
+        override_offered=bool(raw.get("override_offered", False)),
+        ticket=raw.get("ticket"),
+        request_id=raw.get("request_id"),
+        created_at=float(raw.get("created_at", time.time())),
+        updated_at=float(raw.get("updated_at", time.time())),
+    )
+
+
+async def _get_session(user_id: str) -> Optional[SubmissionSession]:
+    """Read a session: in-memory first, then Redis (rehydrating in-memory on a
+    durable hit so a restarted process re-warms its LRU on first touch)."""
     sess = _sessions.get(user_id)
+    if sess is None:
+        # In-memory miss — try the durable store (e.g. after a restart).
+        sess = await session_store.load(
+            session_store.submission_key(user_id), decode=_decode_session
+        )
+        if sess is not None:
+            _sessions[user_id] = sess
+            _sessions.move_to_end(user_id)
     if sess is None:
         return None
     if time.time() - sess.updated_at > _SESSION_TTL_SECONDS:
         logger.info("Guided-submission session expired | user=%s", _mask(user_id))
         _sessions.pop(user_id, None)
+        await session_store.delete(session_store.submission_key(user_id))
         return None
     return sess
 
 
-def _put_session(sess: SubmissionSession) -> None:
+async def _put_session(sess: SubmissionSession) -> None:
+    """Write-through: in-memory LRU + best-effort Redis (TTL = session TTL)."""
     _sessions[sess.user_id] = sess
     _sessions.move_to_end(sess.user_id)
     while len(_sessions) > _MAX_SESSIONS:
         _sessions.popitem(last=False)
+    saved = await session_store.save(
+        session_store.submission_key(sess.user_id),
+        sess,
+        encode=_encode_session,
+        ttl_seconds=_SESSION_TTL_SECONDS,
+    )
+    # Durable sessions are supposed to be ON but the write didn't land — the
+    # in-memory copy is fine, but this session won't survive a restart. Make
+    # the missed durable write observable. Masked key only, never the payload.
+    if not saved and session_store.is_enabled():
+        logger.warning(
+            "Guided-submission durable write missed (flag on) | key=%s",
+            _mask(sess.user_id),
+        )
 
 
-def _clear_session(user_id: str) -> None:
+async def _clear_session(user_id: str) -> None:
     _sessions.pop(user_id, None)
+    await session_store.delete(session_store.submission_key(user_id))
 
 
-def has_active_session(user_id: str) -> bool:
+async def has_active_session(user_id: str) -> bool:
     """True when this user has an in-flight (non-terminal) submission."""
-    sess = _get_session(user_id)
+    sess = await _get_session(user_id)
     return sess is not None and sess.stage in (
         Stage.RESOLVING_LICENSE,
         Stage.COLLECTING_FIELDS,
@@ -445,7 +561,57 @@ def _claimed_type_from_filename(filename: str) -> str:
     return re.sub(r"[_\-]+", " ", stem).strip() or "dokumen"
 
 
-def attach_documents(
+async def handle_inbound_documents(
+    user_id: str,
+    docs: list[SessionDocument],
+) -> Optional[str]:
+    """Public seam for a real chat-transport media webhook (routers/aptana.py).
+
+    Attaches `docs` to the citizen's active guided-submission session and
+    returns a citizen-facing reply string:
+      * If the flow is at/after document collection (COLLECTING_DOCS / REVIEW),
+        re-run live content-scoring and return the score message + review
+        summary (the same thing the field→review transition shows). A re-upload
+        in REVIEW thus refreshes the score.
+      * If the flow is still collecting applicant fields (COLLECTING_FIELDS),
+        store the docs and acknowledge — they're scored automatically when the
+        last field is collected.
+      * Returns None when there is no active session to attach to (the caller
+        decides how to nudge the citizen), or when the flag is off.
+
+    Never raises — degrades to None on any internal error so the caller can
+    fall back to a generic reply. Bytes are never logged."""
+    if not is_enabled():
+        return None
+    try:
+        attached = await attach_documents(user_id, docs)
+        if not attached:
+            return None
+        sess = await _get_session(user_id)
+        if sess is None:
+            return None
+        if sess.stage in (Stage.COLLECTING_DOCS, Stage.REVIEW):
+            # Re-score with the freshly attached bytes and show the result.
+            return await _enter_doc_scoring(sess)
+        # Still collecting applicant fields — acknowledge; the docs are scored
+        # when the last field lands. Nudge the citizen back to the question.
+        nxt = sess.next_missing_field()
+        ack = (
+            f"📎 Dokumen diterima ({len(sess.documents)} berkas). "
+            "Akan saya periksa setelah data pemohon lengkap."
+        )
+        if nxt is not None:
+            ack += f"\n\n{nxt.question}"
+        return ack
+    except Exception:
+        logger.exception(
+            "Guided-submission inbound-document handling crashed | user=%s",
+            _mask(user_id),
+        )
+        return None
+
+
+async def attach_documents(
     user_id: str,
     docs: list[SessionDocument],
 ) -> bool:
@@ -458,7 +624,7 @@ def attach_documents(
     there is no active session to attach to (caller can decide what to do).
     Bytes are held in memory only; never logged.
     """
-    sess = _get_session(user_id)
+    sess = await _get_session(user_id)
     if sess is None or sess.stage in (Stage.DONE, Stage.FAILED):
         return False
     # De-dup by file_id; cap total count.
@@ -477,7 +643,7 @@ def attach_documents(
         sess.documents.append(d)
         have.add(d.file_id)
     sess.touch()
-    _put_session(sess)
+    await _put_session(sess)
     logger.info(
         "Guided-submission documents attached | user=%s | count=%d",
         _mask(user_id), len(sess.documents),
@@ -654,6 +820,32 @@ def _run_validation(sess: SubmissionSession) -> dict[str, Any]:
 # Reply builders — plain-Indonesian, WhatsApp-friendly.
 # ===========================================================================
 
+# Indonesian one-word status labels for the compact score reminder.
+_SCORE_STATUS_LABEL: dict[str, str] = {
+    "ready": "siap dikirim",
+    "needs_fix": "perlu diperbaiki",
+    "unverified": "belum tervalidasi",
+}
+
+
+def _score_reminder_prefix(sess: SubmissionSession) -> str:
+    """A compact one-line score reminder prepended to REVIEW-stage replies so
+    the citizen keeps the context of their latest document score across turns
+    (the full score message is only shown once, at the field→review
+    transition). Empty string when no score has been computed yet.
+
+    Survives a restart because it reads the JSON-safe `last_score` fields that
+    `_encode_session` persists (the rich `result` dataclass is dropped, but
+    score_percent + status are kept)."""
+    score = sess.last_score
+    if not isinstance(score, dict) or "score_percent" not in score:
+        return ""
+    pct = score.get("score_percent")
+    status = _SCORE_STATUS_LABEL.get(str(score.get("status", "")), "")
+    tail = f" ({status})" if status else ""
+    return f"📊 Skor terkini: {pct}%{tail}\n\n"
+
+
 def _fmt_review(sess: SubmissionSession) -> str:
     """The pre-submit summary the citizen confirms with 'ya'."""
     lines = [
@@ -729,7 +921,7 @@ async def _start_session(user_id: str, message: str) -> str:
         # Could not resolve — keep the session in RESOLVING_LICENSE and ask
         # the citizen to name the licence precisely.
         sess.stage = Stage.RESOLVING_LICENSE
-        _put_session(sess)
+        await _put_session(sess)
         note = lookup.get("note", "")
         logger.info(
             "Guided-submission start — licence unresolved | user=%s | query=%r",
@@ -747,7 +939,7 @@ async def _start_session(user_id: str, message: str) -> str:
         # Ambiguous — let the citizen pick from a numbered shortlist.
         sess.candidates = matches[:8]
         sess.stage = Stage.RESOLVING_LICENSE
-        _put_session(sess)
+        await _put_session(sess)
         lines = [
             "Saya menemukan beberapa jenis izin yang cocok. Mohon pilih "
             "dengan membalas *nomornya*:",
@@ -779,7 +971,7 @@ async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
 
     sess.stage = Stage.COLLECTING_FIELDS
     sess.touch()
-    _put_session(sess)
+    await _put_session(sess)
     logger.info(
         "Guided-submission licence locked | user=%s | license_id=%s",
         _mask(sess.user_id), sess.license_id,
@@ -830,13 +1022,13 @@ async def _collect_field(sess: SubmissionSession, message: str) -> str:
         # Defensive — shouldn't happen; jump straight to review.
         sess.stage = Stage.REVIEW
         sess.touch()
-        _put_session(sess)
+        await _put_session(sess)
         return _fmt_review(sess)
 
     ok, cleaned = spec.validate(message)
     if not ok:
         sess.touch()
-        _put_session(sess)
+        await _put_session(sess)
         # cleaned holds the error message in the failure case.
         return f"{cleaned}\n\n{spec.question}"
 
@@ -853,7 +1045,7 @@ async def _collect_field(sess: SubmissionSession, message: str) -> str:
         # All applicant fields collected. Move into document content-scoring.
         return await _enter_doc_scoring(sess)
 
-    _put_session(sess)
+    await _put_session(sess)
     collected = len(sess.fields)
     return f"✅ Tercatat.\n\n{collected + 1}️⃣ {nxt.question}"
 
@@ -878,7 +1070,7 @@ async def _enter_doc_scoring(sess: SubmissionSession) -> str:
         if score is not None:
             sess.last_score = score
             sess.stage = Stage.REVIEW
-            _put_session(sess)
+            await _put_session(sess)
             head = "✅ Semua data pemohon terkumpul.\n\n"
             # The live content-score message is the centerpiece the citizen sees.
             return (
@@ -890,7 +1082,7 @@ async def _enter_doc_scoring(sess: SubmissionSession) -> str:
 
     # No in-session documents (or scoring unavailable) → fixture review path.
     sess.stage = Stage.REVIEW
-    _put_session(sess)
+    await _put_session(sess)
     return "✅ Semua data pemohon terkumpul.\n\n" + _fmt_review(sess)
 
 
@@ -927,7 +1119,7 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
         sess.stage = Stage.REVIEW
         sess.override_offered = True
         sess.touch()
-        _put_session(sess)
+        await _put_session(sess)
         # The content-score path already renders a full WhatsApp message; the
         # fixture path uses the legacy issue formatter.
         if score is not None:
@@ -947,7 +1139,7 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     if not client.is_configured():
         sess.stage = Stage.FAILED
         sess.touch()
-        _put_session(sess)
+        await _put_session(sess)
         logger.warning(
             "Guided-submission: SIAP submission client not configured | user=%s",
             _mask(sess.user_id),
@@ -969,7 +1161,7 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     if not profile_id_raw.isdigit():
         sess.stage = Stage.FAILED
         sess.touch()
-        _put_session(sess)
+        await _put_session(sess)
         logger.warning(
             "Guided-submission: no GUIDED_SUBMISSION_PROFILE_ID configured | "
             "user=%s", _mask(sess.user_id),
@@ -994,7 +1186,7 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     if not submit.get("ok"):
         sess.stage = Stage.FAILED
         sess.touch()
-        _put_session(sess)
+        await _put_session(sess)
         note = submit.get("note", "Terjadi kesalahan saat mengirim ke SIAP.")
         logger.warning(
             "Guided-submission submit failed | user=%s | note=%s",
@@ -1043,7 +1235,7 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
                 _mask(sess.user_id),
             )
 
-    _clear_session(sess.user_id)
+    await _clear_session(sess.user_id)
 
     if ticket:
         track = _PORTAL_TRACK_URL.format(ticket=ticket)
@@ -1085,7 +1277,7 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
         return None
 
     msg = (message or "").strip()
-    sess = _get_session(user_id)
+    sess = await _get_session(user_id)
 
     # --- No active session: only engage on a fresh submission intent ----
     if sess is None or sess.stage in (Stage.DONE, Stage.FAILED):
@@ -1100,14 +1292,14 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
                 logger.exception(
                     "Guided-submission start crashed | user=%s", _mask(user_id)
                 )
-                _clear_session(user_id)
+                await _clear_session(user_id)
                 return None  # degrade: let ai_handler take the message
         return None
 
     # --- Active session: this message belongs to the flow ---------------
     # A citizen can bail out of the form at any step.
     if _CANCEL_PATTERN.match(msg):
-        _clear_session(user_id)
+        await _clear_session(user_id)
         logger.info("Guided-submission cancelled | user=%s", _mask(user_id))
         return (
             "Baik, pengajuan izin dibatalkan. Jika sewaktu-waktu ingin "
@@ -1147,8 +1339,12 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
             # "KIRIM" retry after a validation-issues message.
             if re.match(r"^\s*kirim\s*$", msg, re.IGNORECASE):
                 return await _submit(sess, force=sess.override_offered)
+            # Any other REVIEW-stage message (e.g. a clarifying question before
+            # confirming): re-anchor the citizen with the latest score so they
+            # never lose the context of why validation passed/failed.
             return (
-                "Ketik *YA* untuk memvalidasi dan mengirim permohonan, atau "
+                _score_reminder_prefix(sess)
+                + "Ketik *YA* untuk memvalidasi dan mengirim permohonan, atau "
                 "*BATAL* untuk membatalkan. Jika ada data yang ingin diubah, "
                 "ketik *BATAL* lalu mulai ulang pengajuan."
             )
@@ -1157,7 +1353,7 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
             "Guided-submission handler crashed | user=%s | stage=%s",
             _mask(user_id), sess.stage,
         )
-        _clear_session(user_id)
+        await _clear_session(user_id)
         return (
             "Maaf, terjadi gangguan saat memproses pengajuan Anda. "
             "Pengajuan dibatalkan — mohon mulai ulang dengan menyebutkan "
@@ -1165,5 +1361,5 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
         )
 
     # Unknown stage — clear and let ai_handler handle the message.
-    _clear_session(user_id)
+    await _clear_session(user_id)
     return None

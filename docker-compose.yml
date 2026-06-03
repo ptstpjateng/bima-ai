@@ -45,6 +45,12 @@ services:
     env_file: ./ai-engine/.env
     environment:
       - CHROMA_HOST=${CHROMA_HOST:-ai-engine}
+    # Redis is used for durable chat sessions (services/session_store.py) when
+    # BIMA_REDIS_SESSIONS_ENABLED=true. ai-engine degrades to in-memory if it's
+    # down, but start redis first so the durable store is reachable on boot.
+    depends_on:
+      redis:
+        condition: service_healthy
     volumes:
       - chroma_data:/app/chroma_db
     networks:

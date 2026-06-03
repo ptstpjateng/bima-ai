@@ -315,6 +315,105 @@ class TestReplyBridge(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertIn("gangguan", out.lower())
 
+    def _run_turn_with_tool_calls(self, env, tool_calls):
+        copilot = type("C", (), {})()
+        copilot.chat = AsyncMock(return_value={
+            "reply": "Berkas diteruskan.",
+            "tool_calls": tool_calls,
+            "history": [{"role": "user", "text": "ya"},
+                        {"role": "model", "text": "Berkas diteruskan."}],
+        })
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(oc, "get_copilot", return_value=copilot):
+                return _run(ob.maybe_handle_officer_reply(
+                    channel=ob.CHANNEL_WHATSAPP,
+                    channel_id="628999000111",
+                    message="ya",
+                ))
+
+    def test_session_cleared_after_confirmed_forward(self):
+        # Fix 3: a successful CONFIRMED forward_case clears the session so a
+        # stale ticket can't hijack the officer's next message.
+        env = self._arm_session()
+        self.assertIn("628999000111", ob._sessions)
+        out = self._run_turn_with_tool_calls(env, [{
+            "name": "forward_case",
+            "args": {"ticket": "000123456", "confirmed": True},
+            "result_preview": '{"executed": true, "ok": true, "result": {"id": 7}}',
+        }])
+        self.assertIsNotNone(out)
+        self.assertNotIn("628999000111", ob._sessions)
+
+    def test_session_cleared_after_confirmed_decision(self):
+        env = self._arm_session()
+        out = self._run_turn_with_tool_calls(env, [{
+            "name": "record_decision",
+            "args": {"ticket": "000123456", "decision": "approved",
+                     "notes": "ok", "confirmed": True},
+            "result_preview": '{"executed":true,"ok":true,"result":{}}',
+        }])
+        self.assertIsNotNone(out)
+        self.assertNotIn("628999000111", ob._sessions)
+
+    def test_session_kept_on_draft_forward(self):
+        # A draft (confirmed not true, executed false) must NOT clear the session.
+        env = self._arm_session()
+        self._run_turn_with_tool_calls(env, [{
+            "name": "forward_case",
+            "args": {"ticket": "000123456"},   # no confirmed
+            "result_preview": '{"executed": false, "needs_confirmation": true}',
+        }])
+        self.assertIn("628999000111", ob._sessions)
+
+    def test_session_kept_on_failed_confirmed_write(self):
+        # Confirmed but the write FAILED (ok false) → keep the session so the
+        # officer can retry; the case did not leave the desk.
+        env = self._arm_session()
+        self._run_turn_with_tool_calls(env, [{
+            "name": "forward_case",
+            "args": {"ticket": "000123456", "confirmed": True},
+            "result_preview": '{"executed": true, "ok": false, "note": "SIAP error"}',
+        }])
+        self.assertIn("628999000111", ob._sessions)
+
+    def test_session_kept_on_readonly_tool(self):
+        # A read-only tool turn keeps the session (the existing follow-up Q&A
+        # behaviour) — only a confirmed successful write closes it.
+        env = self._arm_session()
+        self._run_turn_with_tool_calls(env, [{
+            "name": "get_validation_summary", "args": {}, "result_preview": "{}",
+        }])
+        self.assertIn("628999000111", ob._sessions)
+
+
+class TestCaseClosedDetector(unittest.TestCase):
+    """Unit cover for the _case_was_closed helper that gates the session clear."""
+
+    def test_true_only_for_confirmed_successful_write(self):
+        self.assertTrue(ob._case_was_closed([{
+            "name": "forward_case", "args": {"confirmed": True},
+            "result_preview": '{"executed": true, "ok": true}',
+        }]))
+        self.assertTrue(ob._case_was_closed([{
+            "name": "record_decision", "args": {"confirmed": True},
+            "result_preview": '{"ok":true,"executed":true}',
+        }]))
+
+    def test_false_for_draft_failed_unconfirmed_or_other_tools(self):
+        self.assertFalse(ob._case_was_closed([]))
+        self.assertFalse(ob._case_was_closed([{
+            "name": "forward_case", "args": {},
+            "result_preview": '{"executed": false}',
+        }]))
+        self.assertFalse(ob._case_was_closed([{
+            "name": "forward_case", "args": {"confirmed": True},
+            "result_preview": '{"executed": true, "ok": false}',
+        }]))
+        self.assertFalse(ob._case_was_closed([{
+            "name": "get_doc_summary", "args": {"confirmed": True},
+            "result_preview": '{"executed": true, "ok": true}',
+        }]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

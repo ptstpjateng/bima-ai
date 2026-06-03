@@ -50,6 +50,27 @@ _POLLER_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 async def lifespan(app: FastAPI):
     logger.info("BIMA-AI engine starting up.")
 
+    # Durable chat sessions (Redis): probe connectivity once at startup so the
+    # logs say up-front whether guided-submission + officer sessions will
+    # survive a restart. No-op (logs "disabled") when the flag is off; never
+    # fatal — session_store degrades to in-memory on any failure.
+    try:
+        from services import session_store
+        await session_store.ping()
+    except Exception:
+        logger.exception("session_store startup ping raised (non-fatal)")
+
+    # Officer-directory cache (flow-based notify): warm the in-memory set of
+    # registered officer WhatsApp numbers so the first inbound officer message
+    # hits a warm cache instead of a cold sync miss. is_officer_channel_id
+    # refreshes it on a TTL via a non-blocking background task thereafter.
+    # Never fatal — degrades to the BIMA_OFFICER_WA_PHONE env fallback.
+    try:
+        from services import officer_bridge
+        await officer_bridge.warm_officer_cache()
+    except Exception:
+        logger.exception("officer cache warm raised (non-fatal)")
+
     # Transparency-notification poller: a background task that polls SIAP's
     # license-request changes feed and dispatches proactive citizen WhatsApp
     # updates. The task is always created; it no-ops every tick until

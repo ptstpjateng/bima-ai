@@ -95,25 +95,62 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
     phone_number_id = data.get("phoneNumberId")
     raw_payload = data.get("payload")
 
-    # Log envelope at INFO and full payload at DEBUG for the first weeks. Once
-    # _extract_text_from_payload proves stable on real traffic, drop the DEBUG line.
+    # Log the envelope shape at INFO only — NEVER the full payload, which
+    # carries message text, the unmasked msisdn, and media ids (PII). The
+    # masked INFO line below + _payload_shape_keys on the no-text/media path
+    # give enough to diagnose parser gaps without dumping content.
     logger.info(
         "APTANA inbound | from=%s name=%s phone_id=%s payload_type=%s",
         _mask(msisdn or ""), name, phone_number_id, type(raw_payload).__name__,
     )
-    logger.debug("APTANA inbound full | %s", data)
 
     text = _extract_text_from_payload(raw_payload)
     message_id = _extract_message_id_from_payload(raw_payload)
 
+    # --- Inbound MEDIA (image / PDF) intake for the guided-submission flow ---
+    # If the message carries no text but DOES carry media, route it to the
+    # media path so the citizen can upload their documents in chat. The media
+    # is downloaded + attached + scored in a background task (so APTANA still
+    # gets a fast 200). Only engages when the sender has an active guided
+    # submission; otherwise we reply with a gentle nudge.
+    if msisdn and not text:
+        media = _extract_media_from_payload(raw_payload)
+        if media is not None:
+            # An officer's media-only message must NOT enter the citizen media
+            # flow (it would reply with the "no active submission" nudge meant
+            # for citizens). The officer copilot has no document-upload path
+            # over chat, so just drop the media for the configured officer.
+            from services import officer_bridge
+            if officer_bridge.is_officer_channel_id(msisdn):
+                logger.info(
+                    "APTANA inbound media from officer — ignored | user=%s",
+                    _mask(msisdn),
+                )
+                return {"ok": True, "skipped": "officer_media_ignored"}
+            background.add_task(
+                _process_inbound_media, msisdn=msisdn, media=media, message_id=message_id
+            )
+            return {"ok": True, "media": media.kind}
+
     if not msisdn or not text:
-        logger.warning(
-            "APTANA inbound dropped | missing=%s payload_preview=%s",
-            "phone" if not msisdn else "text",
-            (raw_payload[:300] if isinstance(raw_payload, str) else str(raw_payload)[:300]),
+        # Unrecognized / non-text-non-media payload. Log the SHAPE (key names
+        # only — no bytes, no PII) at INFO so we can adapt the media parser
+        # from a real capture, then (if we know the sender) nudge them.
+        logger.info(
+            "APTANA inbound no text/media | user=%s payload_shape=%s",
+            _mask(msisdn or ""), _payload_shape_keys(raw_payload),
         )
-        # 200 so APTANA doesn't retry — it's a parser bug or non-text message,
-        # not a transient failure. Investigate from logs.
+        if msisdn:
+            background.add_task(
+                send_text,
+                recipient_phone=msisdn,
+                body=(
+                    "Maaf, saya belum bisa membaca lampiran itu. Mohon kirim "
+                    "ulang sebagai *foto* (JPG/PNG) atau *PDF*, ya. 🙏"
+                ),
+            )
+        # 200 so APTANA doesn't retry — it's a parser gap or unsupported
+        # message type, not a transient failure. Investigate from the shape log.
         return {"ok": True, "skipped": "missing_fields"}
 
     # Sanitise BEFORE handing off to the background task. Done synchronously
@@ -230,6 +267,93 @@ async def _process_inbound(
         await log_to_backend(user_id, text, reply, channel="whatsapp")
     except Exception:
         logger.exception("Backend log failed | user=%s", _mask(msisdn))
+
+
+async def _process_inbound_media(msisdn: str, media, message_id: str | None = None) -> None:
+    """Download an inbound WhatsApp media item, attach it to the citizen's
+    guided-submission session, score it, and reply with the score. Runs as a
+    BackgroundTask. Never raises. Document bytes are never logged.
+
+    Only image/PDF are scoreable; other media types get a polite decline. If
+    the citizen has no active guided submission, we nudge them to start one
+    rather than silently dropping their upload.
+    """
+    user_id = f"wa-{msisdn}"
+    kind = getattr(media, "kind", "?")
+    logger.info("APTANA media inbound | user=%s kind=%s", _mask(msisdn), kind)
+
+    from services import guided_submission
+    from services.whatsapp_media import download_media
+
+    # `_SCOREABLE_MEDIA_TYPES` is the module-level tuple defined in THIS file
+    # (see below); it is NOT exported by whatsapp_media. Referencing the
+    # in-scope module global avoids an ImportError on every inbound media msg.
+
+    # Guided-submission flag off → media intake is dark; tell the citizen the
+    # document flow isn't available rather than dropping silently.
+    if not guided_submission.is_enabled():
+        logger.info("APTANA media: guided submission disabled | user=%s", _mask(msisdn))
+        return
+
+    # Only act on the scoreable types (image/document). Audio/video/sticker →
+    # gentle decline.
+    if kind not in _SCOREABLE_MEDIA_TYPES:
+        await send_text(
+            recipient_phone=msisdn,
+            body=(
+                "Untuk pemeriksaan dokumen, mohon kirim *foto* (JPG/PNG) atau "
+                "*PDF* berkas perizinan Anda, ya. 🙏"
+            ),
+        )
+        return
+
+    # No active submission → the upload has no home. Nudge to start the flow.
+    if not await guided_submission.has_active_session(user_id):
+        await send_text(
+            recipient_phone=msisdn,
+            body=(
+                "Saya menerima dokumen Anda, tetapi belum ada pengajuan izin "
+                "yang sedang berjalan. Mulai dulu dengan, mis. _\"saya mau "
+                "ajukan izin ...\"_, lalu kirim dokumennya. 🙏"
+            ),
+        )
+        return
+
+    # Acknowledge receipt fast (download + Vision scoring can take several
+    # seconds). Fire-and-forget so it never blocks the slow path below.
+    asyncio.create_task(acknowledge_received(message_id, msisdn))
+
+    downloaded = await download_media(media)
+    if downloaded is None:
+        await send_text(
+            recipient_phone=msisdn,
+            body=(
+                "Maaf, dokumen Anda tidak dapat saya unduh atau formatnya belum "
+                "didukung (hanya JPG, PNG, atau PDF, maksimal 10 MB). Mohon "
+                "kirim ulang, ya. 🙏"
+            ),
+        )
+        return
+
+    # Build a per-session document id. The filename is a safe label only.
+    doc = guided_submission.SessionDocument(
+        file_id=(message_id or downloaded.filename or f"{kind}-doc"),
+        claimed_type=guided_submission._claimed_type_from_filename(downloaded.filename),
+        filename=downloaded.filename,
+        mime_type=downloaded.mime_type,
+        content=downloaded.content,
+    )
+
+    reply = await guided_submission.handle_inbound_documents(user_id, [doc])
+    if reply is None:
+        # Session vanished between checks, or scoring degraded. Give a generic
+        # acknowledgment rather than stranding the citizen.
+        reply = (
+            "📎 Dokumen Anda sudah saya terima. Lanjutkan pengajuan Anda, ya. 🙏"
+        )
+    delivered = await send_text(recipient_phone=msisdn, body=reply)
+    if not delivered:
+        logger.error("APTANA media reply delivery failed | user=%s", _mask(msisdn))
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +483,7 @@ async def aptana_status(path_secret: str, request: Request):
 
     We DECODE and log a clean one-line summary per event instead of dumping the
     whole blob (the raw envelope is huge — APTANA inlines a full price-list — and
-    contains PII). Full raw dump stays at DEBUG for deep debugging only.
+    contains PII).
 
     This endpoint does NOT act on the events yet — it's the visibility layer.
     Read receipts captured here are the foundation for "citizen read the
@@ -372,8 +496,8 @@ async def aptana_status(path_secret: str, request: Request):
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid_json")
 
-    # Full raw envelope only at DEBUG (off by default) — never INFO (PII + noise).
-    logger.debug("APTANA status raw | %s", body)
+    # NB: never dump the raw envelope — it carries recipient msisdns and other
+    # PII. _log_meta_webhook_summary below emits a masked, per-event summary.
 
     envelope = body.get("payload") if isinstance(body, dict) else None
     # APTANA may forward `payload` as a dict (observed) or as a JSON string.
@@ -553,6 +677,121 @@ def _extract_text_from_payload(payload: Any) -> str | None:
                                 return body.strip()
 
     return None
+
+
+# Meta message types that carry a downloadable binary we care about. We only
+# act on image + document (the permit-packet inputs); audio/video/sticker are
+# detected so we can log + politely decline rather than silently drop.
+_MEDIA_TYPES = ("image", "document", "audio", "video", "sticker")
+_SCOREABLE_MEDIA_TYPES = ("image", "document")
+
+
+def _coerce_payload_dict(payload: Any) -> dict | None:
+    """Shared helper: turn APTANA's `payload` (plain text, JSON string, or
+    already-parsed dict) into a dict, or None when it isn't dict-shaped."""
+    if payload is None or payload == "":
+        return None
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                payload = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        else:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _first_message_obj(payload: dict) -> dict | None:
+    """Return the first Meta `messages[0]` object from either the flat
+    {"messages": [...]} shape or the nested {"entry":[{"changes":[{"value":
+    {"messages":[...]}}]}]} envelope. None when absent."""
+    msgs = payload.get("messages")
+    if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict):
+        return msgs[0]
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            value = change.get("value", {}) if isinstance(change, dict) else {}
+            msgs = value.get("messages")
+            if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict):
+                return msgs[0]
+    return None
+
+
+def _extract_media_from_payload(payload: Any):
+    """Best-effort: pull a downloadable media descriptor out of APTANA's
+    `payload`, following Meta's documented Cloud-API media shape. Returns an
+    `InboundMedia` for image/document (the scoreable types), or None.
+
+    BEST-EFFORT / PENDING A REAL CAPTURE: APTANA's docs show TEXT payloads
+    only — we have no captured media payload to confirm the exact JSON path or
+    whether the handle is an opaque `id` or an inlined `link`. This parser
+    covers Meta's standard shape:
+        messages[0] = {"type":"image","image":{"id":...,"mime_type":...}}
+        messages[0] = {"type":"document","document":{"id":...,"filename":...,
+                        "mime_type":...,"link":...}}
+    Both `id` (opaque → Graph resolve) and `link` (direct) are captured; the
+    media client decides how to fetch. When the real shape differs, adapt the
+    field reads here — the call sites don't change.
+    """
+    from services.whatsapp_media import InboundMedia
+
+    obj = _coerce_payload_dict(payload)
+    if obj is None:
+        return None
+    msg = _first_message_obj(obj)
+    if msg is None:
+        return None
+
+    mtype = msg.get("type")
+    if mtype not in _MEDIA_TYPES:
+        return None
+
+    # The media sub-object is conventionally keyed by the type name.
+    sub = msg.get(mtype)
+    if not isinstance(sub, dict):
+        # Some shapes inline the fields on the message itself.
+        sub = msg
+
+    media_id = sub.get("id") or sub.get("media_id") or sub.get("mediaId")
+    link = sub.get("link") or sub.get("url")
+    mime = sub.get("mime_type") or sub.get("mimeType") or sub.get("mimetype")
+    filename = sub.get("filename") or sub.get("file_name")
+
+    media_id = media_id.strip() if isinstance(media_id, str) else None
+    link = link.strip() if isinstance(link, str) else None
+    if not media_id and not link:
+        return None
+
+    return InboundMedia(
+        kind=str(mtype),
+        media_id=media_id,
+        link=link,
+        mime_type=mime.strip() if isinstance(mime, str) else None,
+        filename=filename.strip() if isinstance(filename, str) else None,
+    )
+
+
+def _payload_shape_keys(payload: Any) -> Any:
+    """A PII-free, bytes-free description of a payload's SHAPE (key names only,
+    recursively for the message object) so we can diagnose an unrecognized
+    media payload from a real capture without logging any content."""
+    obj = _coerce_payload_dict(payload)
+    if obj is None:
+        return type(payload).__name__
+    out: dict[str, Any] = {"top_keys": sorted(obj.keys())}
+    msg = _first_message_obj(obj)
+    if isinstance(msg, dict):
+        out["message_keys"] = sorted(msg.keys())
+        out["message_type"] = msg.get("type")
+        mtype = msg.get("type")
+        sub = msg.get(mtype) if isinstance(mtype, str) else None
+        if isinstance(sub, dict):
+            out["media_keys"] = sorted(sub.keys())
+    return out
 
 
 def _extract_message_id_from_payload(payload: Any) -> str | None:
