@@ -9,9 +9,10 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        // Primary action — brand olive, white label (AA ~5:1).
+        // Primary action — brand olive. Label = --color-on-primary (white in
+        // light ~5:1; dark ink in dark, since white-on-lifted-olive was 3.9:1).
         primary:
-          "bg-primary text-white hover:bg-primary-hover active:translate-y-px",
+          "bg-primary text-on-primary hover:bg-primary-hover active:translate-y-px",
         // Persistent "chat / go" CTA — forest green, white label (AA ~9.5:1).
         // Kept under the legacy name `amber` (the top bar uses it) but is now
         // the inviting WhatsApp/action green of the Bima system.

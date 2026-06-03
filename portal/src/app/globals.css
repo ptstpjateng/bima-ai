@@ -30,6 +30,10 @@
   /* ---- Brand palette (from the guideline) ---- */
   --color-primary: #726953;          /* olive — brand core */
   --color-primary-hover: #5e5645;
+  /* Label color for filled primary buttons. White passes AA on the light
+     olive (~5:1); in DARK the olive lifts to #8c7f63 where white is only
+     ~3.9:1, so on-primary flips to dark ink there (~5:1). See dark block. */
+  --color-on-primary: #ffffff;
   --color-secondary: #5b3000;        /* dark brown */
   --color-tertiary: #66462c;         /* medium brown */
   --color-sage: #76877d;             /* primary·dark shade */
@@ -110,10 +114,11 @@
 
     --color-primary: #8c7f63;        /* lifted olive so it reads on dark */
     --color-primary-hover: #9d9072;
+    --color-on-primary: #14130f;     /* dark ink label on lifted olive (~5:1; white was ~3.9:1) */
     --color-accent: #82a6b1;
     --color-accent-ink: #a7c6cf;     /* light dusty-blue for text on dark */
     --color-brand-green: #2f7a52;    /* lifted forest for dark CTAs (white label ~5.2:1) */
-    --color-brand-green-hover: #379060;
+    --color-brand-green-hover: #287044; /* darker than rest so white stays AA on hover (was #379060=3.95:1) */
     --color-brand-green-text: #4ca576; /* lighter green for TEXT on dark surfaces (~5.6:1) */
     --color-sage: #93a39a;
     --color-success: #6aa37c;

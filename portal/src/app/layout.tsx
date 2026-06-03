@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Plus_Jakarta_Sans, Lexend } from "next/font/google";
 import { cn } from "@/lib/utils";
 import { ThemeScript } from "@/components/ThemeScript";
+import { MotionProvider } from "@/components/MotionProvider";
 import "./globals.css";
 
 // BIMA design system fonts (see BIMA-Vault/BIMA Design System.md).
@@ -48,7 +49,9 @@ export default function RootLayout({
       {/* Light-first per the Bima Guidelines; dark mode follows the OS via
           prefers-color-scheme, overridden by the .dark/.light toggle in the
           top bar (persisted to localStorage `bima-theme`). */}
-      <body className="bg-bg text-ink antialiased min-h-screen">{children}</body>
+      <body className="bg-bg text-ink antialiased min-h-screen">
+        <MotionProvider>{children}</MotionProvider>
+      </body>
     </html>
   );
 }
