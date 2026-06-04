@@ -198,6 +198,17 @@ _DONE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# "Restart with a new submission" — the citizen's confirmation, after BIMA has
+# intercepted a mid-form new-submission intent, that they DO want to abandon the
+# current form and start the new licence. Also a manual escape hatch. Anchored
+# so a field answer (a name, "SIAP", "SELESAI") can never match it.
+_RESTART_PATTERN = re.compile(
+    r"^\s*(mulai baru|mulai ulang|ganti(?:\s+pengajuan)?|"
+    r"batalkan dan mulai(?:\s+baru)?|ajukan(?:\s+yang)?\s+baru|"
+    r"pengajuan baru)\s*$",
+    re.IGNORECASE,
+)
+
 
 # ===========================================================================
 # Field collection — the applicant profile fields we walk the citizen through.
@@ -222,6 +233,14 @@ def _v_name(raw: str) -> tuple[bool, str]:
         return False, "Nama terlalu pendek. Mohon tulis nama lengkap sesuai KTP."
     if not re.search(r"[A-Za-z]", s):
         return False, "Nama tidak valid. Mohon tulis nama lengkap sesuai KTP."
+    # Defense in depth (FIX A): a new-submission intent ("saya mau ajukan izin
+    # …") must never be silently stored AS the applicant's name. maybe_handle
+    # intercepts these before field collection, but if one slips through, reject
+    # it here and re-ask rather than recording the intent phrase as a person.
+    if _SUBMISSION_INTENT_PATTERN.search(s) or re.search(
+        r"ajukan\s+izin", s, re.IGNORECASE
+    ):
+        return False, "Mohon ketik nama lengkap sesuai KTP."
     return True, s
 
 
@@ -346,6 +365,13 @@ class SubmissionSession:
     # ok-gate (otherwise KIRIM loops forever — a flawed packet could never be
     # filed). Reset implicitly per session.
     override_offered: bool = False
+    # When a citizen sends a CLEAR new-submission intent mid-form (e.g. "saya mau
+    # ajukan izin PKPP" while still answering the name field), we do NOT eat it
+    # as a field answer. We stash the raw message here and offer MULAI BARU. A
+    # subsequent MULAI BARU clears the session and re-resolves from this text; a
+    # genuine field answer clears it (the citizen chose to continue). Not PII per
+    # se (it's a licence-intent phrase), but kept off logs to be safe.
+    pending_new_intent: Optional[str] = None
     # the resulting SIAP ticket once submitted (for officer-brief wiring).
     ticket: Optional[str] = None
     request_id: Optional[int] = None
@@ -415,6 +441,7 @@ def _encode_session(sess: SubmissionSession) -> str:
         "documents": docs,
         "last_score": _score_for_redis(sess.last_score),
         "override_offered": sess.override_offered,
+        "pending_new_intent": sess.pending_new_intent,
         "ticket": sess.ticket,
         "request_id": sess.request_id,
         "created_at": sess.created_at,
@@ -448,6 +475,7 @@ def _decode_session(blob: str) -> SubmissionSession:
         documents=docs,
         last_score=raw.get("last_score"),
         override_offered=bool(raw.get("override_offered", False)),
+        pending_new_intent=raw.get("pending_new_intent"),
         ticket=raw.get("ticket"),
         request_id=raw.get("request_id"),
         created_at=float(raw.get("created_at", time.time())),
@@ -666,9 +694,12 @@ async def attach_documents(
         if d.file_id in have:
             continue
         if len(d.content) > _MAX_DOC_BYTES:
+            # PII: a citizen-supplied filename can carry a name (e.g.
+            # "Budi_Santoso_KTP.jpg") — log the opaque file_id + size, never the
+            # filename or content.
             logger.warning(
-                "attach_documents skipped oversize | user=%s | file=%s | bytes=%d",
-                _mask(user_id), d.filename, len(d.content),
+                "attach_documents skipped oversize | user=%s | file_id=%s | bytes=%d",
+                _mask(user_id), d.file_id, len(d.content),
             )
             continue
         if len(sess.documents) >= _MAX_DOCS:
@@ -1088,10 +1119,11 @@ async def _collect_field(sess: SubmissionSession, message: str) -> str:
 
     sess.fields[spec.key] = cleaned
     sess.touch()
+    # PII: log ONLY the field NAME + a non-PII length indicator. The field VALUE
+    # (applicant name / NIK / phone / business name) must NEVER appear in logs.
     logger.info(
-        "Guided-submission field collected | user=%s | field=%s | value=%s",
-        _mask(sess.user_id), spec.key,
-        _mask(cleaned) if spec.is_pii else cleaned,
+        "Guided-submission field collected | user=%s | field=%s | value_len=%d",
+        _mask(sess.user_id), spec.key, len(cleaned),
     )
 
     nxt = sess.next_missing_field()
@@ -1423,6 +1455,72 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
             "Baik, pengajuan izin dibatalkan. Jika sewaktu-waktu ingin "
             "mengajukan lagi, cukup beri tahu saya."
         )
+
+    # MULAI BARU — switch to a fresh submission. Runs at ANY active stage,
+    # BEFORE the per-stage dispatch consumes the message as a field/SIAP/SELESAI.
+    #   * with a pending intercepted intent → clear the current form and START a
+    #     fresh resolution from the stashed message (same path _start_session
+    #     uses), so the new licence resolves cleanly.
+    #   * without one → behave like BATAL but ask them to name the new licence.
+    if _RESTART_PATTERN.match(msg):
+        pending = sess.pending_new_intent
+        if pending:
+            logger.info(
+                "Guided-submission MULAI BARU — restarting from intercepted "
+                "intent | user=%s",
+                _mask(user_id),
+            )
+            try:
+                # _start_session builds a brand-new SubmissionSession and writes
+                # it through under this user_id, so the old form is replaced.
+                return await _start_session(user_id, pending)
+            except Exception:
+                logger.exception(
+                    "Guided-submission MULAI BARU restart crashed | user=%s",
+                    _mask(user_id),
+                )
+                await _clear_session(user_id)
+                return None
+        await _clear_session(user_id)
+        logger.info("Guided-submission MULAI BARU (no pending) | user=%s", _mask(user_id))
+        return (
+            "Baik, pengajuan sebelumnya dibatalkan. Mohon sebutkan *nama izin* "
+            "yang ingin Anda ajukan (contoh: \"Izin Pemakaian Tanah\")."
+        )
+
+    # New-submission intent INTERCEPT (FIX A) — while a form is ACTIVE
+    # (CONFIRMING_START / COLLECTING_FIELDS / COLLECTING_DOCS, NOT
+    # RESOLVING_LICENSE), a clear "saya mau ajukan izin …" must NOT be eaten as
+    # a field answer / SELESAI / doc trigger. We stash it and offer MULAI BARU.
+    # detect_submission_intent is conservative (verb-phrase + licensing-object),
+    # so a normal name ("Budi Santoso"), a NIK, "SIAP", or "SELESAI" never trips
+    # it. RESOLVING_LICENSE is excluded — there a licence-name message is the
+    # expected input.
+    if sess.stage in (
+        Stage.CONFIRMING_START,
+        Stage.COLLECTING_FIELDS,
+        Stage.COLLECTING_DOCS,
+    ) and detect_submission_intent(msg):
+        sess.pending_new_intent = msg
+        sess.touch()
+        await _put_session(sess)
+        logger.info(
+            "Guided-submission new-intent intercepted mid-form | user=%s | stage=%s",
+            _mask(user_id), sess.stage.value,
+        )
+        return (
+            f"Anda sedang mengisi pengajuan {sess.license_name}. Ketik "
+            "*MULAI BARU* untuk mengganti dengan pengajuan baru, atau lanjutkan "
+            "dengan menjawab pertanyaan sebelumnya."
+        )
+
+    # The citizen sent neither a restart nor a new-submission intent — they are
+    # continuing the current form. Any previously-stashed intercepted intent is
+    # now stale (they chose to proceed), so clear it before the stage dispatch.
+    if sess.pending_new_intent is not None:
+        sess.pending_new_intent = None
+        sess.touch()
+        await _put_session(sess)
 
     try:
         if sess.stage == Stage.RESOLVING_LICENSE:
