@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from deps import require_internal_key
 from services import notifications
+from services.pii import mask_pii
 from services.agents.validator import (
     SUPPORTED_DOC_TYPES,
     Document,
@@ -682,7 +683,7 @@ async def suitability_endpoint(
                 file=f.file,
                 file_id=f.file_id,
                 judgement=f.judgement,
-                evidence=f.evidence,
+                evidence=mask_pii(f.evidence),
                 confidence=f.confidence,
             )
             for f in suit_result.suitability
@@ -691,8 +692,8 @@ async def suitability_endpoint(
             SuitabilityIssueOut(
                 id=i.id,
                 severity=i.severity,
-                title=i.title,
-                detail=i.detail,
+                title=mask_pii(i.title),
+                detail=mask_pii(i.detail),
             )
             for i in suit_result.compatibility_findings
         ],
@@ -702,8 +703,8 @@ async def suitability_endpoint(
             SuitabilityIssueOut(
                 id=i.id,
                 severity=i.severity,
-                title=i.title,
-                detail=i.detail,
+                title=mask_pii(i.title),
+                detail=mask_pii(i.detail),
             )
             for i in suit_result.issues
         ],
