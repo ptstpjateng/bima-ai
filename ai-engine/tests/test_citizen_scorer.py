@@ -204,6 +204,135 @@ class TestRenderScoreMessage(unittest.TestCase):
         self.assertIn("SIAP DB tidak tersedia.", msg)
 
 
+class TestMaskPiiUnit(unittest.TestCase):
+    """Direct unit cover for the reusable `services.pii.mask_pii` helper."""
+
+    def setUp(self):
+        from services.pii import mask_pii
+        self.mask = mask_pii
+
+    def test_16_digit_nik_masked_but_short_id_not(self):
+        # 16-digit run → masked; a 9-digit licence/ticket number → untouched.
+        self.assertNotIn("3327080511740081", self.mask("NIK : 3327080511740081"))
+        self.assertEqual(self.mask("tiket 000123456 ok"), "tiket 000123456 ok")
+        # 15- and 17-digit runs are NOT NIKs → left alone.
+        self.assertEqual(self.mask("332708051174008"), "332708051174008")
+        self.assertEqual(self.mask("33270805117400812"), "33270805117400812")
+
+    def test_grouped_nik_masked(self):
+        for grouped in ("3327 0805 1174 0081", "3327.0805.1174.0081"):
+            self.assertNotIn("3327080511740081", self.mask(grouped))
+            self.assertIn("33", self.mask(grouped))
+
+    def test_phone_shapes_masked(self):
+        self.assertNotIn("085117557091", self.mask("085117557091"))
+        self.assertNotIn("6285117557091", self.mask("+6285117557091"))
+        self.assertNotIn("6285117557091", self.mask("wa 6285117557091"))
+
+    def test_already_masked_review_block_is_noop(self):
+        # The existing review block ("33******81" / "08****12") must not get
+        # double-masked into something awkward.
+        self.assertEqual(self.mask("33******81"), "33******81")
+        self.assertEqual(self.mask("08****12"), "08****12")
+
+    def test_idempotent(self):
+        once = self.mask("NIK : 3327080511740081 telp 085117557091")
+        self.assertEqual(self.mask(once), once)
+
+    def test_empty_and_none_safe(self):
+        self.assertEqual(self.mask(""), "")
+        self.assertIsNone(self.mask(None))
+
+
+class TestEvidencePiiMasked(unittest.TestCase):
+    """PII leak fix — a SuitabilityFinding's `evidence` is a Gemini Vision quote
+    of the document and CAN contain a raw 16-digit NIK or a phone number. The
+    citizen score message MUST render it masked (matching the existing
+    "33******81" review block), never the full value."""
+
+    _NIK = "3327080511740081"   # 16 digits — a real KTP NIK shape
+    _PHONE = "085117557091"     # Indonesian mobile
+
+    def test_nik_in_evidence_is_masked(self):
+        res = _result(
+            suitability=[
+                SuitabilityFinding(
+                    requirement="KTP sesuai pemohon",
+                    file="ktp.jpg",
+                    file_id="doc-1",
+                    judgement="mismatch",
+                    evidence=(
+                        "PROVINSI JAWA TENGAH KABUPATEN PEMALANG "
+                        f"NIK : {self._NIK} nama tidak cocok"
+                    ),
+                    confidence=0.8,
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        # The full NIK must NOT appear anywhere in the citizen message.
+        self.assertNotIn(self._NIK, msg)
+        # The masked form (first 2 + last 2, middle starred) IS present.
+        self.assertIn("33", msg)
+        self.assertIn("************81", msg)
+        # Surrounding non-PII context is preserved.
+        self.assertIn("KABUPATEN PEMALANG", msg)
+
+    def test_phone_in_evidence_is_masked(self):
+        res = _result(
+            suitability=[
+                SuitabilityFinding(
+                    requirement="Surat Domisili",
+                    file="domisili.pdf",
+                    file_id="doc-2",
+                    judgement="partial",
+                    evidence=f"narahubung {self._PHONE} tertera di surat",
+                    confidence=0.6,
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        self.assertNotIn(self._PHONE, msg)
+        # Exact masked token: 08 + middle starred + last 2 digits (91).
+        self.assertIn("08********91", msg)
+
+    def test_non_pii_evidence_unchanged(self):
+        res = _result(
+            suitability=[
+                SuitabilityFinding(
+                    requirement="Alamat usaha",
+                    file="d.pdf",
+                    file_id="doc-3",
+                    judgement="mismatch",
+                    evidence="alamat usaha jelas",
+                    confidence=0.7,
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        # The evidence is echoed verbatim (the surrounding "*...*" are WhatsApp
+        # bold markers, not masking) — assert the exact evidence line is intact.
+        self.assertIn("belum sesuai — alamat usaha jelas", msg)
+
+    def test_short_id_not_masked(self):
+        # A 9-digit ticket / licence number embedded in evidence must survive
+        # untouched — only 16-digit NIK runs and phone-shaped runs are targeted.
+        res = _result(
+            suitability=[
+                SuitabilityFinding(
+                    requirement="Nomor berkas",
+                    file="d.pdf",
+                    file_id="doc-4",
+                    judgement="partial",
+                    evidence="nomor tiket 000123456 tercatat",
+                    confidence=0.7,
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        self.assertIn("000123456", msg)
+
+
 class TestNoEmojiInScoreMessage(unittest.TestCase):
     """FIX B — the rendered score message carries no emoji (plain-text status
     bands + bullets only)."""

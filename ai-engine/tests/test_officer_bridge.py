@@ -150,6 +150,101 @@ class TestScoreToValidation(unittest.TestCase):
         self.assertIsNone(ob._score_to_validation({}))
 
 
+class TestEvidencePiiMaskedForOfficer(unittest.TestCase):
+    """PII leak fix — the SAME SuitabilityResult that feeds the citizen score
+    also feeds the officer-facing validation dict (brief + copilot
+    get_validation_summary). NIK/phone quoted from documents into issue
+    titles/messages/summary MUST be masked before it reaches the officer."""
+
+    _NIK = "3327080511740081"
+    _PHONE = "085117557091"
+
+    def _score_with_pii_issue(self):
+        # An issue whose title echoes a Gemini Vision evidence quote with a NIK
+        # (this is exactly the shape that leaked: evidence → issue text).
+        issues = [
+            Issue(
+                id=f"suitability:mismatch:doc-1:NIK {self._NIK}",
+                severity="high",
+                title=f"Dokumen tidak sesuai: NIK {self._NIK} tidak cocok",
+                detail=f"Bukti: NIK {self._NIK} berbeda dari NIB.",
+            ),
+        ]
+        result = SuitabilityResult(
+            completeness=CompletenessSection(score=1.0, missing=[], required=["KTP"]),
+            type_correctness=[],
+            suitability=[],
+            compatibility_findings=[],
+            overall_suitability_score=0.7,
+            issues=issues,
+        )
+        return {
+            "ok": False,
+            "status": "needs_fix",
+            "score_percent": 70,
+            "summary": f"Pemohon dengan NIK {self._NIK} perlu dicek.",
+            "message": "m",
+            "issues": [{"severity": i.severity, "message": i.title} for i in issues],
+            "result": result,
+        }
+
+    def test_rich_path_masks_nik_in_message_field_and_summary(self):
+        v = ob._score_to_validation(self._score_with_pii_issue())
+        # Full NIK must NOT appear in ANY string of the projected validation.
+        blob = repr(v)
+        self.assertNotIn(self._NIK, blob)
+        # The masked form is present in the issue message + the summary.
+        self.assertIn("************81", v["issues"][0]["message"])
+        self.assertIn("************81", v["summary"])
+        # `field` carries the issue id which embedded the NIK — also masked.
+        self.assertNotIn(self._NIK, v["issues"][0]["field"])
+
+    def test_flattened_fallback_masks_phone(self):
+        score = {
+            "score_percent": 60,
+            "status": "needs_fix",
+            "summary": "ringkasan",
+            "issues": [
+                {"severity": "high", "message": f"hubungi {self._PHONE} untuk klarifikasi"},
+            ],
+            "result": None,
+        }
+        v = ob._score_to_validation(score)
+        self.assertNotIn(self._PHONE, repr(v))
+        self.assertIn("08", v["issues"][0]["message"])
+
+    def test_non_pii_message_unchanged(self):
+        score = {
+            "score_percent": 90, "status": "ready", "summary": "berkas lengkap",
+            "issues": [{"severity": "low", "message": "alamat usaha jelas"}],
+            "result": None,
+        }
+        v = ob._score_to_validation(score)
+        self.assertEqual(v["issues"][0]["message"], "alamat usaha jelas")
+        self.assertEqual(v["summary"], "berkas lengkap")
+
+    def test_notify_stores_masked_validation_in_session(self):
+        # End-to-end: the masked validation is what lands in the officer
+        # session (and therefore what the copilot/brief see).
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "628999000111",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        ob._sessions.clear()
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+                _run(ob.notify_officer_of_submission(
+                    ticket="000123456", request_id=42, license_id=358,
+                    license_name="Izin Penelitian", applicant_name="Budi",
+                    score=self._score_with_pii_issue(), documents=[],
+                ))
+        sess = ob._sessions.get("628999000111")
+        self.assertIsNotNone(sess)
+        self.assertNotIn(self._NIK, repr(sess.validation))
+        self.assertIn("************81", repr(sess.validation))
+
+
 class TestNotify(unittest.TestCase):
     def setUp(self):
         ob._sessions.clear()
