@@ -43,6 +43,7 @@ from services.agents.suitability_judge import (
     UploadedDoc,
     judge_submission,
 )
+from services.pii import mask_pii
 
 logger = logging.getLogger("bima_ai.citizen_scorer")
 
@@ -150,15 +151,23 @@ def _type_lines(result: SuitabilityResult) -> list[str]:
 
 def _materia_or_suitability_lines(result: SuitabilityResult) -> list[str]:
     """Surface suitability mismatches/partials (e.g. a Surat Permohonan that
-    is missing materai, or content that does not satisfy the requirement)."""
+    is missing materai, or content that does not satisfy the requirement).
+
+    The `evidence` is a Gemini Vision quote of the document content and CAN
+    contain raw PII (a KTP NIK, a phone number). It is masked via `mask_pii`
+    before it ever reaches the citizen's screen — the masked review block
+    elsewhere already shows NIK as "33******81"; this keeps the evidence line
+    consistent so the full 16-digit NIK never leaks here.
+    """
     lines: list[str] = []
     for f in result.suitability:
         if f.judgement == "match":
             continue
+        evidence = mask_pii(f.evidence)
         if f.judgement == "mismatch":
-            lines.append(f"- {f.requirement}: belum sesuai — {f.evidence}")
+            lines.append(f"- {f.requirement}: belum sesuai — {evidence}")
         elif f.judgement == "partial":
-            lines.append(f"- {f.requirement}: kurang lengkap — {f.evidence}")
+            lines.append(f"- {f.requirement}: kurang lengkap — {evidence}")
         # "unknown" judgements are not shown to the citizen (vision was down
         # for that pair) — they would just confuse, and the completeness line
         # already covers presence.
@@ -216,7 +225,11 @@ def render_score_message(
         lines += ["", "*Yang perlu diperhatikan:*"]
         for issue in result.issues[:_MAX_ISSUES_SHOWN]:
             bullet = _SEVERITY_BULLET.get(issue.severity, "-")
-            lines.append(f"{bullet} {issue.title}")
+            # Issue titles are short, registry-derived strings, but mask them
+            # too: a suitability issue's title echoes the requirement and the
+            # masker is a cheap, idempotent no-op on PII-free text — so no raw
+            # NIK/phone can ride along even if a title ever quotes content.
+            lines.append(f"{bullet} {mask_pii(issue.title)}")
         remaining = len(result.issues) - _MAX_ISSUES_SHOWN
         if remaining > 0:
             lines.append(f"...dan {remaining} catatan lain.")

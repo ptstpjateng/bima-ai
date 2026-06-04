@@ -79,6 +79,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from services import session_store
+from services.pii import mask_pii
 
 load_dotenv()
 
@@ -401,19 +402,30 @@ def _score_to_validation(score: Optional[dict[str, Any]]) -> Optional[dict[str, 
     [{severity, field, message, related_docs}]}.
 
     Returns None when there's no score (officer brief then says validation is
-    pending, and `get_validation_summary` will report it gracefully)."""
+    pending, and `get_validation_summary` will report it gracefully).
+
+    PII: the SuitabilityResult's issue titles/ids (and the flattened-fallback
+    messages) can echo Gemini Vision evidence quoted from the citizen's
+    documents — a KTP NIK, a phone number. We mask every free-text field HERE,
+    at the single point where the score is projected into the officer-facing
+    validation dict. That dict is what gets stored in the OfficerCaseSession,
+    forwarded into the copilot (`get_validation_summary`, which the model
+    narrates to the officer verbatim), and rendered into the brief — so
+    masking once here covers all three officer surfaces, matching the standing
+    rule that NIK/phone/name must be masked for the officer."""
     if not score or not isinstance(score, dict):
         return None
 
     issues: list[dict[str, Any]] = []
     result = score.get("result")
     if result is not None and getattr(result, "issues", None) is not None:
-        # Rich path — map the SuitabilityResult.Issue objects.
+        # Rich path — map the SuitabilityResult.Issue objects. Both the title
+        # and the id (which embeds the requirement text) are masked.
         for it in result.issues:
             issues.append({
                 "severity": getattr(it, "severity", "") or "",
-                "field": getattr(it, "id", "") or "",
-                "message": getattr(it, "title", "") or "",
+                "field": mask_pii(getattr(it, "id", "") or ""),
+                "message": mask_pii(getattr(it, "title", "") or ""),
                 "related_docs": [],
             })
     else:
@@ -423,14 +435,14 @@ def _score_to_validation(score: Optional[dict[str, Any]]) -> Optional[dict[str, 
                 issues.append({
                     "severity": str(it.get("severity", "") or ""),
                     "field": "",
-                    "message": str(it.get("message", "") or ""),
+                    "message": mask_pii(str(it.get("message", "") or "")),
                     "related_docs": [],
                 })
 
     return {
         "score_percent": int(score.get("score_percent", 0) or 0),
         "status": str(score.get("status", "unverified") or "unverified"),
-        "summary": str(score.get("summary", "") or ""),
+        "summary": mask_pii(str(score.get("summary", "") or "")),
         "issues": issues,
     }
 
