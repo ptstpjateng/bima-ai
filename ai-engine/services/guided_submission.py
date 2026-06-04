@@ -181,6 +181,23 @@ _AFFIRM_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Readiness affirmation — the citizen's "yes, guide me" at the CONFIRMING_START
+# step (after the requirements were shown, before field collection begins).
+# Broader than _AFFIRM_PATTERN: includes the explicit "SIAP" / "SIAP DIPANDU"
+# / "MULAI" / "MULAI SEKARANG" wording the readiness prompt asks for.
+_AFFIRM_START_PATTERN = re.compile(
+    r"^\s*(siap(?:\s+dipandu)?|mulai(?:\s+sekarang)?|ya|iya|yes|y|ok|oke|okay|"
+    r"lanjut(?:kan)?|setuju|gas|ayo|boleh)\s*$",
+    re.IGNORECASE,
+)
+
+# "I'm done sending documents" — the citizen's signal at COLLECTING_DOCS that
+# all requirement files have been sent and BIMA should score them now.
+_DONE_PATTERN = re.compile(
+    r"^\s*(selesai|sudah|udah|done|finish(?:ed)?|cukup|lengkap)\s*$",
+    re.IGNORECASE,
+)
+
 
 # ===========================================================================
 # Field collection — the applicant profile fields we walk the citizen through.
@@ -273,11 +290,17 @@ _FIELD_BY_KEY: dict[str, FieldSpec] = {f.key: f for f in _FIELD_SPECS}
 
 class Stage(str, Enum):
     RESOLVING_LICENSE = "resolving_license"
+    # CONFIRMING_START: the licence is locked and its requirements have been
+    # shown; before walking the citizen through the form we ask for an explicit
+    # "SIAP" (ready) so they can read the requirements first. An affirmative
+    # advances to COLLECTING_FIELDS; BATAL cancels.
+    CONFIRMING_START = "confirming_start"
     COLLECTING_FIELDS = "collecting_fields"
-    # COLLECTING_DOCS: applicant fields are done; we are waiting for the
-    # citizen's document images/PDFs so BIMA can CONTENT-score them before
-    # review. When no documents arrive (the chat transport has not delivered
-    # media yet) the flow falls back to the demo-fixture validation path.
+    # COLLECTING_DOCS: applicant fields are done; we are EXPLICITLY waiting for
+    # the citizen to send their document images/PDFs (they type SELESAI when
+    # finished) so BIMA can CONTENT-score them before review. As a fallback for
+    # a transport that hasn't wired media (or the curated demo packet), the flow
+    # can still fall through to the demo-fixture validation path.
     COLLECTING_DOCS = "collecting_docs"
     REVIEW = "review"
     DONE = "done"
@@ -486,6 +509,7 @@ async def has_active_session(user_id: str) -> bool:
     sess = await _get_session(user_id)
     return sess is not None and sess.stage in (
         Stage.RESOLVING_LICENSE,
+        Stage.CONFIRMING_START,
         Stage.COLLECTING_FIELDS,
         Stage.COLLECTING_DOCS,
         Stage.REVIEW,
@@ -569,13 +593,14 @@ async def handle_inbound_documents(
 
     Attaches `docs` to the citizen's active guided-submission session and
     returns a citizen-facing reply string:
-      * If the flow is at/after document collection (COLLECTING_DOCS / REVIEW),
-        re-run live content-scoring and return the score message + review
-        summary (the same thing the field→review transition shows). A re-upload
-        in REVIEW thus refreshes the score.
-      * If the flow is still collecting applicant fields (COLLECTING_FIELDS),
-        store the docs and acknowledge — they're scored automatically when the
-        last field is collected.
+      * COLLECTING_DOCS — the explicit document-collection step: attach and
+        acknowledge with a running count. Do NOT score yet — the citizen types
+        SELESAI when finished, which triggers scoring.
+      * REVIEW — a re-upload after scoring: re-run live content-scoring and
+        return the refreshed score message + review summary.
+      * Earlier stages (CONFIRMING_START / COLLECTING_FIELDS) — the citizen sent
+        a document early; store it and acknowledge, nudging them back to the
+        flow. The docs are scored once they reach the document-collection step.
       * Returns None when there is no active session to attach to (the caller
         decides how to nudge the citizen), or when the flag is off.
 
@@ -590,14 +615,22 @@ async def handle_inbound_documents(
         sess = await _get_session(user_id)
         if sess is None:
             return None
-        if sess.stage in (Stage.COLLECTING_DOCS, Stage.REVIEW):
-            # Re-score with the freshly attached bytes and show the result.
+        if sess.stage == Stage.COLLECTING_DOCS:
+            # Explicit document-collection step: acknowledge with a running
+            # count and wait for more documents / SELESAI. No scoring yet.
+            n = len(sess.documents)
+            return (
+                f"Dokumen diterima ({n} total). Kirim dokumen lain, atau "
+                "ketik SELESAI untuk saya nilai."
+            )
+        if sess.stage == Stage.REVIEW:
+            # A re-upload after scoring → re-score with the fresh bytes.
             return await _enter_doc_scoring(sess)
-        # Still collecting applicant fields — acknowledge; the docs are scored
-        # when the last field lands. Nudge the citizen back to the question.
+        # Earlier stage (still confirming start or collecting applicant fields)
+        # — acknowledge; the docs are scored once we reach the document step.
         nxt = sess.next_missing_field()
         ack = (
-            f"📎 Dokumen diterima ({len(sess.documents)} berkas). "
+            f"Dokumen diterima ({len(sess.documents)} berkas). "
             "Akan saya periksa setelah data pemohon lengkap."
         )
         if nxt is not None:
@@ -843,7 +876,7 @@ def _score_reminder_prefix(sess: SubmissionSession) -> str:
     pct = score.get("score_percent")
     status = _SCORE_STATUS_LABEL.get(str(score.get("status", "")), "")
     tail = f" ({status})" if status else ""
-    return f"📊 Skor terkini: {pct}%{tail}\n\n"
+    return f"Skor terkini: {pct}%{tail}\n\n"
 
 
 def _fmt_review(sess: SubmissionSession) -> str:
@@ -851,7 +884,7 @@ def _fmt_review(sess: SubmissionSession) -> str:
     lines = [
         f"Baik, mohon dicek kembali permohonan Anda:",
         "",
-        f"📋 *Jenis izin:* {sess.license_name}",
+        f"*Jenis izin:* {sess.license_name}",
     ]
     for spec in _FIELD_SPECS:
         val = sess.fields.get(spec.key, "-")
@@ -862,11 +895,11 @@ def _fmt_review(sess: SubmissionSession) -> str:
             "business_name": "Nama usaha",
             "phone": "No. WhatsApp",
         }.get(spec.key, spec.key)
-        lines.append(f"• *{label}:* {shown}")
+        lines.append(f"- *{label}:* {shown}")
     if sess.sla_working_days:
-        lines.append(f"• *Perkiraan SLA:* {sess.sla_working_days} hari kerja")
+        lines.append(f"- *Perkiraan SLA:* {sess.sla_working_days} hari kerja")
     if sess.retribution_fee:
-        lines.append(f"• *Retribusi:* {sess.retribution_fee}")
+        lines.append(f"- *Retribusi:* {sess.retribution_fee}")
     lines += [
         "",
         "Jika sudah benar, ketik *YA* untuk memvalidasi dan mengirim "
@@ -878,16 +911,16 @@ def _fmt_review(sess: SubmissionSession) -> str:
 def _fmt_validation_issues(result: dict[str, Any]) -> str:
     """The 'please fix this before we submit' message — flow does NOT submit."""
     lines = [
-        "⚠️ Permohonan Anda belum bisa dikirim — ada yang perlu diperbaiki "
+        "Permohonan Anda belum bisa dikirim — ada yang perlu diperbaiki "
         f"dulu (kelengkapan {result.get('score_percent', 0)}%):",
         "",
     ]
     issues = result.get("issues") or []
     if issues:
         for it in issues[:5]:
-            lines.append(f"• {it.get('message', '')}".rstrip())
+            lines.append(f"- {it.get('message', '')}".rstrip())
     else:
-        lines.append(f"• {result.get('summary', 'Dokumen belum lengkap.')}")
+        lines.append(f"- {result.get('summary', 'Dokumen belum lengkap.')}")
     lines += [
         "",
         "Perbaiki poin di atas, lalu ketik *KIRIM* untuk mencoba lagi, atau "
@@ -928,7 +961,7 @@ async def _start_session(user_id: str, message: str) -> str:
             _mask(user_id),
         )
         return (
-            "Saya siap membantu Anda mengajukan izin lewat SIAP Jateng. 🙌\n\n"
+            "Saya siap membantu Anda mengajukan izin lewat SIAP Jateng.\n\n"
             "Mohon sebutkan *nama izin* yang ingin Anda ajukan "
             "(contoh: \"Izin Pemakaian Tanah\")."
             + (f"\n\n_{note}_" if note else "")
@@ -956,7 +989,13 @@ async def _start_session(user_id: str, message: str) -> str:
 
 
 async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
-    """Pin the chosen licence onto the session and move to field collection."""
+    """Pin the chosen licence onto the session, show its requirements, and ask
+    the citizen to confirm they are ready before field collection begins.
+
+    We do NOT jump straight into the form: the citizen should be able to read
+    the document checklist first. So we park the session in CONFIRMING_START
+    and ask for an explicit "SIAP". maybe_handle advances on an affirmative.
+    """
     from services.siap_tools import siap_get_requirements
 
     sess.license_id = int(match["license_id"])
@@ -969,7 +1008,7 @@ async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
         sess.sla_working_days = reqs.get("sla_working_days")
         sess.retribution_fee = reqs.get("retribution_fee")
 
-    sess.stage = Stage.COLLECTING_FIELDS
+    sess.stage = Stage.CONFIRMING_START
     sess.touch()
     await _put_session(sess)
     logger.info(
@@ -986,17 +1025,32 @@ async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
             "Dokumen yang nanti perlu Anda siapkan:",
         ]
         for r in sess.requirements[:8]:
-            intro_lines.append(f"• {r}")
+            intro_lines.append(f"- {r}")
     intro_lines += [
         "",
-        "Sekarang saya akan menanyakan data pemohon satu per satu. "
+        f"Apakah Anda siap saya pandu untuk mengajukan {sess.license_name}? "
+        "Balas *SIAP* untuk mulai, atau *BATAL* untuk membatalkan.",
+    ]
+    return "\n".join(intro_lines).rstrip()
+
+
+async def _begin_field_collection(sess: SubmissionSession) -> str:
+    """Move CONFIRMING_START → COLLECTING_FIELDS and ask the first field."""
+    sess.stage = Stage.COLLECTING_FIELDS
+    sess.touch()
+    await _put_session(sess)
+    logger.info(
+        "Guided-submission field collection started | user=%s | license_id=%s",
+        _mask(sess.user_id), sess.license_id,
+    )
+    lines = [
+        "Baik, kita mulai. Saya akan menanyakan data pemohon satu per satu. "
         "Ketik *BATAL* kapan saja untuk membatalkan.",
         "",
     ]
-    # Ask the first field.
     first = sess.next_missing_field()
-    intro_lines.append(f"1️⃣ {first.question}" if first else "")
-    return "\n".join(intro_lines).rstrip()
+    lines.append(f"1. {first.question}" if first else "")
+    return "\n".join(lines).rstrip()
 
 
 def _handle_license_choice(sess: SubmissionSession, message: str) -> Optional[dict]:
@@ -1042,27 +1096,61 @@ async def _collect_field(sess: SubmissionSession, message: str) -> str:
 
     nxt = sess.next_missing_field()
     if nxt is None:
-        # All applicant fields collected. Move into document content-scoring.
-        return await _enter_doc_scoring(sess)
+        # All applicant fields collected. Ask the citizen to send their
+        # requirement documents (explicit document-collection step).
+        return await _ask_for_documents(sess)
 
     await _put_session(sess)
     collected = len(sess.fields)
-    return f"✅ Tercatat.\n\n{collected + 1}️⃣ {nxt.question}"
+    return f"Tercatat.\n\n{collected + 1}. {nxt.question}"
 
 
-async def _enter_doc_scoring(sess: SubmissionSession) -> str:
-    """Transition COLLECTING_FIELDS → (live content-score) → REVIEW.
+# The explicit "now send the file" prompt shown once the last applicant field
+# is collected. The citizen sends photos/PDFs and types SELESAI when done.
+_DOC_PROMPT = (
+    "Data pemohon lengkap. Sekarang silakan kirim dokumen persyaratan dalam "
+    "bentuk foto (JPG/PNG) atau PDF, maksimal 10 MB. Anda boleh mengirim "
+    "beberapa dokumen sekaligus. Ketik SELESAI jika semua dokumen sudah "
+    "dikirim."
+)
 
-    If the chat transport has delivered documents (or the curated demo packet
-    is configured), BIMA CONTENT-scores them live here and shows the citizen
-    the score before asking for confirmation. When no documents are available,
-    fall back to the existing demo-fixture review path so the flow still works
-    on a transport that hasn't wired media yet.
+
+async def _ask_for_documents(sess: SubmissionSession) -> str:
+    """Transition COLLECTING_FIELDS → COLLECTING_DOCS and ask for the files.
+
+    The live path is real uploads: we park in COLLECTING_DOCS and explicitly
+    ask the citizen to send their documents (then type SELESAI). The ONLY
+    exception is the demo fallback: when GUIDED_SUBMISSION_DEMO_PACKET is set
+    (NOT in production), auto-load that packet and score immediately so the
+    rehearsal doesn't require live uploads.
     """
     sess.stage = Stage.COLLECTING_DOCS
     sess.touch()
 
-    # Pull in the curated demo packet if real media hasn't arrived.
+    # Demo fallback only — production does not set GUIDED_SUBMISSION_DEMO_PACKET,
+    # so this is a no-op there and the citizen is asked to upload for real.
+    if not sess.documents and _demo_packet_dir() is not None:
+        loaded = _load_demo_packet(sess)
+        if loaded:
+            return await _enter_doc_scoring(sess)
+
+    await _put_session(sess)
+    return _DOC_PROMPT
+
+
+async def _enter_doc_scoring(sess: SubmissionSession) -> str:
+    """Run the live content-score over the in-session documents → REVIEW.
+
+    Called when the citizen types SELESAI at COLLECTING_DOCS (real uploads) or
+    when the demo packet was auto-loaded. BIMA CONTENT-scores the documents and
+    shows the citizen the score before asking for confirmation. When no
+    documents are available (and no packet), fall back to the demo-fixture
+    review path so the flow still works on a transport that hasn't wired media.
+    """
+    sess.touch()
+
+    # Pull in the curated demo packet if real media hasn't arrived (no-op in
+    # production where GUIDED_SUBMISSION_DEMO_PACKET is unset).
     _load_demo_packet(sess)
 
     if sess.documents:
@@ -1071,7 +1159,7 @@ async def _enter_doc_scoring(sess: SubmissionSession) -> str:
             sess.last_score = score
             sess.stage = Stage.REVIEW
             await _put_session(sess)
-            head = "✅ Semua data pemohon terkumpul.\n\n"
+            head = "Semua dokumen sudah saya terima.\n\n"
             # The live content-score message is the centerpiece the citizen sees.
             return (
                 head
@@ -1083,7 +1171,7 @@ async def _enter_doc_scoring(sess: SubmissionSession) -> str:
     # No in-session documents (or scoring unavailable) → fixture review path.
     sess.stage = Stage.REVIEW
     await _put_session(sess)
-    return "✅ Semua data pemohon terkumpul.\n\n" + _fmt_review(sess)
+    return "Semua data pemohon terkumpul.\n\n" + _fmt_review(sess)
 
 
 async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
@@ -1150,11 +1238,11 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
             _mask(sess.user_id),
         )
         return (
-            "✅ Dokumen Anda sudah lengkap dan tervalidasi.\n\n"
+            "Dokumen Anda sudah lengkap dan tervalidasi.\n\n"
             "Namun kanal pengiriman otomatis ke SIAP belum aktif di sistem "
             "saat ini. Permohonan Anda *belum terkirim*. Mohon hubungi "
             "petugas DPMPTSP untuk menyelesaikan pengajuan, atau coba lagi "
-            "nanti. Mohon maaf atas ketidaknyamanannya. 🙏"
+            "nanti. Mohon maaf atas ketidaknyamanannya."
         )
 
     # profile_id: in this slice we do not yet resolve a real SIAP profile_id
@@ -1172,10 +1260,10 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
             "user=%s", _mask(sess.user_id),
         )
         return (
-            "✅ Dokumen Anda sudah lengkap dan tervalidasi.\n\n"
+            "Dokumen Anda sudah lengkap dan tervalidasi.\n\n"
             "Namun pemetaan profil pemohon ke SIAP belum dikonfigurasi di "
             "sistem saat ini. Permohonan *belum terkirim* — mohon hubungi "
-            "petugas DPMPTSP untuk menyelesaikan pengajuan. 🙏"
+            "petugas DPMPTSP untuk menyelesaikan pengajuan."
         )
 
     description = (
@@ -1198,7 +1286,7 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
             _mask(sess.user_id), note,
         )
         return (
-            "✅ Dokumen Anda sudah tervalidasi, tetapi pengiriman ke SIAP "
+            "Dokumen Anda sudah tervalidasi, tetapi pengiriman ke SIAP "
             f"gagal:\n\n_{note}_\n\n"
             "Permohonan *belum terkirim*. Ketik *KIRIM* untuk mencoba lagi, "
             "atau hubungi petugas DPMPTSP."
@@ -1270,19 +1358,19 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     if ticket:
         track = _PORTAL_TRACK_URL.format(ticket=ticket)
         return (
-            "🎉 *Permohonan Anda berhasil dikirim ke SIAP Jateng!*\n\n"
-            f"📋 *Jenis izin:* {sess.license_name}\n"
-            f"🎟️ *Nomor tiket:* {ticket}\n\n"
+            "*Permohonan Anda berhasil dikirim ke SIAP Jateng!*\n\n"
+            f"*Jenis izin:* {sess.license_name}\n"
+            f"*Nomor tiket:* {ticket}\n\n"
             f"Pantau status permohonan Anda kapan saja di:\n{track}\n\n"
             "Simpan nomor tiket ini. Anda akan kami kabari saat status "
-            "permohonan berubah. Terima kasih. 🙏"
+            "permohonan berubah. Terima kasih."
         )
     # Submitted but SIAP did not return a ticket — still a success.
     return (
-        "🎉 *Permohonan Anda berhasil dikirim ke SIAP Jateng!*\n\n"
-        f"📋 *Jenis izin:* {sess.license_name}\n\n"
+        "*Permohonan Anda berhasil dikirim ke SIAP Jateng!*\n\n"
+        f"*Jenis izin:* {sess.license_name}\n\n"
         "Nomor tiket akan tersedia sebentar lagi. Anda dapat memantau status "
-        f"di {_PORTAL_TRACK_URL.format(ticket='')[:-1]}. Terima kasih. 🙏"
+        f"di {_PORTAL_TRACK_URL.format(ticket='')[:-1]}. Terima kasih."
     )
 
 
@@ -1333,7 +1421,7 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
         logger.info("Guided-submission cancelled | user=%s", _mask(user_id))
         return (
             "Baik, pengajuan izin dibatalkan. Jika sewaktu-waktu ingin "
-            "mengajukan lagi, cukup beri tahu saya. 🙏"
+            "mengajukan lagi, cukup beri tahu saya."
         )
 
     try:
@@ -1354,15 +1442,44 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
             # "ajukan izin PKPP" → 0 matches.
             return await _start_session(user_id, msg)
 
+        if sess.stage == Stage.CONFIRMING_START:
+            # Readiness gate: requirements were shown; advance only on an
+            # explicit affirmative (SIAP / YA / MULAI / OKE / SIAP DIPANDU).
+            if _AFFIRM_START_PATTERN.match(msg):
+                return await _begin_field_collection(sess)
+            # Anything else (BATAL is handled above) → re-prompt.
+            return (
+                f"Apakah Anda siap saya pandu untuk mengajukan "
+                f"{sess.license_name}? Balas *SIAP* untuk mulai, atau *BATAL* "
+                "untuk membatalkan."
+            )
+
         if sess.stage == Stage.COLLECTING_FIELDS:
             return await _collect_field(sess, msg)
 
         if sess.stage == Stage.COLLECTING_DOCS:
-            # Transient stage — normally we transition straight through to
-            # REVIEW inside _enter_doc_scoring. If we land here (e.g. a process
-            # restart left a session mid-flight, or real media intake is being
-            # awaited), re-run the doc-scoring transition.
-            return await _enter_doc_scoring(sess)
+            # Explicit document-collection step. The citizen sends their files
+            # (handled out-of-band by the media webhook → handle_inbound_documents)
+            # and types SELESAI here when finished.
+            if _DONE_PATTERN.match(msg):
+                if sess.documents:
+                    # At least one document → score now and move to REVIEW.
+                    return await _enter_doc_scoring(sess)
+                # No documents sent yet → nudge to send at least one.
+                return (
+                    "Belum ada dokumen yang saya terima. Mohon kirim minimal "
+                    "satu dokumen persyaratan (foto JPG/PNG atau PDF, maksimal "
+                    "10 MB) terlebih dahulu, lalu ketik SELESAI."
+                )
+            # A non-SELESAI text message while waiting for documents. In the
+            # demo-packet rehearsal path (NOT production) there are no live
+            # uploads, so fall through to scoring the auto-loaded packet. In the
+            # live path, re-show the prompt so the citizen knows to send files
+            # (or type SELESAI) — we do NOT score on arbitrary chatter, only on
+            # an explicit SELESAI.
+            if _demo_packet_dir() is not None:
+                return await _enter_doc_scoring(sess)
+            return _DOC_PROMPT
 
         if sess.stage == Stage.REVIEW:
             # If the "send as-is" override has already been offered for a

@@ -386,6 +386,93 @@ class TestRedirectAndSniff(unittest.TestCase):
                                 mime_type="application/pdf")
         self.assertIsNone(_run(wm.download_media(media)))
 
+    # --- FIX A: generic octet-stream content-type via magic-byte sniff -----
+
+    def test_octet_stream_pdf_accepted_via_sniff(self):
+        # APTANA's CDN serves the file as application/octet-stream but the body
+        # is a real PDF → accepted, mime resolved to application/pdf (the sniff,
+        # not the generic header, is authority).
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "application/octet-stream"},
+            chunks=[b"%PDF-1.7 ", b"realbody"],
+        )
+        media = wm.InboundMedia(kind="document",
+                                link="https://lookaside.fbsbx.com/x",
+                                mime_type="application/pdf", filename="ktp.pdf")
+        out = _run(wm.download_media(media))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.mime_type, "application/pdf")
+        self.assertEqual(out.content, b"%PDF-1.7 realbody")
+        self.assertEqual(out.filename, "ktp.pdf")
+
+    def test_octet_stream_jpeg_accepted_via_sniff(self):
+        # octet-stream + JPEG magic bytes → accepted as image/jpeg.
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "APPLICATION/OCTET-STREAM; charset=binary"},
+            chunks=[b"\xff\xd8\xff\xe0jpeg"],
+        )
+        media = wm.InboundMedia(kind="image",
+                                link="https://lookaside.fbsbx.com/x")
+        out = _run(wm.download_media(media))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.mime_type, "image/jpeg")
+
+    def test_binary_octet_stream_alias_accepted(self):
+        # The `binary/octet-stream` alias is also treated as generic.
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "binary/octet-stream"},
+            chunks=[b"\x89PNGstuff"],
+        )
+        media = wm.InboundMedia(kind="image",
+                                link="https://lookaside.fbsbx.com/x")
+        out = _run(wm.download_media(media))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.mime_type, "image/png")
+
+    def test_octet_stream_html_garbage_rejected(self):
+        # octet-stream but the body is HTML/garbage → still rejected (the
+        # generic header does not let an un-sniffable body through).
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "application/octet-stream"},
+            chunks=[b"<html>not a real document</html>"],
+        )
+        media = wm.InboundMedia(kind="document",
+                                link="https://lookaside.fbsbx.com/x",
+                                mime_type="application/pdf")  # hint ignored
+        self.assertIsNone(_run(wm.download_media(media)))
+
+    def test_octet_stream_oversize_still_aborted(self):
+        # A generic octet-stream that blows the size cap must still abort, even
+        # though its first bytes sniff as a PDF — the size guard is not weakened.
+        big = b"%PDF-1.4 " + b"x" * (wm._MAX_MEDIA_BYTES + 1)
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "application/octet-stream"}, chunks=[big],
+        )
+        media = wm.InboundMedia(kind="document",
+                                link="https://lookaside.fbsbx.com/x")
+        self.assertIsNone(_run(wm.download_media(media)))
+
+    def test_concrete_disallowed_type_still_rejected(self):
+        # A SPECIFIC non-allowed type (text/html) is refused outright — the
+        # octet-stream relaxation must not let concrete types through.
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "text/html"}, chunks=[b"%PDF-1.4 sneaky"],
+        )
+        media = wm.InboundMedia(kind="document",
+                                link="https://lookaside.fbsbx.com/x")
+        self.assertIsNone(_run(wm.download_media(media)))
+
+    def test_octet_stream_offlist_host_still_refused(self):
+        # A generic octet-stream from an off-allow-list host is refused BEFORE
+        # the body is read — the SSRF guard is not weakened by Fix A.
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "application/octet-stream"},
+            chunks=[b"%PDF-1.4 body"],
+        )
+        media = wm.InboundMedia(kind="document",
+                                link="https://evil.example.com/x.pdf")
+        self.assertIsNone(_run(wm.download_media(media)))
+
 
 # ---------------------------------------------------------------------------
 # Parser tests — import the aptana parser functions. The router pulls heavy

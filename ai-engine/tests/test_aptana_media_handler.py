@@ -223,11 +223,11 @@ def _suitability_result(percent=90, critical=False):
     )
 
 
-def _make_review_session(user_id, *, last_score=None):
+def _make_review_session(user_id, *, last_score=None, stage=None):
     sess = gs.SubmissionSession(user_id=user_id)
     sess.license_id = 358
     sess.license_name = "Izin Penelitian"
-    sess.stage = gs.Stage.REVIEW
+    sess.stage = stage or gs.Stage.REVIEW
     sess.fields = {
         "applicant_name": "Budi",
         "nik": "3374012345678901",
@@ -390,6 +390,101 @@ class TestMediaHandlerIntendedBehaviour(unittest.TestCase):
         self.assertEqual(len(_SENT), 1)
         self.assertEqual(_SENT[0]["to"], "628111222")
         self.assertIn("88%", _SENT[0]["body"])
+
+    def test_collecting_docs_upload_acknowledged_without_scoring(self):
+        # FIX D: while the session is at COLLECTING_DOCS, an inbound document
+        # gets a running-count acknowledgment and is NOT scored — scoring waits
+        # for the citizen to type SELESAI.
+        sess = _make_review_session("wa-628111222", stage=gs.Stage.COLLECTING_DOCS)
+        media = aptana._extract_media_from_payload(
+            {"messages": [{"type": "document",
+                           "document": {"id": "D1",
+                                        "link": "https://lookaside.fbsbx.com/D1",
+                                        "filename": "ktp.pdf",
+                                        "mime_type": "application/pdf"}}]}
+        )
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "application/pdf"}, chunks=[b"%PDF-1.4 a"],
+        )
+        env = {"BIMA_GUIDED_SUBMISSION_ENABLED": "true",
+               "GUIDED_SUBMISSION_DEMO_PACKET": ""}
+        with patch.dict(os.environ, env, clear=False):
+            _run(gs._put_session(sess))
+            with _capture_sends(), patch(
+                "services.citizen_scorer.score_session_documents",
+                new=AsyncMock(side_effect=AssertionError("must not score on upload")),
+            ):
+                _run(aptana._process_inbound_media(
+                    msisdn="628111222", media=media, message_id="wamid.DOC1"
+                ))
+        # Document attached, session still COLLECTING_DOCS, running-count reply.
+        self.assertEqual(len(gs._sessions["wa-628111222"].documents), 1)
+        self.assertEqual(gs._sessions["wa-628111222"].stage, gs.Stage.COLLECTING_DOCS)
+        self.assertEqual(len(_SENT), 1)
+        self.assertIn("1 total", _SENT[0]["body"])
+        self.assertIn("SELESAI", _SENT[0]["body"])
+
+    def test_octet_stream_pdf_accepted_end_to_end(self):
+        # The live-bug repro: APTANA's CDN serves a real PDF as
+        # application/octet-stream. Fix A must accept it via magic-byte sniffing
+        # so the document attaches + scores (previously rejected
+        # "content-type=application/octet-stream").
+        sess = _make_review_session("wa-628111222")
+        media = aptana._extract_media_from_payload(
+            {"messages": [{"type": "document",
+                           "document": {"id": "D1",
+                                        "link": "https://lookaside.fbsbx.com/D1",
+                                        "filename": "ktp.pdf",
+                                        "mime_type": "application/pdf"}}]}
+        )
+        self.assertIsNotNone(media)
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "application/octet-stream"},
+            chunks=[b"%PDF-1.7 ", b"realktpbytes"],
+        )
+        fake_score = _suitability_result(percent=84)
+        env = {"BIMA_GUIDED_SUBMISSION_ENABLED": "true",
+               "GUIDED_SUBMISSION_DEMO_PACKET": ""}
+        with patch.dict(os.environ, env, clear=False):
+            _run(gs._put_session(sess))
+            with _capture_sends(), patch(
+                "services.citizen_scorer.score_session_documents",
+                new=AsyncMock(return_value=fake_score),
+            ):
+                _run(aptana._process_inbound_media(
+                    msisdn="628111222", media=media, message_id="wamid.OCTET"
+                ))
+        # The octet-stream PDF was downloaded, mime resolved to PDF, attached...
+        attached = gs._sessions["wa-628111222"].documents
+        self.assertEqual(len(attached), 1)
+        self.assertEqual(attached[0].mime_type, "application/pdf")
+        self.assertEqual(attached[0].content, b"%PDF-1.7 realktpbytes")
+        # ...and (session at REVIEW) the citizen got the refreshed score.
+        self.assertEqual(len(_SENT), 1)
+        self.assertIn("84%", _SENT[0]["body"])
+
+    def test_octet_stream_garbage_declines(self):
+        # octet-stream but a non-document body → download_media rejects → the
+        # citizen gets the unsupported-format decline, nothing attached.
+        sess = _make_review_session("wa-628111222")
+        from services.whatsapp_media import InboundMedia
+        _FakeAsyncClient.stream_response = _FakeStreamResponse(
+            headers={"content-type": "application/octet-stream"},
+            chunks=[b"GIF89a not a permitted type"],
+        )
+        media = InboundMedia(kind="document",
+                             link="https://lookaside.fbsbx.com/x",
+                             mime_type="application/pdf")
+        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
+            _run(gs._put_session(sess))
+            with _capture_sends():
+                _run(aptana._process_inbound_media(
+                    msisdn="628111222", media=media, message_id="wamid.GARBAGE"
+                ))
+        self.assertEqual(len(gs._sessions["wa-628111222"].documents), 0)
+        self.assertEqual(len(_SENT), 1)
+        body = _SENT[0]["body"].lower()
+        self.assertTrue("tidak dapat" in body or "10 mb" in body)
 
     def test_disallowed_media_type_declines(self):
         # An audio message is parseable but not scoreable → polite decline,
@@ -799,8 +894,8 @@ class TestScoreReminderOnFollowUp(unittest.TestCase):
             _run(gs._put_session(sess))
             reply = _run(gs.maybe_handle("wa-628321", "apakah ini sudah benar?"))
         self.assertIsNotNone(reply)
-        # Literal expected reminder line.
-        self.assertTrue(reply.startswith("📊 Skor terkini: 73% (perlu diperbaiki)"))
+        # Literal expected reminder line (no emoji — Fix B).
+        self.assertTrue(reply.startswith("Skor terkini: 73% (perlu diperbaiki)"))
         # The standard confirm instruction still follows the reminder.
         self.assertIn("YA", reply.upper())
 
@@ -813,7 +908,7 @@ class TestScoreReminderOnFollowUp(unittest.TestCase):
         with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
             _run(gs._put_session(sess))
             reply = _run(gs.maybe_handle("wa-628322", "boleh tanya dulu?"))
-        self.assertTrue(reply.startswith("📊 Skor terkini: 92% (siap dikirim)"))
+        self.assertTrue(reply.startswith("Skor terkini: 92% (siap dikirim)"))
 
     def test_no_reminder_before_any_score(self):
         sess = _make_review_session("wa-628323", last_score=None)

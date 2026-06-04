@@ -19,6 +19,7 @@ exercised against hand-built SuitabilityResult dataclasses.
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import types
 import unittest
@@ -201,6 +202,60 @@ class TestRenderScoreMessage(unittest.TestCase):
         )
         msg = cs.render_score_message(res)
         self.assertIn("SIAP DB tidak tersedia.", msg)
+
+
+class TestNoEmojiInScoreMessage(unittest.TestCase):
+    """FIX B — the rendered score message carries no emoji (plain-text status
+    bands + bullets only)."""
+
+    _EMOJI = re.compile(
+        "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
+        "\U0001F1E6-\U0001F1FF\U0000FE0F\U000020E3\U00002190-\U000021FF]"
+    )
+
+    def _assert_clean(self, text):
+        self.assertEqual(self._EMOJI.findall(text), [], f"emoji in: {text!r}")
+
+    def test_full_message_is_emoji_free(self):
+        res = _result(
+            overall=0.58,
+            completeness=CompletenessSection(
+                score=0.5, missing=["NPWP"], required=["KTP", "NIB", "NPWP"]
+            ),
+            type_correctness=[
+                TypeCorrectnessFinding(file="ktp.jpg", file_id="d1",
+                                       claimed_type="KTP", detected_type="NPWP",
+                                       confidence=0.9, matches=False),
+                TypeCorrectnessFinding(file="nib.pdf", file_id="d2",
+                                       claimed_type="NIB", detected_type="NIB",
+                                       confidence=0.95, matches=True),
+                TypeCorrectnessFinding(file="x.pdf", file_id="d3",
+                                       claimed_type="KTP", detected_type="Unknown",
+                                       confidence=0.1, matches=False),
+            ],
+            suitability=[
+                SuitabilityFinding(requirement="Surat materai", file="s.pdf",
+                                   file_id="d4", judgement="mismatch",
+                                   evidence="tidak ada materai", confidence=0.8),
+                SuitabilityFinding(requirement="Proposal", file="p.pdf",
+                                   file_id="d5", judgement="partial",
+                                   evidence="kurang", confidence=0.6),
+            ],
+            issues=[
+                Issue(id="c", severity="critical", title="Dokumen wajib hilang", detail="d"),
+                Issue(id="h", severity="high", title="Materai hilang", detail="d"),
+                Issue(id="m", severity="medium", title="Foto buram", detail="d"),
+            ],
+        )
+        msg = cs.render_score_message(res, license_name="Izin Penelitian")
+        self._assert_clean(msg)
+        # Plain-text band word is present instead of a coloured circle.
+        self.assertIn("Perlu diperbaiki", msg)
+
+    def test_high_score_band_is_plain_text(self):
+        msg = cs.render_score_message(_result(overall=0.92))
+        self._assert_clean(msg)
+        self.assertIn("Lengkap", msg)
 
 
 class TestIsSubmissionReady(unittest.TestCase):

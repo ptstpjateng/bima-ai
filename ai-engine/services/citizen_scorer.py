@@ -97,12 +97,13 @@ _CLASS_LABEL: dict[str, str] = {
     "Unknown": "Tidak terbaca",
 }
 
-# Severity → emoji bullet for the issues list.
+# Severity → plain-text prefix for the issues list (no emoji — WhatsApp
+# replies are kept emoji-free, see BIMA persona / Fix B).
 _SEVERITY_BULLET: dict[str, str] = {
-    "critical": "⛔",
-    "high": "🔴",
-    "medium": "🟠",
-    "low": "🔵",
+    "critical": "- [Penting]",
+    "high": "- [Penting]",
+    "medium": "-",
+    "low": "-",
 }
 
 # How many issues to show in the citizen message before "...dan N lainnya".
@@ -119,10 +120,10 @@ def _completeness_line(result: SuitabilityResult) -> str:
     comp = result.completeness
     if not comp.required:
         # Registry could not be loaded or license has no structured list.
-        return f"📑 *Kelengkapan:* {comp.note or 'tidak dapat dinilai otomatis'}"
+        return f"*Kelengkapan:* {comp.note or 'tidak dapat dinilai otomatis'}"
     total = len(comp.required)
     present = total - len(comp.missing)
-    return f"📑 *Kelengkapan dokumen wajib:* {present}/{total} lengkap"
+    return f"*Kelengkapan dokumen wajib:* {present}/{total} lengkap"
 
 
 def _type_lines(result: SuitabilityResult) -> list[str]:
@@ -132,16 +133,16 @@ def _type_lines(result: SuitabilityResult) -> list[str]:
     for f in result.type_correctness:
         if f.detected_type in ("Unknown", ""):
             lines.append(
-                f"• {f.file}: ⚠️ tidak dapat dibaca — pastikan foto/PDF jelas"
+                f"- {f.file}: tidak dapat dibaca — pastikan foto/PDF jelas"
             )
             continue
         if f.matches:
             lines.append(
-                f"• {f.file}: ✅ terbaca sebagai {_label(f.detected_type)}"
+                f"- {f.file}: [OK] terbaca sebagai {_label(f.detected_type)}"
             )
         else:
             lines.append(
-                f"• {f.file}: ⚠️ Anda labeli *{_label(f.claimed_type)}* "
+                f"- {f.file}: Anda labeli *{_label(f.claimed_type)}* "
                 f"tapi terbaca sebagai *{_label(f.detected_type)}*"
             )
     return lines
@@ -155,9 +156,9 @@ def _materia_or_suitability_lines(result: SuitabilityResult) -> list[str]:
         if f.judgement == "match":
             continue
         if f.judgement == "mismatch":
-            lines.append(f"• ❌ {f.requirement}: belum sesuai — {f.evidence}")
+            lines.append(f"- {f.requirement}: belum sesuai — {f.evidence}")
         elif f.judgement == "partial":
-            lines.append(f"• ⚠️ {f.requirement}: kurang lengkap — {f.evidence}")
+            lines.append(f"- {f.requirement}: kurang lengkap — {f.evidence}")
         # "unknown" judgements are not shown to the citizen (vision was down
         # for that pair) — they would just confuse, and the completeness line
         # already covers presence.
@@ -179,44 +180,46 @@ def render_score_message(
     """
     percent = int(round(result.overall_suitability_score * 100))
 
-    # Headline emoji by band — a quick visual cue for the citizen.
+    # Plain-text status band by score — no emoji (WhatsApp replies stay
+    # emoji-free, see Fix B). The band word gives the citizen a quick read of
+    # whether their packet is in good shape.
     if percent >= 85:
-        head = "🟢"
+        band = "Lengkap"
     elif percent >= 60:
-        head = "🟡"
+        band = "Hampir lengkap"
     else:
-        head = "🔴"
+        band = "Perlu diperbaiki"
 
     title = (
-        f"📄 *Hasil pemeriksaan dokumen {license_name}*"
+        f"*Hasil pemeriksaan dokumen {license_name}*"
         if license_name
-        else "📄 *Hasil pemeriksaan dokumen Anda*"
+        else "*Hasil pemeriksaan dokumen Anda*"
     )
 
     lines: list[str] = [
         title,
         "",
-        f"{head} *Skor kelayakan: {percent}%*",
+        f"*Skor kelayakan: {percent}%* ({band})",
         _completeness_line(result),
     ]
 
     type_lines = _type_lines(result)
     if type_lines:
-        lines += ["", "🔎 *Pemeriksaan jenis dokumen:*", *type_lines]
+        lines += ["", "*Pemeriksaan jenis dokumen:*", *type_lines]
 
     suit_lines = _materia_or_suitability_lines(result)
     if suit_lines:
-        lines += ["", "📝 *Kesesuaian isi dokumen:*", *suit_lines]
+        lines += ["", "*Kesesuaian isi dokumen:*", *suit_lines]
 
     # Prioritized issues — the judge already sorted worst-first.
     if result.issues:
         lines += ["", "*Yang perlu diperhatikan:*"]
         for issue in result.issues[:_MAX_ISSUES_SHOWN]:
-            bullet = _SEVERITY_BULLET.get(issue.severity, "•")
+            bullet = _SEVERITY_BULLET.get(issue.severity, "-")
             lines.append(f"{bullet} {issue.title}")
         remaining = len(result.issues) - _MAX_ISSUES_SHOWN
         if remaining > 0:
-            lines.append(f"…dan {remaining} catatan lain.")
+            lines.append(f"...dan {remaining} catatan lain.")
 
     return "\n".join(lines).rstrip()
 
