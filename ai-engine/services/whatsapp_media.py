@@ -38,6 +38,11 @@ SECURITY (hard requirements — do not relax without review)
   huge file can't exhaust memory.
 * CONTENT-TYPE: only `image/jpeg`, `image/png`, `image/webp`,
   `application/pdf` are accepted (matches what the suitability judge can read).
+  A GENERIC binary content-type (`application/octet-stream`,
+  `binary/octet-stream`) or an empty/absent one does NOT bypass this — the
+  bytes are read and the real type is decided by sniffing magic bytes, then
+  re-checked against the allow-list. A CONCRETE non-allowed type (text/html,
+  application/zip, …) is still rejected outright before the body is read.
 * TIMEOUT: every fetch is bounded by `_FETCH_TIMEOUT_SECONDS`.
 * PII: document bytes are NEVER logged. Only the masked media id, host, content
   type, and byte length are logged.
@@ -76,6 +81,23 @@ ALLOWED_CONTENT_TYPES = {
 }
 
 _FETCH_TIMEOUT_SECONDS = 30.0
+
+# GENERIC binary content-types a CDN slaps on a file when it doesn't know (or
+# won't disclose) the real one. APTANA's media CDN serves citizen uploads with
+# `application/octet-stream`, so these must NOT be rejected by the allow-list
+# gate — instead the bytes are read and the real type is decided by magic-byte
+# sniffing, then re-checked against ALLOWED_CONTENT_TYPES. A SPECIFIC type that
+# isn't allow-listed (text/html, application/zip, …) is still refused outright.
+_GENERIC_CONTENT_TYPES = {
+    "application/octet-stream",
+    "binary/octet-stream",
+}
+
+
+def _is_generic_ctype(ctype: str) -> bool:
+    """True when `ctype` (already lower-cased, charset-stripped) is empty or a
+    generic binary type — i.e. we cannot trust it and must sniff the bytes."""
+    return ctype == "" or ctype in _GENERIC_CONTENT_TYPES
 
 # Redirects are NOT auto-followed (httpx follow_redirects=False); we resolve
 # them manually so the allow-list + IP-safety guards run on EVERY hop. This
@@ -339,8 +361,18 @@ async def _stream_to_bytes(
                     .strip()
                     .lower()
                 )
-                # A PRESENT content-type must be in the allow-list outright.
-                if ctype and ctype not in ALLOWED_CONTENT_TYPES:
+                # A SPECIFIC (concrete) content-type that isn't allow-listed is
+                # refused outright before reading the body — e.g. text/html,
+                # application/zip. A GENERIC binary type
+                # (application/octet-stream) or an empty/absent one is NOT
+                # rejected here: APTANA's CDN serves citizen uploads as
+                # octet-stream, so we read the bytes and let magic-byte sniffing
+                # decide the real type below (re-checked against the allow-list).
+                if (
+                    ctype
+                    and ctype not in ALLOWED_CONTENT_TYPES
+                    and not _is_generic_ctype(ctype)
+                ):
                     logger.warning("media download rejected content-type=%s", ctype)
                     return None
                 # Pre-flight on Content-Length when present.
@@ -361,17 +393,17 @@ async def _stream_to_bytes(
                         return None
 
                 content = bytes(buf)
-                # When the response carried NO (or an empty) Content-Type, do
-                # not trust the payload hint — sniff the magic bytes and require
-                # a recognised, allow-listed type. An unrecognised body is
-                # refused here rather than passed through to the mime-hint
-                # fallback in download_media().
-                if not ctype:
+                # When the response carried NO content-type OR a generic binary
+                # one (octet-stream), do not trust the payload hint — sniff the
+                # magic bytes and require a recognised, allow-listed type. An
+                # unrecognised body is refused here rather than passed through to
+                # the mime-hint fallback in download_media().
+                if _is_generic_ctype(ctype):
                     sniffed = _sniff_content_type(content[:16])
                     if sniffed not in ALLOWED_CONTENT_TYPES:
                         logger.warning(
-                            "media download rejected — missing content-type and "
-                            "unrecognised magic bytes"
+                            "media download rejected — generic/missing "
+                            "content-type and unrecognised magic bytes"
                         )
                         return None
                     ctype = sniffed
@@ -456,11 +488,33 @@ async def download_media(media: InboundMedia) -> Optional[DownloadedMedia]:
 
         content, resp_ctype = fetched
 
-    # Decide the final mime: trust the HTTP content-type when it's allow-listed,
-    # else fall back to the payload hint when THAT is allow-listed.
-    mime = resp_ctype if resp_ctype in ALLOWED_CONTENT_TYPES else ""
-    if not mime and media.mime_type in ALLOWED_CONTENT_TYPES:
-        mime = media.mime_type  # type: ignore[assignment]
+    # Decide the final mime.
+    #   * A concrete, allow-listed HTTP content-type is trusted as-is.
+    #   * An EMPTY or GENERIC binary content-type (application/octet-stream — as
+    #     APTANA's CDN serves citizen uploads) is NOT trusted: sniff the magic
+    #     bytes and accept only when the sniff lands an allow-listed type. The
+    #     payload `mime_type` hint is consulted ONLY as a last-resort tiebreaker
+    #     when sniffing is inconclusive AND the hint is itself allow-listed — it
+    #     is never the sole authority for a generic/empty response.
+    # (`_stream_to_bytes` already sniffs generic/empty responses, so resp_ctype
+    # is normally an allow-listed type here; this re-derivation makes the final
+    # decision correct independently of that and matches the documented gate.)
+    if resp_ctype in ALLOWED_CONTENT_TYPES:
+        mime = resp_ctype
+    elif _is_generic_ctype(resp_ctype):
+        sniffed = _sniff_content_type(content[:16])
+        if sniffed in ALLOWED_CONTENT_TYPES:
+            mime = sniffed
+        elif media.mime_type in ALLOWED_CONTENT_TYPES:
+            # Sniffing inconclusive — fall back to the allow-listed hint only.
+            mime = media.mime_type  # type: ignore[assignment]
+        else:
+            mime = ""
+    else:
+        # A concrete, non-allow-listed resp content-type (text/html, …) reaching
+        # here would already have been refused in _stream_to_bytes; refuse again
+        # defensively rather than trusting the hint.
+        mime = ""
     if mime not in ALLOWED_CONTENT_TYPES:
         logger.warning(
             "media rejected — unresolved/disallowed content type | resp=%s hint=%s",

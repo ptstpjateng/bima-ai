@@ -459,10 +459,77 @@ class TestHandleInboundDocuments(unittest.TestCase):
         # Document is stored for later scoring.
         self.assertEqual(len(gs._sessions[sess.user_id].documents), 1)
 
+    def test_collecting_docs_running_count_no_score(self):
+        # FIX D: at COLLECTING_DOCS, a document arriving is acknowledged with a
+        # running TOTAL count and is NOT scored (scoring waits for SELESAI).
+        sess = _make_session(gs.Stage.COLLECTING_DOCS)
+        _run(gs._put_session(sess))
+        score_mock = AsyncMock(return_value=_suitability_result(91))
+        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
+            with patch("services.citizen_scorer.score_session_documents", score_mock):
+                r1 = _run(gs.handle_inbound_documents(
+                    sess.user_id, [gs.SessionDocument("doc-1", "ktp", "ktp.jpg",
+                                                       "image/jpeg", b"x")]))
+                r2 = _run(gs.handle_inbound_documents(
+                    sess.user_id, [gs.SessionDocument("doc-2", "nib", "nib.pdf",
+                                                       "application/pdf", b"%PDF")]))
+        self.assertIn("1 total", r1)
+        self.assertIn("2 total", r2)
+        self.assertIn("SELESAI", r1)
+        # Never scored on upload; session still at COLLECTING_DOCS.
+        score_mock.assert_not_awaited()
+        self.assertEqual(gs._sessions[sess.user_id].stage, gs.Stage.COLLECTING_DOCS)
+        self.assertEqual(len(gs._sessions[sess.user_id].documents), 2)
+
+    def test_confirming_start_upload_acknowledged_early(self):
+        # A document sent during the readiness gate (CONFIRMING_START) is stored
+        # and acknowledged early — not scored, not dropped.
+        sess = _make_session(gs.Stage.CONFIRMING_START)
+        _run(gs._put_session(sess))
+        doc = gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")
+        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
+            reply = _run(gs.handle_inbound_documents(sess.user_id, [doc]))
+        self.assertIn("Dokumen diterima", reply)
+        self.assertEqual(len(gs._sessions[sess.user_id].documents), 1)
+
     def test_none_when_no_active_session(self):
         with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
             doc = gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")
             self.assertIsNone(_run(gs.handle_inbound_documents("wa-nobody", [doc])))
+
+
+class TestAskForDocuments(unittest.TestCase):
+    """FIX D: the field→docs transition asks for files (live path) but
+    auto-loads + scores the curated demo packet when one is configured."""
+
+    def setUp(self):
+        gs._sessions.clear()
+
+    def test_live_path_asks_for_documents(self):
+        sess = _make_session(gs.Stage.COLLECTING_FIELDS)
+        _run(gs._put_session(sess))
+        with patch.dict(os.environ, {"GUIDED_SUBMISSION_DEMO_PACKET": ""}, clear=False):
+            reply = _run(gs._ask_for_documents(sess))
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+        self.assertIn("kirim dokumen", reply.lower())
+        self.assertIn("SELESAI", reply)
+        self.assertEqual(len(sess.documents), 0)
+
+    def test_demo_packet_autoloads_and_scores(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "ktp.jpg").write_bytes(b"\xff\xd8\xff fake")
+            sess = _make_session(gs.Stage.COLLECTING_FIELDS)
+            _run(gs._put_session(sess))
+            fake = _suitability_result(percent=90)
+            env = {"GUIDED_SUBMISSION_DEMO_PACKET": d}
+            with patch.dict(os.environ, env, clear=False):
+                with patch("services.citizen_scorer.score_session_documents",
+                           new=AsyncMock(return_value=fake)):
+                    reply = _run(gs._ask_for_documents(sess))
+        # Rehearsal path: packet auto-loaded → scored → REVIEW.
+        self.assertEqual(sess.stage, gs.Stage.REVIEW)
+        self.assertIn("90%", reply)
+        self.assertIn("Jenis izin", reply)
 
 
 if __name__ == "__main__":

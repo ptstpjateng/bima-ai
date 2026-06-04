@@ -159,7 +159,7 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
                 recipient_phone=msisdn,
                 body=(
                     "Maaf, saya belum bisa membaca lampiran itu. Mohon kirim "
-                    "ulang sebagai *foto* (JPG/PNG) atau *PDF*, ya. 🙏"
+                    "ulang sebagai *foto* (JPG/PNG) atau *PDF*, ya."
                 ),
             )
         # 200 so APTANA doesn't retry — it's a parser gap or unsupported
@@ -315,7 +315,7 @@ async def _process_inbound_media(msisdn: str, media, message_id: str | None = No
             recipient_phone=msisdn,
             body=(
                 "Untuk pemeriksaan dokumen, mohon kirim *foto* (JPG/PNG) atau "
-                "*PDF* berkas perizinan Anda, ya. 🙏"
+                "*PDF* berkas perizinan Anda, ya."
             ),
         )
         return
@@ -327,7 +327,7 @@ async def _process_inbound_media(msisdn: str, media, message_id: str | None = No
             body=(
                 "Saya menerima dokumen Anda, tetapi belum ada pengajuan izin "
                 "yang sedang berjalan. Mulai dulu dengan, mis. _\"saya mau "
-                "ajukan izin ...\"_, lalu kirim dokumennya. 🙏"
+                "ajukan izin ...\"_, lalu kirim dokumennya."
             ),
         )
         return
@@ -343,7 +343,7 @@ async def _process_inbound_media(msisdn: str, media, message_id: str | None = No
             body=(
                 "Maaf, dokumen Anda tidak dapat saya unduh atau formatnya belum "
                 "didukung (hanya JPG, PNG, atau PDF, maksimal 10 MB). Mohon "
-                "kirim ulang, ya. 🙏"
+                "kirim ulang, ya."
             ),
         )
         return
@@ -362,7 +362,7 @@ async def _process_inbound_media(msisdn: str, media, message_id: str | None = No
         # Session vanished between checks, or scoring degraded. Give a generic
         # acknowledgment rather than stranding the citizen.
         reply = (
-            "📎 Dokumen Anda sudah saya terima. Lanjutkan pengajuan Anda, ya. 🙏"
+            "Dokumen Anda sudah saya terima. Lanjutkan pengajuan Anda, ya."
         )
     delivered = await send_text(recipient_phone=msisdn, body=reply)
     if not delivered:
