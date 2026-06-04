@@ -591,6 +591,235 @@ class TestDocumentCollectionStep(_GuidedFlowBase):
             self.assertIn("SELESAI", r)
 
 
+# A SECOND, distinct licence the new-submission-intent restart resolves to, so
+# the MULAI BARU test can prove the session re-resolved a DIFFERENT licence.
+_OTHER_MATCH = {
+    "found": True,
+    "count": 1,
+    "matches": [{"license_id": 99, "name": "Izin PKPP",
+                 "sektor": "Perhubungan"}],
+}
+_OTHER_REQUIREMENTS = {
+    "found": True,
+    "license_id": 99,
+    "license_name": "Izin PKPP",
+    "requirements": ["KTP", "Surat kuasa"],
+    "sla_working_days": 7,
+    "retribution_fee": "Rp 0",
+}
+
+
+# ===========================================================================
+# FIX A — new-submission intent interception mid-form + MULAI BARU
+# ===========================================================================
+
+class TestMidFormNewIntentInterception(_GuidedFlowBase):
+    """A clear new-submission intent sent WHILE a form is active must be
+    intercepted (offer MULAI BARU) and NOT eaten as a field answer / SELESAI /
+    doc trigger. This is the exact incident: a half-finished form at
+    COLLECTING_FIELDS (applicant_name) + "saya mau ajukan izin PKPP"."""
+
+    def _to_collecting_name(self, uid):
+        """Drive intent → readiness gate → COLLECTING_FIELDS, parked on the
+        applicant_name question (no field collected yet)."""
+        _run(gs.maybe_handle(uid, "mau ajukan izin pemakaian tanah"))
+        _run(gs.maybe_handle(uid, "SIAP"))
+
+    def test_new_intent_not_recorded_as_name_offers_mulai_baru(self):
+        with patch("services.license_resolver.resolve_license_intent",
+                   new=AsyncMock(return_value=_ONE_MATCH)), \
+             patch("services.siap_tools.siap_get_requirements",
+                   new=AsyncMock(return_value=_REQUIREMENTS)):
+            uid = "wa-a1"
+            self._to_collecting_name(uid)
+            self.assertEqual(gs._sessions[uid].stage, gs.Stage.COLLECTING_FIELDS)
+
+            # The incident message — sent where the name answer is expected.
+            reply = _run(gs.maybe_handle(uid, "saya mau ajukan izin PKPP"))
+
+            # It was NOT recorded as the applicant_name field...
+            sess = gs._sessions[uid]
+            self.assertNotIn("applicant_name", sess.fields)
+            # ...the flow did NOT advance to NIK...
+            self.assertEqual(sess.stage, gs.Stage.COLLECTING_FIELDS)
+            self.assertNotIn("NIK", reply)
+            # ...and BIMA offered MULAI BARU, naming the in-progress licence.
+            self.assertIn("MULAI BARU", reply.upper())
+            self.assertIn("Izin Pemakaian Tanah", reply)
+            # The intent was stashed for the restart.
+            self.assertEqual(sess.pending_new_intent, "saya mau ajukan izin PKPP")
+
+    def test_intercept_also_fires_in_confirming_start(self):
+        with patch("services.license_resolver.resolve_license_intent",
+                   new=AsyncMock(return_value=_ONE_MATCH)), \
+             patch("services.siap_tools.siap_get_requirements",
+                   new=AsyncMock(return_value=_REQUIREMENTS)):
+            uid = "wa-a2"
+            _run(gs.maybe_handle(uid, "mau ajukan izin pemakaian tanah"))
+            self.assertEqual(gs._sessions[uid].stage, gs.Stage.CONFIRMING_START)
+            reply = _run(gs.maybe_handle(uid, "tolong ajukan izin lingkungan"))
+            self.assertIn("MULAI BARU", reply.upper())
+            self.assertEqual(gs._sessions[uid].stage, gs.Stage.CONFIRMING_START)
+
+    def test_normal_name_answer_is_recorded_and_advances(self):
+        # Conservative classifier: a normal full name is NOT a new-intent, so it
+        # IS recorded and the flow advances to NIK.
+        with patch("services.license_resolver.resolve_license_intent",
+                   new=AsyncMock(return_value=_ONE_MATCH)), \
+             patch("services.siap_tools.siap_get_requirements",
+                   new=AsyncMock(return_value=_REQUIREMENTS)):
+            uid = "wa-a3"
+            self._to_collecting_name(uid)
+            reply = _run(gs.maybe_handle(uid, "Budi Santoso"))
+            sess = gs._sessions[uid]
+            self.assertEqual(sess.fields.get("applicant_name"), "Budi Santoso")
+            self.assertIn("NIK", reply)
+            # No spurious pending intent left behind.
+            self.assertIsNone(sess.pending_new_intent)
+
+    def test_answering_after_intercept_clears_pending_and_proceeds(self):
+        # After the intercept offer, if the citizen answers the actual question
+        # (instead of MULAI BARU), proceed normally and clear the pending flag.
+        with patch("services.license_resolver.resolve_license_intent",
+                   new=AsyncMock(return_value=_ONE_MATCH)), \
+             patch("services.siap_tools.siap_get_requirements",
+                   new=AsyncMock(return_value=_REQUIREMENTS)):
+            uid = "wa-a4"
+            self._to_collecting_name(uid)
+            _run(gs.maybe_handle(uid, "saya mau ajukan izin PKPP"))   # intercepted
+            self.assertEqual(gs._sessions[uid].pending_new_intent,
+                             "saya mau ajukan izin PKPP")
+            reply = _run(gs.maybe_handle(uid, "Budi Santoso"))        # real answer
+            sess = gs._sessions[uid]
+            self.assertEqual(sess.fields.get("applicant_name"), "Budi Santoso")
+            self.assertIsNone(sess.pending_new_intent)
+            self.assertIn("NIK", reply)
+
+
+class TestMulaiBaru(_GuidedFlowBase):
+    """MULAI BARU clears the in-progress form and re-resolves the new licence
+    from the stashed intercepted intent; with no pending intent it just cancels
+    and asks for a licence name."""
+
+    def test_mulai_baru_restarts_with_stashed_new_licence(self):
+        # First resolver call returns Izin Pemakaian Tanah; the restart call
+        # (with the stashed "PKPP" text) returns Izin PKPP. side_effect lets us
+        # return different matches per call.
+        resolver = AsyncMock(side_effect=[_ONE_MATCH, _OTHER_MATCH])
+        reqs = AsyncMock(side_effect=[_REQUIREMENTS, _OTHER_REQUIREMENTS])
+        with patch("services.license_resolver.resolve_license_intent", resolver), \
+             patch("services.siap_tools.siap_get_requirements", reqs):
+            uid = "wa-a5"
+            # Start a Pemakaian-Tanah form, advance into field collection.
+            _run(gs.maybe_handle(uid, "mau ajukan izin pemakaian tanah"))
+            _run(gs.maybe_handle(uid, "SIAP"))
+            old_sess = gs._sessions[uid]
+            self.assertEqual(old_sess.license_id, 42)
+
+            # Mid-form new intent → intercepted + stashed.
+            _run(gs.maybe_handle(uid, "saya mau ajukan izin PKPP"))
+            self.assertEqual(gs._sessions[uid].pending_new_intent,
+                             "saya mau ajukan izin PKPP")
+
+            # MULAI BARU → old form gone, NEW licence resolved from the stash.
+            reply = _run(gs.maybe_handle(uid, "MULAI BARU"))
+            new_sess = gs._sessions[uid]
+            self.assertEqual(new_sess.license_id, 99)
+            self.assertEqual(new_sess.license_name, "Izin PKPP")
+            # Fresh session: previous applicant fields are gone.
+            self.assertEqual(new_sess.fields, {})
+            self.assertIsNone(new_sess.pending_new_intent)
+            self.assertIn("Izin PKPP", reply)
+            # The restart resolved from the stashed PKPP text, not the original.
+            resolver.assert_awaited_with("saya mau ajukan izin PKPP")
+
+    def test_mulai_baru_without_pending_cancels_and_asks_for_name(self):
+        with patch("services.license_resolver.resolve_license_intent",
+                   new=AsyncMock(return_value=_ONE_MATCH)), \
+             patch("services.siap_tools.siap_get_requirements",
+                   new=AsyncMock(return_value=_REQUIREMENTS)):
+            uid = "wa-a6"
+            _run(gs.maybe_handle(uid, "mau ajukan izin pemakaian tanah"))
+            _run(gs.maybe_handle(uid, "SIAP"))
+            # No new-intent stashed → MULAI BARU behaves like BATAL + re-prompt.
+            reply = _run(gs.maybe_handle(uid, "MULAI BARU"))
+            self.assertFalse(_run(gs.has_active_session(uid)))
+            self.assertIn("nama izin", reply.lower())
+
+
+class TestApplicantNameIntentGuard(unittest.TestCase):
+    """FIX A defense-in-depth: _v_name rejects a value that reads as a
+    new-submission intent (so an intent phrase can never be stored as a name),
+    while accepting ordinary names."""
+
+    def test_rejects_ajukan_izin_value(self):
+        for bad in (
+            "saya mau ajukan izin PKPP",
+            "ajukan izin lingkungan",
+            "tolong ajukan izin pemakaian tanah",
+        ):
+            ok, msg = gs._v_name(bad)
+            self.assertFalse(ok, f"should reject: {bad!r}")
+            self.assertIn("nama lengkap sesuai KTP", msg)
+
+    def test_accepts_ordinary_names(self):
+        for good in ("Budi Santoso", "Sri Wahyuni", "Andi"):
+            ok, cleaned = gs._v_name(good)
+            self.assertTrue(ok, f"should accept: {good!r}")
+            self.assertEqual(cleaned, good)
+
+
+class TestFieldCollectedLogHasNoPII(_GuidedFlowBase):
+    """FIX B: the 'Guided-submission field collected' log line must NOT carry
+    the field VALUE — only the field name + a length indicator. Asserted two
+    ways: (1) the captured log text never contains the value; (2) the logging
+    call's format string has no `value=%s` placeholder."""
+
+    def test_collected_log_omits_value(self):
+        import io
+        import logging
+
+        log = logging.getLogger("bima_ai.guided_submission")
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.INFO)
+        log.addHandler(handler)
+        old_level = log.level
+        log.setLevel(logging.INFO)
+        try:
+            with patch("services.license_resolver.resolve_license_intent",
+                       new=AsyncMock(return_value=_ONE_MATCH)), \
+                 patch("services.siap_tools.siap_get_requirements",
+                       new=AsyncMock(return_value=_REQUIREMENTS)):
+                uid = "wa-a7"
+                _run(gs.maybe_handle(uid, "mau ajukan izin pemakaian tanah"))
+                _run(gs.maybe_handle(uid, "SIAP"))
+                # Distinctive name + NIK we can grep for in the log buffer.
+                _run(gs.maybe_handle(uid, "Zulfikar Rahmananto"))
+                _run(gs.maybe_handle(uid, "3374019988776655"))
+        finally:
+            log.removeHandler(handler)
+            log.setLevel(old_level)
+
+        contents = buf.getvalue()
+        # The field-collected line was emitted...
+        self.assertIn("Guided-submission field collected", contents)
+        self.assertIn("field=applicant_name", contents)
+        self.assertIn("field=nik", contents)
+        # ...but NEITHER the applicant name NOR the NIK value appears anywhere.
+        self.assertNotIn("Zulfikar Rahmananto", contents)
+        self.assertNotIn("3374019988776655", contents)
+        # The non-PII length indicator is present instead of the value.
+        self.assertIn("value_len=", contents)
+
+    def test_log_format_string_has_no_value_placeholder(self):
+        # Static guard: the source format string must not interpolate a value.
+        src = Path(gs.__file__).read_text(encoding="utf-8")
+        self.assertIn("Guided-submission field collected", src)
+        # The old leaky format had "value=%s"; assert it is gone.
+        self.assertNotIn("field collected | user=%s | field=%s | value=%s", src)
+
+
 class TestNoEmojiInGuidedMessages(_GuidedFlowBase):
     """FIX B — the key citizen-facing guided/scoring messages carry no emoji."""
 
