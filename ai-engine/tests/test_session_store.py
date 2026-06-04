@@ -220,7 +220,7 @@ class TestSubmissionSessionSerialization(unittest.TestCase):
         from services import guided_submission as gs
 
         sess = gs.SubmissionSession(user_id="wa-628999")
-        sess.stage = gs.Stage.REVIEW
+        sess.stage = gs.Stage.CONFIRM
         sess.license_id = 358
         sess.license_name = "Izin Penelitian"
         sess.fields = {"applicant_name": "Budi", "nik": "3374012345678901"}
@@ -238,7 +238,7 @@ class TestSubmissionSessionSerialization(unittest.TestCase):
         restored = gs._decode_session(blob)
 
         self.assertEqual(restored.user_id, "wa-628999")
-        self.assertEqual(restored.stage, gs.Stage.REVIEW)
+        self.assertEqual(restored.stage, gs.Stage.CONFIRM)
         self.assertEqual(restored.license_id, 358)
         self.assertEqual(restored.fields["nik"], "3374012345678901")
         self.assertEqual(len(restored.documents), 1)
@@ -258,6 +258,25 @@ class TestSubmissionSessionSerialization(unittest.TestCase):
         prefix = gs._score_reminder_prefix(sess)
         self.assertIn("88%", prefix)
         self.assertIn("siap dikirim", prefix)
+
+    def test_legacy_stage_blob_rehydrates_onto_new_stages(self):
+        # A durable blob written by the PRE-redesign code carries old stage
+        # values. Decoding must map them onto the closest new stage so a restart
+        # across the deploy doesn't crash or strand a citizen.
+        import json
+        from services import guided_submission as gs
+
+        def _decode_stage(stage_value):
+            blob = json.dumps({"user_id": "wa-1", "stage": stage_value})
+            return gs._decode_session(blob).stage
+
+        self.assertEqual(_decode_stage("review"), gs.Stage.CONFIRM)
+        self.assertEqual(_decode_stage("collecting_fields"), gs.Stage.COLLECTING_DOCS)
+        self.assertEqual(_decode_stage("confirming_start"), gs.Stage.COLLECTING_DOCS)
+        # A genuinely unknown value degrades to the safe start stage.
+        self.assertEqual(_decode_stage("something_unknown"), gs.Stage.RESOLVING_LICENSE)
+        # A current value round-trips unchanged.
+        self.assertEqual(_decode_stage("confirm"), gs.Stage.CONFIRM)
 
 
 class TestOfficerSessionSerialization(unittest.TestCase):

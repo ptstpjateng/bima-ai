@@ -1,82 +1,99 @@
 """
-Guided submission flow — BIMA walks a citizen through filing a real SIAP
-licence application end to end ([[BIMA Vision]] req #4, Wave 3).
-
-Waves 1+2 gave BIMA a SIAP read layer (catalogue, requirements, status), a
-validator, and an officer write seam. Wave 3 ties them into ONE continuous
-citizen experience: a UMKM owner says "saya mau ajukan izin ..." and BIMA
-conversationally collects the application fields over many WhatsApp turns,
-validates the submission, and — on a clean validation — files the request in
-SIAP, handing back a ticket + a portal tracking link.
+Guided submission — BIMA walks a citizen through filing a real SIAP licence
+application end to end, conversationally, like a human assistant.
 
 ────────────────────────────────────────────────────────────────────────────
-WHERE THIS PLUGS IN
+THE REDESIGN (2026-06) — warm, document-first, no rigid keywords
 ────────────────────────────────────────────────────────────────────────────
-`ai_handler.generate_ai_response` (and its streaming twin) call
-`maybe_handle()` as an early FAST-PATH, right after the SIAP ticket
-fast-path and before intent classification. `maybe_handle()` returns:
-  * a reply string  → the message belonged to a guided-submission session
-                       (or started one); ai_handler returns it directly.
-  * None            → not a submission message; ai_handler proceeds as before.
+The previous flow gated every step on an exact keyword the citizen had to type
+(SIAP to start, then a 4-question applicant Q&A, then SELESAI to score, then YA
+to submit, BATAL to cancel). The product owner wants BIMA to feel like a human
+clerk: warm Bahasa Indonesia, intent understood (never "Ketik X"), and the
+applicant fields READ FROM the uploaded documents rather than asked one by one.
 
-The whole flow is deterministic Python + the SIAP tool layer + the validator
-— it makes NO Gemma generation call. That keeps form-filling fast (<1 s/turn
-when SIAP is reachable) and hallucination-free.
+The new shape is three stages:
 
-────────────────────────────────────────────────────────────────────────────
-STATE — multi-turn, per-user, survives across messages
-────────────────────────────────────────────────────────────────────────────
-A citizen fills a form across many separate WhatsApp messages. `ai_handler`'s
-existing `_history` keeps only the last 2 turns — far too short. So this
-module owns its OWN per-user state: a `SubmissionSession` dataclass in a
-bounded in-memory LRU (`_sessions`). Each session is a small state machine:
+  RESOLVING_LICENSE — the citizen names a licence; the LLM resolver
+                      (`license_resolver.resolve_license_intent`) maps it
+                      against the whole SIAP catalogue. On a single match BIMA
+                      warmly lists the requirements and invites an upload right
+                      away — NO readiness gate, NO field questions.
 
-  RESOLVING_LICENSE  — citizen named a licence; we matched (or need to
-                       disambiguate) it against SIAP's catalogue.
-  COLLECTING_FIELDS  — walking the citizen item by item through the required
-                       applicant fields, one question per turn.
-  REVIEW             — all fields collected; showing a summary, awaiting the
-                       citizen's "ya" to validate + submit.
-  DONE / FAILED      — terminal; the session is cleared.
+  COLLECTING_DOCS   — the citizen sends photos/PDFs. WhatsApp delivers each
+                      media item as a SEPARATE webhook, so BIMA attaches each
+                      file SILENTLY (no per-file "received N" reply) and runs a
+                      per-session DEBOUNCE: once uploads settle (~8 s with no
+                      new file) it does ONE consolidated pass — score + extract
+                      the applicant fields from the docs — and sends ONE warm
+                      reply with the completeness, score, the data it read back
+                      (NIK masked), and a natural confirmation question.
 
-In-memory state is acceptable for this slice (same call as `ai_handler`'s
-`_history` and the rate limiter). A process restart drops in-flight forms;
-a durable store (Redis / a DB table) is a documented follow-up.
+  CONFIRM           — the citizen replies in natural language. A small LLM
+                      intent classifier (`submission_intent.classify_confirm_intent`)
+                      maps it to AFFIRM (submit), DECLINE (hold/cancel),
+                      CORRECT (fix a field → re-show), or QUESTION (answer →
+                      re-ask). No "YA" keyword required; the literal "batal"
+                      still cancels as a strong decline.
 
-────────────────────────────────────────────────────────────────────────────
-DOCUMENTS — deliberate scope decision
-────────────────────────────────────────────────────────────────────────────
-The validator needs the citizen's documents (KTP/NIB/NPWP). Receiving
-document IMAGES over WhatsApp (APTANA media webhook → download → decode) is
-a sizeable integration on its own. To keep this slice solid rather than
-over-stretched, document intake runs through the validator's existing
-DEMO-FIXTURE path (`ai-engine/tests/fixtures/*.json`, also used by the
-bima-admin case page). That exercises the real validate → branch → submit
-logic end to end with no PII and no Gemini-Vision quota burn.
-
-Real document-upload-over-WhatsApp is DEFERRED and reported as a follow-up
-slice. When it lands, only `_run_validation()` changes — it will build real
-`Document` objects from the citizen's uploaded media and call
-`services.agents.validator.validate_submission` directly. The state machine,
-the field collection, and the submit step do not change.
+  DONE / FAILED     — terminal; the session is cleared.
 
 ────────────────────────────────────────────────────────────────────────────
-FEATURE FLAG
+THE DEBOUNCE (the key fix) + OUT-OF-BAND SEND
 ────────────────────────────────────────────────────────────────────────────
-`BIMA_GUIDED_SUBMISSION_ENABLED` (default "false"). While off, `maybe_handle`
-always returns None — ai_handler behaves exactly as before. This makes the
-PR safe to merge before the SIAP submission token is provisioned and the
-flow is verified on Beta-SIAP.
+`routers/aptana.py:_process_inbound_media` runs in a BackgroundTask per media
+webhook and calls `handle_inbound_documents`. A burst of N files would, in the
+old code, produce N "Dokumen diterima (k total)" replies. Now:
+
+  * each file is attached SILENTLY (handle_inbound_documents returns None at
+    COLLECTING_DOCS), `sess.last_doc_at` is stamped + persisted, and
+  * a SINGLE debounce task is ensured per session (guarded by the module-level
+    `_debounce_tasks` set so 7 files spawn 1 task, not 7).
+
+The debounce task loops { sleep(DEBOUNCE_SECONDS); reload; break when settled },
+then runs the consolidated processing and SENDS the reply DIRECTLY via the
+channel sender (`_send_to_user`, picked by the `wa-`/`tg-` user_id prefix) —
+because it runs out-of-band, not as a router return value.
+
+Restart tolerance: if the process dies mid-debounce the task is lost, but the
+documents are still attached in the durable session — a later upload re-arms the
+debounce, and a later text at COLLECTING_DOCS also triggers the consolidated
+pass. Nothing is stranded.
 
 ────────────────────────────────────────────────────────────────────────────
-PII
+FIELDS — extracted from the documents, not asked
 ────────────────────────────────────────────────────────────────────────────
-NIK and phone are masked in every log line (`_mask`). Full values live only
-in the in-memory session and the SIAP request body.
+In the consolidated pass we extract:
+  * name + NIK from the KTP (Gemini Vision via `gemini_vision.extract_ktp_fields`),
+  * business name from the NIB / SIUP when present, else the person's name,
+  * phone = the citizen's OWN WhatsApp msisdn (from user_id 'wa-{msisdn}') —
+    never asked.
+A REQUIRED field that can't be read (no KTP / unreadable) is asked for
+naturally, without restarting the flow.
+
+────────────────────────────────────────────────────────────────────────────
+PRESERVED INVARIANTS
+────────────────────────────────────────────────────────────────────────────
+* Durable Redis sessions (services/session_store.py) — write-through, the
+  (encode, decode) pair lives here. `last_doc_at` and `fields` are persisted;
+  document bytes go base64 inside the JSON; the rich `last_score["result"]`
+  dataclass is dropped on encode (re-scored on demand).
+* Officer notify on submit (`officer_bridge.notify_officer_of_submission`) with
+  the score + documents — fire-and-forget, never blocks the success reply.
+* PII masking (`services.pii.mask_pii`) on every NIK shown / forwarded / logged;
+  `_mask` for user_id / NIK in log lines.
+* The LLM licence resolver.
+* Graceful fallbacks everywhere (Vision down → ask for the field; LLM intent
+  down → keyword yes/no; SIAP down → friendly "belum terkirim"). NEVER raises
+  into the chat path.
+* No emoji in any citizen-facing string.
+
+FEATURE FLAG: `BIMA_GUIDED_SUBMISSION_ENABLED` (default "false"). Off → every
+public entrypoint returns None / no-ops; ai_handler behaves as before.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -93,6 +110,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from services import session_store
+from services.pii import mask_pii
 
 load_dotenv()
 
@@ -102,10 +120,26 @@ _PORTAL_TRACK_URL = "https://portal.nolongin.com/track/{ticket}"
 
 # The demo-slice license: "Surat Keterangan Penelitian" (Izin Penelitian) on
 # Beta-SIAP. Used as the default license_id for content-scoring when the
-# resolved session has no license_id yet (shouldn't happen in the normal
-# flow, but the scorer needs a registry key). Overridable via env so the
-# same code can score any license in a later slice.
+# resolved session has no license_id yet (shouldn't happen in the normal flow,
+# but the scorer needs a registry key). Overridable via env.
 _DEMO_LICENSE_ID = int(os.getenv("GUIDED_SUBMISSION_DEMO_LICENSE_ID", "358"))
+
+# How long (seconds) a burst of uploads must be quiet before BIMA processes the
+# whole set as ONE reply. WhatsApp delivers media as separate webhooks that can
+# arrive several seconds apart, so this needs to be generous enough to gather a
+# realistic multi-file send. Read at call time so ops/tests can tune it.
+_DEFAULT_DEBOUNCE_SECONDS = 8.0
+
+
+def _debounce_seconds() -> float:
+    raw = os.getenv("GUIDED_SUBMISSION_DEBOUNCE_SECONDS", "").strip()
+    try:
+        val = float(raw) if raw else _DEFAULT_DEBOUNCE_SECONDS
+    except ValueError:
+        val = _DEFAULT_DEBOUNCE_SECONDS
+    # Clamp to a sane band; a 0 would defeat the debounce, a huge value would
+    # strand the citizen waiting.
+    return max(0.5, min(val, 120.0))
 
 
 # ===========================================================================
@@ -120,16 +154,14 @@ def is_enabled() -> bool:
 
 
 # ===========================================================================
-# Submission-intent detection
+# Submission-intent detection — "I want to file a licence application".
+#
+# Used at the NO-active-session boundary to decide whether to START a flow, and
+# mid-form to intercept a clear "saya mau ajukan izin ..." so it isn't eaten as
+# a correction. Intentionally conservative — a false negative just routes to the
+# normal chat path; a false positive hijacks a message into the form.
 # ===========================================================================
 
-# A citizen starting a filing. Indonesian: "saya mau ajukan/mengajukan/
-# daftar/mendaftar izin ...". English: "I want to apply for ...". Word-bounded
-# verbs so "pendaftaran" alone (a noun) does not trip it; the verb must pair
-# with a licensing object word (izin / perizinan / permohonan / permit /
-# license / NIB). The classifier is intentionally conservative — a false
-# negative just routes to the normal chat path; a false positive hijacks a
-# message into the form, which is worse.
 _SUBMISSION_INTENT_PATTERN = re.compile(
     r"\b("
     r"(?:mau|ingin|pengen|hendak|akan|tolong|bantu|bisa)\s+"
@@ -144,8 +176,6 @@ _SUBMISSION_INTENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# The message must ALSO mention a licensing object — guards against
-# "saya mau daftar antrean" (queue) etc.
 _LICENSING_OBJECT_PATTERN = re.compile(
     r"\b(izin|perizinan|permohonan|permit|licen[cs]e|lisensi|nib|"
     r"sertifikat\s+standar|sertifikat)\b",
@@ -156,8 +186,8 @@ _LICENSING_OBJECT_PATTERN = re.compile(
 def detect_submission_intent(message: str) -> bool:
     """True when the message reads as 'I want to file a licence application'.
 
-    Requires BOTH a filing verb-phrase AND a licensing-object noun, so that a
-    bare "saya mau daftar" or "apa itu izin usaha" does not start a flow.
+    Requires BOTH a filing verb-phrase AND a licensing-object noun, so a bare
+    "saya mau daftar" or "apa itu izin usaha" does not start a flow.
     """
     if not message or not message.strip():
         return False
@@ -167,140 +197,62 @@ def detect_submission_intent(message: str) -> bool:
     )
 
 
-# Cancel words — let a citizen abandon an in-flight form at any step.
-_CANCEL_PATTERN = re.compile(
-    r"^\s*(batal|batalkan|cancel|stop|berhenti|ga jadi|gak jadi|tidak jadi|"
-    r"keluar)\s*$",
-    re.IGNORECASE,
-)
-
-# Affirmation words — the citizen's "yes, submit it" at the REVIEW step.
-_AFFIRM_PATTERN = re.compile(
-    r"^\s*(ya|iya|ya|yes|y|ok|oke|okay|setuju|lanjut(?:kan)?|benar|betul|"
-    r"kirim|submit|gas|jalankan|boleh)\s*$",
-    re.IGNORECASE,
-)
-
-# Readiness affirmation — the citizen's "yes, guide me" at the CONFIRMING_START
-# step (after the requirements were shown, before field collection begins).
-# Broader than _AFFIRM_PATTERN: includes the explicit "SIAP" / "SIAP DIPANDU"
-# / "MULAI" / "MULAI SEKARANG" wording the readiness prompt asks for.
-_AFFIRM_START_PATTERN = re.compile(
-    r"^\s*(siap(?:\s+dipandu)?|mulai(?:\s+sekarang)?|ya|iya|yes|y|ok|oke|okay|"
-    r"lanjut(?:kan)?|setuju|gas|ayo|boleh)\s*$",
-    re.IGNORECASE,
-)
-
-# "I'm done sending documents" — the citizen's signal at COLLECTING_DOCS that
-# all requirement files have been sent and BIMA should score them now.
-_DONE_PATTERN = re.compile(
-    r"^\s*(selesai|sudah|udah|done|finish(?:ed)?|cukup|lengkap)\s*$",
-    re.IGNORECASE,
-)
-
-# "Restart with a new submission" — the citizen's confirmation, after BIMA has
-# intercepted a mid-form new-submission intent, that they DO want to abandon the
-# current form and start the new licence. Also a manual escape hatch. Anchored
-# so a field answer (a name, "SIAP", "SELESAI") can never match it.
-_RESTART_PATTERN = re.compile(
-    r"^\s*(mulai baru|mulai ulang|ganti(?:\s+pengajuan)?|"
-    r"batalkan dan mulai(?:\s+baru)?|ajukan(?:\s+yang)?\s+baru|"
-    r"pengajuan baru)\s*$",
-    re.IGNORECASE,
-)
+# A numeric pick from a disambiguation shortlist ("2").
+_NUMERIC_PICK_RE = re.compile(r"^\s*(\d{1,2})\s*$")
 
 
 # ===========================================================================
-# Field collection — the applicant profile fields we walk the citizen through.
+# Applicant fields — now EXTRACTED from documents, not asked via Q&A.
 #
-# These are the citizen-supplied profile fields a SIAP licence-request needs.
-# We deliberately collect the APPLICANT profile here, not the licence's full
-# document checklist — documents are validated separately (see module
-# docstring on the deferred WhatsApp document-upload slice).
+# The keys are unchanged from the old per-field flow so the review summary,
+# the SIAP description, the Redis encode/decode, and the officer brief all keep
+# working. What changed is HOW they get populated: from the KTP / NIB / msisdn.
 # ===========================================================================
 
-@dataclass(frozen=True)
-class FieldSpec:
-    key: str
-    question: str               # Indonesian prompt shown to the citizen
-    validate: Any               # callable(str) -> (ok: bool, cleaned_or_error)
-    is_pii: bool = False        # mask in logs / review summary
+_FIELD_KEYS = ("applicant_name", "nik", "business_name", "phone")
+
+_FIELD_LABEL = {
+    "applicant_name": "Nama",
+    "nik": "NIK",
+    "business_name": "Nama usaha",
+    "phone": "No. WhatsApp",
+}
 
 
-def _v_name(raw: str) -> tuple[bool, str]:
-    s = re.sub(r"\s+", " ", (raw or "")).strip()
-    if len(s) < 3:
-        return False, "Nama terlalu pendek. Mohon tulis nama lengkap sesuai KTP."
-    if not re.search(r"[A-Za-z]", s):
-        return False, "Nama tidak valid. Mohon tulis nama lengkap sesuai KTP."
-    # Defense in depth (FIX A): a new-submission intent ("saya mau ajukan izin
-    # …") must never be silently stored AS the applicant's name. maybe_handle
-    # intercepts these before field collection, but if one slips through, reject
-    # it here and re-ask rather than recording the intent phrase as a person.
-    if _SUBMISSION_INTENT_PATTERN.search(s) or re.search(
-        r"ajukan\s+izin", s, re.IGNORECASE
-    ):
-        return False, "Mohon ketik nama lengkap sesuai KTP."
-    return True, s
-
-
-def _v_nik(raw: str) -> tuple[bool, str]:
+def _v_nik(raw: str) -> Optional[str]:
+    """Return the 16-digit NIK from free text, or None if not exactly 16."""
     digits = re.sub(r"\D", "", raw or "")
-    if len(digits) != 16:
-        return False, (
-            "NIK harus 16 digit angka (sesuai KTP). Mohon kirim ulang NIK Anda."
-        )
-    return True, digits
+    return digits if len(digits) == 16 else None
 
 
-def _v_business_name(raw: str) -> tuple[bool, str]:
+def _v_name(raw: str) -> Optional[str]:
+    """Clean a name; reject too-short / no-letter / intent-phrase values."""
     s = re.sub(r"\s+", " ", (raw or "")).strip()
-    if len(s) < 2:
-        return False, "Nama usaha terlalu pendek. Mohon tulis nama usaha Anda."
-    return True, s
+    if len(s) < 3 or not re.search(r"[A-Za-z]", s):
+        return None
+    # Defence in depth: a new-submission intent must never be stored as a name.
+    if _SUBMISSION_INTENT_PATTERN.search(s) or re.search(r"ajukan\s+izin", s, re.IGNORECASE):
+        return None
+    return s
 
 
-def _v_phone(raw: str) -> tuple[bool, str]:
-    digits = re.sub(r"\D", "", raw or "")
-    # Indonesian mobile: 10-15 digits after stripping; tolerate 0/62 prefixes.
-    if not (9 <= len(digits) <= 15):
-        return False, (
-            "Nomor HP tidak valid. Mohon kirim nomor WhatsApp aktif "
-            "(contoh: 081234567890)."
-        )
-    return True, digits
+def _v_business_name(raw: str) -> Optional[str]:
+    s = re.sub(r"\s+", " ", (raw or "")).strip()
+    return s if len(s) >= 2 else None
 
 
-# Order matters — this IS the question sequence the citizen walks through.
-_FIELD_SPECS: list[FieldSpec] = [
-    FieldSpec(
-        key="applicant_name",
-        question="Siapa nama lengkap pemohon (sesuai KTP)?",
-        validate=_v_name,
-    ),
-    FieldSpec(
-        key="nik",
-        question="Berapa NIK (16 digit) pemohon? Mohon ketik nomornya.",
-        validate=_v_nik,
-        is_pii=True,
-    ),
-    FieldSpec(
-        key="business_name",
-        question="Apa nama usaha / badan usaha Anda?",
-        validate=_v_business_name,
-    ),
-    FieldSpec(
-        key="phone",
-        question=(
-            "Nomor WhatsApp aktif untuk pemberitahuan status "
-            "(contoh: 081234567890)?"
-        ),
-        validate=_v_phone,
-        is_pii=True,
-    ),
-]
+def _msisdn_from_user_id(user_id: str) -> Optional[str]:
+    """Extract the citizen's own phone from a 'wa-{msisdn}' user_id.
 
-_FIELD_BY_KEY: dict[str, FieldSpec] = {f.key: f for f in _FIELD_SPECS}
+    Returns the digits, or None for non-WhatsApp channels (e.g. 'tg-123', or a
+    bare web-chat session id) where there is no phone to infer.
+    """
+    if not user_id:
+        return None
+    if user_id.startswith("wa-"):
+        digits = re.sub(r"\D", "", user_id[3:])
+        return digits or None
+    return None
 
 
 # ===========================================================================
@@ -309,19 +261,14 @@ _FIELD_BY_KEY: dict[str, FieldSpec] = {f.key: f for f in _FIELD_SPECS}
 
 class Stage(str, Enum):
     RESOLVING_LICENSE = "resolving_license"
-    # CONFIRMING_START: the licence is locked and its requirements have been
-    # shown; before walking the citizen through the form we ask for an explicit
-    # "SIAP" (ready) so they can read the requirements first. An affirmative
-    # advances to COLLECTING_FIELDS; BATAL cancels.
-    CONFIRMING_START = "confirming_start"
-    COLLECTING_FIELDS = "collecting_fields"
-    # COLLECTING_DOCS: applicant fields are done; we are EXPLICITLY waiting for
-    # the citizen to send their document images/PDFs (they type SELESAI when
-    # finished) so BIMA can CONTENT-score them before review. As a fallback for
-    # a transport that hasn't wired media (or the curated demo packet), the flow
-    # can still fall through to the demo-fixture validation path.
+    # COLLECTING_DOCS: the licence is locked and its requirements shown; BIMA is
+    # gathering the citizen's uploaded files. Uploads attach SILENTLY and a
+    # per-session debounce produces ONE consolidated reply once they settle.
     COLLECTING_DOCS = "collecting_docs"
-    REVIEW = "review"
+    # CONFIRM: BIMA has scored the docs, extracted the applicant fields, and
+    # shown the summary + confirmation question. The next message is classified
+    # by intent (AFFIRM/DECLINE/CORRECT/QUESTION) — no rigid keyword.
+    CONFIRM = "confirm"
     DONE = "done"
     FAILED = "failed"
 
@@ -329,11 +276,11 @@ class Stage(str, Enum):
 @dataclass
 class SessionDocument:
     """One document the citizen sent in-session, held in memory for live
-    content-scoring + officer doc-Q&A. Bytes never touch disk and are never
+    content-scoring + field extraction. Bytes never touch disk and are never
     logged."""
 
-    file_id: str            # opaque per-session id (e.g. "doc-1")
-    claimed_type: str       # what the citizen / packet labelled it
+    file_id: str
+    claimed_type: str
     filename: str
     mime_type: str
     content: bytes
@@ -350,68 +297,53 @@ class SubmissionSession:
     requirements: list[str] = field(default_factory=list)
     sla_working_days: Optional[int] = None
     retribution_fee: Optional[str] = None
-    # license candidates when the lookup is ambiguous (citizen must pick).
     candidates: list[dict[str, Any]] = field(default_factory=list)
-    # collected applicant fields: key -> cleaned value.
+    # collected applicant fields: key -> value (EXTRACTED from docs / msisdn).
     fields: dict[str, str] = field(default_factory=dict)
-    # documents the citizen sent in-session (bytes held in memory only) — the
-    # input to live content-scoring and to the officer's doc-Q&A.
+    # documents the citizen sent in-session (bytes in memory only).
     documents: list[SessionDocument] = field(default_factory=list)
-    # the last content-scoring result (kept so a 'KIRIM' retry and the officer
-    # brief can reuse it without re-running Gemini Vision).
+    # the last content-scoring result (so a re-confirm + officer brief reuse it).
     last_score: Optional[dict[str, Any]] = None
-    # True once the citizen has been shown the "send as-is" override prompt for
-    # a sub-threshold packet. The NEXT KIRIM/YA then force-submits past the
-    # ok-gate (otherwise KIRIM loops forever — a flawed packet could never be
-    # filed). Reset implicitly per session.
+    # True once a sub-threshold "ajukan apa adanya?" override has been offered,
+    # so the NEXT AFFIRM force-submits past the ok-gate (no submit dead-end).
     override_offered: bool = False
-    # When a citizen sends a CLEAR new-submission intent mid-form (e.g. "saya mau
-    # ajukan izin PKPP" while still answering the name field), we do NOT eat it
-    # as a field answer. We stash the raw message here and offer MULAI BARU. A
-    # subsequent MULAI BARU clears the session and re-resolves from this text; a
-    # genuine field answer clears it (the citizen chose to continue). Not PII per
-    # se (it's a licence-intent phrase), but kept off logs to be safe.
+    # When a citizen sends a clear NEW-submission intent mid-form, we stash the
+    # raw text here and offer to switch; a later AFFIRM-to-switch re-resolves.
     pending_new_intent: Optional[str] = None
-    # the resulting SIAP ticket once submitted (for officer-brief wiring).
+    # unix ts of the most recent attached document — drives the upload debounce.
+    last_doc_at: float = 0.0
     ticket: Optional[str] = None
     request_id: Optional[int] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
-    def next_missing_field(self) -> Optional[FieldSpec]:
-        for spec in _FIELD_SPECS:
-            if spec.key not in self.fields:
-                return spec
-        return None
+    def missing_required_fields(self) -> list[str]:
+        """Required applicant fields not yet populated. business_name is NOT
+        required (it falls back to the person's name); phone comes from the
+        msisdn. So 'required' for asking-the-citizen purposes is name + NIK."""
+        required = ("applicant_name", "nik")
+        return [k for k in required if not self.fields.get(k)]
 
     def touch(self) -> None:
         self.updated_at = time.time()
 
 
-# Bounded LRU of in-flight sessions — same shape as ai_handler._history.
 _MAX_SESSIONS = 500
-# Stale-session TTL: a form abandoned for this long is dropped on next touch.
 _SESSION_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 _sessions: "OrderedDict[str, SubmissionSession]" = OrderedDict()
+
+# Module-level guard so a burst of N uploads spawns exactly ONE debounce task
+# per session, not N. Holds the user_ids that currently have a live debounce
+# task in flight. Mutated only from the event loop (single-threaded asyncio).
+_debounce_tasks: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
 # Redis serialization (durable sessions — services/session_store.py).
-#
-# The store is generic; this module supplies the (encode, decode) pair. The
-# session is JSON with two careful exclusions:
-#   * SessionDocument.content (raw bytes) → base64 string, decoded back to
-#     bytes on load. Bytes are NEVER logged (session_store logs only lengths).
-#   * last_score["result"] is a SuitabilityResult dataclass (not JSON-safe) →
-#     DROPPED on encode. The JSON-safe score fields (ok/status/score_percent/
-#     summary/message/issues) survive, so the score reminder + KIRIM retry +
-#     officer brief still work after a restart. A post-restart KIRIM that needs
-#     the rich `result` simply re-scores from the rehydrated document bytes.
 # ---------------------------------------------------------------------------
 
 def _score_for_redis(score: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    """Strip the non-JSON `result` dataclass from a last_score dict so it can
-    be persisted. Keeps every JSON-safe field. Returns None unchanged."""
+    """Strip the non-JSON `result` dataclass so the score dict can persist."""
     if not isinstance(score, dict):
         return None
     return {k: v for k, v in score.items() if k != "result"}
@@ -442,6 +374,7 @@ def _encode_session(sess: SubmissionSession) -> str:
         "last_score": _score_for_redis(sess.last_score),
         "override_offered": sess.override_offered,
         "pending_new_intent": sess.pending_new_intent,
+        "last_doc_at": sess.last_doc_at,
         "ticket": sess.ticket,
         "request_id": sess.request_id,
         "created_at": sess.created_at,
@@ -462,9 +395,13 @@ def _decode_session(blob: str) -> SubmissionSession:
         )
         for d in raw.get("documents") or []
     ]
+    # `stage` may be an OLD value from a pre-redesign blob (confirming_start /
+    # collecting_fields / review). Map any unknown legacy stage onto the closest
+    # new stage so a restart across the deploy doesn't strand a citizen.
+    stage = _coerce_stage(raw.get("stage"))
     return SubmissionSession(
         user_id=str(raw["user_id"]),
-        stage=Stage(raw.get("stage", Stage.RESOLVING_LICENSE.value)),
+        stage=stage,
         license_id=raw.get("license_id"),
         license_name=raw.get("license_name"),
         requirements=list(raw.get("requirements") or []),
@@ -476,6 +413,7 @@ def _decode_session(blob: str) -> SubmissionSession:
         last_score=raw.get("last_score"),
         override_offered=bool(raw.get("override_offered", False)),
         pending_new_intent=raw.get("pending_new_intent"),
+        last_doc_at=float(raw.get("last_doc_at", 0.0) or 0.0),
         ticket=raw.get("ticket"),
         request_id=raw.get("request_id"),
         created_at=float(raw.get("created_at", time.time())),
@@ -483,12 +421,30 @@ def _decode_session(blob: str) -> SubmissionSession:
     )
 
 
+# Legacy stage values that may appear in a durable blob written by the
+# pre-redesign code. We don't want a Stage(...) ValueError to strand the
+# citizen, so map them to the closest current stage.
+_LEGACY_STAGE_MAP = {
+    "confirming_start": Stage.COLLECTING_DOCS,
+    "collecting_fields": Stage.COLLECTING_DOCS,
+    "review": Stage.CONFIRM,
+}
+
+
+def _coerce_stage(value: Any) -> Stage:
+    s = str(value or Stage.RESOLVING_LICENSE.value)
+    if s in _LEGACY_STAGE_MAP:
+        return _LEGACY_STAGE_MAP[s]
+    try:
+        return Stage(s)
+    except ValueError:
+        return Stage.RESOLVING_LICENSE
+
+
 async def _get_session(user_id: str) -> Optional[SubmissionSession]:
-    """Read a session: in-memory first, then Redis (rehydrating in-memory on a
-    durable hit so a restarted process re-warms its LRU on first touch)."""
+    """Read a session: in-memory first, then Redis (rehydrating in-memory)."""
     sess = _sessions.get(user_id)
     if sess is None:
-        # In-memory miss — try the durable store (e.g. after a restart).
         sess = await session_store.load(
             session_store.submission_key(user_id), decode=_decode_session
         )
@@ -517,9 +473,6 @@ async def _put_session(sess: SubmissionSession) -> None:
         encode=_encode_session,
         ttl_seconds=_SESSION_TTL_SECONDS,
     )
-    # Durable sessions are supposed to be ON but the write didn't land — the
-    # in-memory copy is fine, but this session won't survive a restart. Make
-    # the missed durable write observable. Masked key only, never the payload.
     if not saved and session_store.is_enabled():
         logger.warning(
             "Guided-submission durable write missed (flag on) | key=%s",
@@ -529,6 +482,7 @@ async def _put_session(sess: SubmissionSession) -> None:
 
 async def _clear_session(user_id: str) -> None:
     _sessions.pop(user_id, None)
+    _debounce_tasks.discard(user_id)
     await session_store.delete(session_store.submission_key(user_id))
 
 
@@ -537,10 +491,8 @@ async def has_active_session(user_id: str) -> bool:
     sess = await _get_session(user_id)
     return sess is not None and sess.stage in (
         Stage.RESOLVING_LICENSE,
-        Stage.CONFIRMING_START,
-        Stage.COLLECTING_FIELDS,
         Stage.COLLECTING_DOCS,
-        Stage.REVIEW,
+        Stage.CONFIRM,
     )
 
 
@@ -555,40 +507,12 @@ def _mask(value: Optional[str]) -> str:
 
 
 # ===========================================================================
-# Validator integration
-#
-# This slice runs the validator through its DEMO-FIXTURE path (see module
-# docstring). The fixtures are the same canned ValidateResponse JSON the
-# bima-admin case page uses — they exercise the real validate → branch →
-# submit logic with no PII and no Gemini-Vision quota. When real
-# document-over-WhatsApp intake lands this function swaps to building
-# `Document` objects and calling `validator.validate_submission` directly;
-# nothing else in this module changes.
+# Demo packet + document intake
 # ===========================================================================
 
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
 
 
-# ===========================================================================
-# In-session document intake + LIVE content-scoring (the demo centerpiece).
-#
-# When the chat transport delivers the citizen's documents (real APTANA /
-# Telegram media download — DEFERRED, or the curated demo packet below), they
-# land on the session as `SessionDocument`s. `_run_content_score()` then runs
-# the suitability judge over the real bytes: completeness, type-correctness,
-# and per-requirement suitability via Gemini Vision. This is "3/7 + does-it-
-# comply", not a checkbox — and it runs on documents BIMA holds in memory.
-#
-# Provenance honesty: for the June-4 demo the bytes come from a CURATED
-# PACKET (a clean set + a deliberately-flawed set), NOT the 1,032 real Beta
-# citizen files (whose bytes are not on Beta's disk). The SCORING is 100%
-# real; only the document provenance is staged. See PR notes.
-# ===========================================================================
-
-# A directory of files to auto-attach as the citizen's "uploaded" documents
-# when the chat transport hasn't delivered real media. Each filename is the
-# claimed type: e.g. "surat_permohonan.pdf", "ktp.jpg", "proposal.pdf". Blank
-# → no packet (the flow falls back to the demo-fixture validation path).
 def _demo_packet_dir() -> Optional[Path]:
     raw = os.getenv("GUIDED_SUBMISSION_DEMO_PACKET", "").strip()
     if not raw:
@@ -597,7 +521,6 @@ def _demo_packet_dir() -> Optional[Path]:
     return p if p.is_dir() else None
 
 
-# Hard cap mirrors routers/validator.py so an oversized file can't blow memory.
 _MAX_DOC_BYTES = 8 * 1024 * 1024
 _MAX_DOCS = 10
 
@@ -605,9 +528,7 @@ _MAX_DOCS = 10
 def _claimed_type_from_filename(filename: str) -> str:
     """Derive a citizen-claimed doc label from a packet filename stem.
 
-    'surat_permohonan_materai.pdf' -> 'surat permohonan materai'. The
-    suitability judge canonicalises this to a DOC_CLASS; unknown labels stay
-    as free text and are still type-checked by Gemini.
+    'surat_permohonan_materai.pdf' -> 'surat permohonan materai'.
     """
     stem = Path(filename).stem
     return re.sub(r"[_\-]+", " ", stem).strip() or "dokumen"
@@ -619,51 +540,43 @@ async def handle_inbound_documents(
 ) -> Optional[str]:
     """Public seam for a real chat-transport media webhook (routers/aptana.py).
 
-    Attaches `docs` to the citizen's active guided-submission session and
-    returns a citizen-facing reply string:
-      * COLLECTING_DOCS — the explicit document-collection step: attach and
-        acknowledge with a running count. Do NOT score yet — the citizen types
-        SELESAI when finished, which triggers scoring.
-      * REVIEW — a re-upload after scoring: re-run live content-scoring and
-        return the refreshed score message + review summary.
-      * Earlier stages (CONFIRMING_START / COLLECTING_FIELDS) — the citizen sent
-        a document early; store it and acknowledge, nudging them back to the
-        flow. The docs are scored once they reach the document-collection step.
-      * Returns None when there is no active session to attach to (the caller
-        decides how to nudge the citizen), or when the flag is off.
+    NEW BEHAVIOUR (the debounce fix): attach the docs SILENTLY and arm a
+    per-session debounce so a BURST of uploads yields exactly ONE consolidated
+    reply (sent out-of-band by the debounce task). This entrypoint therefore
+    returns None at COLLECTING_DOCS — there is no per-file acknowledgment.
 
-    Never raises — degrades to None on any internal error so the caller can
-    fall back to a generic reply. Bytes are never logged."""
+    Returns:
+      * None  — at COLLECTING_DOCS / CONFIRM: the doc was attached, the debounce
+        was armed, and the consolidated reply will be SENT out-of-band. (None
+        also for: flag off, no active session, terminal session.) The aptana
+        caller already treats None as "nothing to send here".
+      * a reply string — only at RESOLVING_LICENSE (the citizen uploaded before
+        naming a licence): a gentle nudge to name the licence first.
+
+    Never raises — degrades to None on any internal error. Bytes never logged.
+    """
     if not is_enabled():
         return None
     try:
-        attached = await attach_documents(user_id, docs)
+        sess = await _get_session(user_id)
+        if sess is None or sess.stage in (Stage.DONE, Stage.FAILED):
+            return None
+
+        if sess.stage == Stage.RESOLVING_LICENSE:
+            # The citizen sent a file before telling us which licence. Don't
+            # attach to a license-less session — gently ask for the licence.
+            return (
+                "Terima kasih sudah mengirim dokumennya, Bapak/Ibu. Sebelum "
+                "saya periksa, boleh sebutkan dulu izin apa yang ingin "
+                "diajukan? Contohnya \"Izin Pemakaian Tanah\"."
+            )
+
+        # COLLECTING_DOCS or CONFIRM (a late upload): attach silently + debounce.
+        attached = await _attach_documents(user_id, docs)
         if not attached:
             return None
-        sess = await _get_session(user_id)
-        if sess is None:
-            return None
-        if sess.stage == Stage.COLLECTING_DOCS:
-            # Explicit document-collection step: acknowledge with a running
-            # count and wait for more documents / SELESAI. No scoring yet.
-            n = len(sess.documents)
-            return (
-                f"Dokumen diterima ({n} total). Kirim dokumen lain, atau "
-                "ketik SELESAI untuk saya nilai."
-            )
-        if sess.stage == Stage.REVIEW:
-            # A re-upload after scoring → re-score with the fresh bytes.
-            return await _enter_doc_scoring(sess)
-        # Earlier stage (still confirming start or collecting applicant fields)
-        # — acknowledge; the docs are scored once we reach the document step.
-        nxt = sess.next_missing_field()
-        ack = (
-            f"Dokumen diterima ({len(sess.documents)} berkas). "
-            "Akan saya periksa setelah data pemohon lengkap."
-        )
-        if nxt is not None:
-            ack += f"\n\n{nxt.question}"
-        return ack
+        await _arm_debounce(user_id)
+        return None
     except Exception:
         logger.exception(
             "Guided-submission inbound-document handling crashed | user=%s",
@@ -672,31 +585,26 @@ async def handle_inbound_documents(
         return None
 
 
-async def attach_documents(
-    user_id: str,
-    docs: list[SessionDocument],
-) -> bool:
-    """Public seam: attach documents the chat transport received to a citizen's
-    in-flight session. This is the ONE function a real APTANA/Telegram media
-    webhook calls once it has downloaded + decoded the bytes — the state
-    machine and scoring do not change when that lands.
+async def attach_documents(user_id: str, docs: list[SessionDocument]) -> bool:
+    """Public seam (kept for compatibility): attach docs to an active session.
 
-    Returns True when the docs were attached to an active session, False when
-    there is no active session to attach to (caller can decide what to do).
-    Bytes are held in memory only; never logged.
+    Returns True when attached to an active session, False otherwise. Does NOT
+    arm the debounce — `handle_inbound_documents` is the webhook seam that does
+    that. Bytes are held in memory only; never logged.
     """
+    return await _attach_documents(user_id, docs)
+
+
+async def _attach_documents(user_id: str, docs: list[SessionDocument]) -> bool:
     sess = await _get_session(user_id)
     if sess is None or sess.stage in (Stage.DONE, Stage.FAILED):
         return False
-    # De-dup by file_id; cap total count.
     have = {d.file_id for d in sess.documents}
+    added = 0
     for d in docs:
         if d.file_id in have:
             continue
         if len(d.content) > _MAX_DOC_BYTES:
-            # PII: a citizen-supplied filename can carry a name (e.g.
-            # "Budi_Santoso_KTP.jpg") — log the opaque file_id + size, never the
-            # filename or content.
             logger.warning(
                 "attach_documents skipped oversize | user=%s | file_id=%s | bytes=%d",
                 _mask(user_id), d.file_id, len(d.content),
@@ -706,20 +614,21 @@ async def attach_documents(
             break
         sess.documents.append(d)
         have.add(d.file_id)
+        added += 1
+    sess.last_doc_at = time.time()
     sess.touch()
     await _put_session(sess)
     logger.info(
-        "Guided-submission documents attached | user=%s | count=%d",
-        _mask(user_id), len(sess.documents),
+        "Guided-submission documents attached | user=%s | count=%d | added=%d",
+        _mask(user_id), len(sess.documents), added,
     )
     return True
 
 
 def _load_demo_packet(sess: SubmissionSession) -> int:
-    """Load the curated demo packet (if configured) onto the session as
-    SessionDocuments. Returns the number of docs loaded. No-op + returns the
-    existing count when a packet dir isn't configured or the session already
-    has documents (real media won the race)."""
+    """Load the curated demo packet (if configured) onto the session. Returns
+    the number of docs loaded. No-op when no packet dir is configured or the
+    session already has documents (real media won the race)."""
     if sess.documents:
         return len(sess.documents)
     pkt = _demo_packet_dir()
@@ -755,16 +664,126 @@ def _load_demo_packet(sess: SubmissionSession) -> int:
     return loaded
 
 
+# ===========================================================================
+# Out-of-band channel send (the debounce task replies directly).
+# ===========================================================================
+
+async def _send_to_user(user_id: str, text: str) -> bool:
+    """Send `text` to the citizen on whatever channel their user_id namespaces.
+
+    The consolidated upload reply is produced OUT-OF-BAND (in the debounce
+    task), not as a router return value, so it must be pushed to the channel
+    here. The sender is chosen by the user_id prefix:
+      * 'wa-{msisdn}' → whatsapp_sender.send_text
+      * 'tg-{chat_id}' → telegram sender (best-effort; skipped if unavailable)
+    Returns True on a successful send. Never raises.
+    """
+    if not text:
+        return False
+    try:
+        if user_id.startswith("wa-"):
+            from services.whatsapp_sender import send_text
+            msisdn = user_id[3:]
+            return await send_text(recipient_phone=msisdn, body=text)
+        if user_id.startswith("tg-"):
+            # Best-effort Telegram support — only if a sender module exists.
+            try:
+                from services.telegram_sender import send_message  # type: ignore
+            except Exception:
+                logger.warning(
+                    "Guided-submission: no telegram sender for out-of-band reply "
+                    "| user=%s", _mask(user_id),
+                )
+                return False
+            chat_id = user_id[3:]
+            return await send_message(chat_id=chat_id, text=text)
+        logger.warning(
+            "Guided-submission: unknown channel for out-of-band reply | user=%s",
+            _mask(user_id),
+        )
+        return False
+    except Exception:
+        logger.exception(
+            "Guided-submission out-of-band send crashed | user=%s", _mask(user_id)
+        )
+        return False
+
+
+# ===========================================================================
+# Debounce — one task per session; consolidated reply once uploads settle.
+# ===========================================================================
+
+async def _arm_debounce(user_id: str) -> None:
+    """Ensure exactly ONE debounce task is running for this session.
+
+    Guarded by the module-level `_debounce_tasks` set so a burst of N uploads
+    (each its own webhook → its own handle_inbound_documents call) spawns ONE
+    task, not N. Subsequent uploads just re-stamp `last_doc_at`; the already-
+    running task observes the later stamp and waits again.
+    """
+    if user_id in _debounce_tasks:
+        return  # a task is already watching this session
+    _debounce_tasks.add(user_id)
+    try:
+        asyncio.create_task(_debounce_then_process(user_id))
+    except RuntimeError:
+        # No running event loop (shouldn't happen on the webhook path). Drop the
+        # guard so a later upload can retry; the docs are safely attached.
+        _debounce_tasks.discard(user_id)
+        logger.warning(
+            "Guided-submission: could not schedule debounce (no loop) | user=%s",
+            _mask(user_id),
+        )
+
+
+async def _debounce_then_process(user_id: str) -> None:
+    """Wait for the upload burst to settle, then run the consolidated pass and
+    SEND the reply out-of-band. Single task per session (see `_arm_debounce`).
+
+    Loop: sleep(DEBOUNCE); reload session; if quiet long enough → break and
+    process; else loop again (a new file arrived during the sleep). Never
+    raises — always clears its `_debounce_tasks` guard on exit.
+    """
+    debounce = _debounce_seconds()
+    try:
+        # Bound the number of extra waits so a pathological drip of uploads
+        # can't keep the task alive forever; after the cap we process anyway.
+        for _ in range(60):
+            await asyncio.sleep(debounce)
+            sess = await _get_session(user_id)
+            if sess is None or sess.stage in (Stage.DONE, Stage.FAILED):
+                return
+            if sess.stage not in (Stage.COLLECTING_DOCS, Stage.CONFIRM):
+                return
+            quiet_for = time.time() - sess.last_doc_at
+            if quiet_for >= debounce:
+                break
+        else:
+            sess = await _get_session(user_id)
+            if sess is None:
+                return
+
+        reply = await _process_collected_documents(sess)
+        if reply:
+            await _send_to_user(user_id, reply)
+    except Exception:
+        logger.exception(
+            "Guided-submission debounce processing crashed | user=%s",
+            _mask(user_id),
+        )
+    finally:
+        _debounce_tasks.discard(user_id)
+
+
+# ===========================================================================
+# Content scoring (LIVE suitability judge over in-session documents).
+# ===========================================================================
+
 async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]]:
     """Run the LIVE suitability judge over the session's in-memory documents.
 
-    Returns a normalised result dict the flow + officer brief reuse:
-      {"ok": bool, "status": str, "score_percent": int, "summary": str,
-       "message": str (rendered WhatsApp text), "issues": [{severity, message}],
-       "result": SuitabilityResult}
-
-    Returns None when there are no in-session documents — the caller then
-    falls back to the demo-fixture validation path. Never raises.
+    Returns a normalised result dict the flow + officer brief reuse, or None
+    when there are no documents. Never raises.
     """
     if not sess.documents:
         return None
@@ -796,13 +815,8 @@ async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]
 
     ready = citizen_scorer.is_submission_ready(result)
     percent = int(round(result.overall_suitability_score * 100))
-    message = citizen_scorer.render_score_message(
-        result, license_name=sess.license_name
-    )
-    issues = [
-        {"severity": i.severity, "message": i.title}
-        for i in result.issues
-    ]
+    message = citizen_scorer.render_score_message(result, license_name=sess.license_name)
+    issues = [{"severity": i.severity, "message": i.title} for i in result.issues]
     logger.info(
         "Guided-submission content-score | user=%s | license_id=%s | "
         "percent=%d | ready=%s | issues=%d",
@@ -819,214 +833,259 @@ async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]
     }
 
 
-def _demo_fixture_name() -> str:
-    """Which fixture the guided flow validates against. Read at call time
-    (not import time) so ops can flip it without a restart — same pattern as
-    `is_enabled()`. "clean" is the happy-path default so the flow
-    demonstrates a real end-to-end submit."""
-    return os.getenv("GUIDED_SUBMISSION_DEMO_FIXTURE", "clean").strip() or "clean"
+# ===========================================================================
+# Field extraction from the uploaded documents (replaces the 4-question Q&A).
+# ===========================================================================
+
+# Claimed-type / detected-type hints for picking the business-name source.
+_BUSINESS_DOC_HINTS = ("nib", "siup", "akta", "nomor induk berusaha")
 
 
-def _run_validation(sess: SubmissionSession) -> dict[str, Any]:
-    """Validate the citizen's submission. Returns a normalised result dict:
+def _looks_like_ktp(doc: SessionDocument) -> bool:
+    label = (doc.claimed_type or "").lower() + " " + (doc.filename or "").lower()
+    return "ktp" in label or "kartu tanda penduduk" in label
 
-      {"ok": bool, "status": str, "score_percent": int, "summary": str,
-       "issues": [{severity, message}, ...]}
 
-    `ok` is True only when the validation status is "ready" (clean) — that is
-    the gate for the SIAP submit step. Any miss / load failure returns
-    ok=False with a friendly note rather than raising.
+def _looks_like_business_doc(doc: SessionDocument) -> bool:
+    label = (doc.claimed_type or "").lower() + " " + (doc.filename or "").lower()
+    return any(h in label for h in _BUSINESS_DOC_HINTS)
+
+
+async def _extract_fields_from_documents(sess: SubmissionSession) -> None:
+    """Populate sess.fields from the uploaded docs + the citizen's msisdn.
+
+    * name + NIK: from the document that looks like a KTP (Gemini Vision). If no
+      doc is obviously a KTP, try EVERY image/pdf until one extracts as a KTP.
+    * business name: from a NIB/SIUP/Akta filename hint when present; otherwise
+      left empty here and defaulted to the applicant name at summary time.
+    * phone: the citizen's OWN msisdn from 'wa-{msisdn}' — never asked.
+
+    Best-effort + defensive: a failed Vision call simply leaves a field empty
+    (the caller asks for it naturally). Never raises. NIK is masked in logs.
     """
-    path = _FIXTURES_DIR / f"{_demo_fixture_name()}.json"
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
-        logger.warning(
-            "Guided-submission validation fixture unavailable | path=%s | err=%s",
-            path, exc,
-        )
-        return {
-            "ok": False,
-            "status": "unverified",
-            "score_percent": 0,
-            "summary": (
-                "Validasi dokumen belum bisa dijalankan saat ini. Mohon coba "
-                "lagi nanti."
-            ),
-            "issues": [],
-        }
+    # Phone — always from the channel id, never asked.
+    msisdn = _msisdn_from_user_id(sess.user_id)
+    if msisdn and not sess.fields.get("phone"):
+        sess.fields["phone"] = msisdn
 
-    status = str(payload.get("status", "unverified"))
-    issues_raw = payload.get("issues") or []
-    issues = [
-        {
-            "severity": str(it.get("severity", "")).lower(),
-            "message": str(it.get("message", "")),
-        }
-        for it in issues_raw
-        if isinstance(it, dict)
-    ]
+    # Name + NIK from the KTP — only if we don't already have BOTH (a CORRECT
+    # earlier may have set one). Try the obvious KTP doc first, else any doc.
+    need_name = not sess.fields.get("applicant_name")
+    need_nik = not sess.fields.get("nik")
+    if (need_name or need_nik) and sess.documents:
+        ordered = sorted(sess.documents, key=lambda d: 0 if _looks_like_ktp(d) else 1)
+        from services.gemini_vision import extract_ktp_fields, is_configured as _vision_ok
+
+        if _vision_ok():
+            for d in ordered:
+                # Only attempt on image/pdf bytes the model can read.
+                if not (d.mime_type.startswith("image/") or d.mime_type == "application/pdf"):
+                    continue
+                try:
+                    ktp = await extract_ktp_fields(image_bytes=d.content, mime_type=d.mime_type)
+                except Exception:
+                    logger.exception(
+                        "Guided-submission KTP extraction crashed | user=%s | file_id=%s",
+                        _mask(sess.user_id), d.file_id,
+                    )
+                    ktp = None
+                if not ktp or not ktp.get("is_ktp"):
+                    continue
+                if need_name and ktp.get("name"):
+                    cleaned = _v_name(ktp["name"])
+                    if cleaned:
+                        sess.fields["applicant_name"] = cleaned
+                        need_name = False
+                if need_nik and ktp.get("nik"):
+                    sess.fields["nik"] = ktp["nik"]  # already 16-digit-validated
+                    need_nik = False
+                # Optional gender for later Pak/Bu tailoring.
+                if ktp.get("gender") and not sess.fields.get("gender"):
+                    sess.fields["gender"] = ktp["gender"]
+                if not need_name and not need_nik:
+                    break
+
+    # Business name — from a NIB/SIUP/Akta filename hint, if any. We don't run a
+    # second Vision pass for this slice; the filename hint is enough to label
+    # the source, and we default to the person's name otherwise (at render).
+    if not sess.fields.get("business_name"):
+        biz_doc = next((d for d in sess.documents if _looks_like_business_doc(d)), None)
+        if biz_doc is not None:
+            label = _claimed_type_from_filename(biz_doc.filename)
+            cleaned = _v_business_name(label)
+            # Only use it if it's a meaningful business label, not just "nib".
+            if cleaned and cleaned.lower() not in _BUSINESS_DOC_HINTS:
+                sess.fields["business_name"] = cleaned
+
     logger.info(
-        "Guided-submission validation | user=%s | status=%s | issues=%d",
-        _mask(sess.user_id), status, len(issues),
+        "Guided-submission fields extracted | user=%s | name=%s | nik=%s | "
+        "business=%s | phone=%s",
+        _mask(sess.user_id),
+        bool(sess.fields.get("applicant_name")),
+        _mask(sess.fields.get("nik")),
+        bool(sess.fields.get("business_name")),
+        _mask(sess.fields.get("phone")),
     )
-    return {
-        "ok": status == "ready",
-        "status": status,
-        "score_percent": int(payload.get("score_percent", 0) or 0),
-        "summary": str(payload.get("summary", "")),
-        "issues": issues,
-    }
 
 
 # ===========================================================================
-# Reply builders — plain-Indonesian, WhatsApp-friendly.
+# Reply builders — warm Bahasa Indonesia, WhatsApp-friendly, NO emoji.
 # ===========================================================================
 
-# Indonesian one-word status labels for the compact score reminder.
-_SCORE_STATUS_LABEL: dict[str, str] = {
-    "ready": "siap dikirim",
-    "needs_fix": "perlu diperbaiki",
-    "unverified": "belum tervalidasi",
-}
-
-
-def _score_reminder_prefix(sess: SubmissionSession) -> str:
-    """A compact one-line score reminder prepended to REVIEW-stage replies so
-    the citizen keeps the context of their latest document score across turns
-    (the full score message is only shown once, at the field→review
-    transition). Empty string when no score has been computed yet.
-
-    Survives a restart because it reads the JSON-safe `last_score` fields that
-    `_encode_session` persists (the rich `result` dataclass is dropped, but
-    score_percent + status are kept)."""
-    score = sess.last_score
-    if not isinstance(score, dict) or "score_percent" not in score:
-        return ""
-    pct = score.get("score_percent")
-    status = _SCORE_STATUS_LABEL.get(str(score.get("status", "")), "")
-    tail = f" ({status})" if status else ""
-    return f"Skor terkini: {pct}%{tail}\n\n"
-
-
-def _fmt_review(sess: SubmissionSession) -> str:
-    """The pre-submit summary the citizen confirms with 'ya'."""
+def _fmt_requirements_invite(sess: SubmissionSession) -> str:
+    """The warm requirements + upload invite shown right after the licence is
+    locked. No readiness gate, no field questions — straight to "upload here"."""
     lines = [
-        f"Baik, mohon dicek kembali permohonan Anda:",
-        "",
-        f"*Jenis izin:* {sess.license_name}",
+        f"Baik Bapak/Ibu, untuk mengajukan {sess.license_name} lewat SIAP "
+        "Jateng ada beberapa syarat yang harus dipenuhi.",
     ]
-    for spec in _FIELD_SPECS:
-        val = sess.fields.get(spec.key, "-")
-        shown = _mask(val) if spec.is_pii else val
-        label = {
-            "applicant_name": "Nama pemohon",
-            "nik": "NIK",
-            "business_name": "Nama usaha",
-            "phone": "No. WhatsApp",
-        }.get(spec.key, spec.key)
-        lines.append(f"- *{label}:* {shown}")
-    if sess.sla_working_days:
-        lines.append(f"- *Perkiraan SLA:* {sess.sla_working_days} hari kerja")
-    if sess.retribution_fee:
-        lines.append(f"- *Retribusi:* {sess.retribution_fee}")
+    if sess.requirements:
+        lines += ["", "Berikut dokumen persyaratan yang perlu disiapkan:"]
+        for r in sess.requirements[:10]:
+            lines.append(f"- {r}")
     lines += [
         "",
-        "Jika sudah benar, ketik *YA* untuk memvalidasi dan mengirim "
-        "permohonan ke SIAP. Ketik *BATAL* untuk membatalkan.",
+        "Pastikan semua dokumen tersedia ya, lalu silakan upload dokumennya "
+        "di sini (boleh beberapa sekaligus).",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
-def _fmt_validation_issues(result: dict[str, Any]) -> str:
-    """The 'please fix this before we submit' message — flow does NOT submit."""
-    lines = [
-        "Permohonan Anda belum bisa dikirim — ada yang perlu diperbaiki "
-        f"dulu (kelengkapan {result.get('score_percent', 0)}%):",
-        "",
+def _data_readback_lines(sess: SubmissionSession) -> list[str]:
+    """The 'data pemohon yang kami baca' block — NIK masked via mask_pii."""
+    name = sess.fields.get("applicant_name") or "-"
+    nik = sess.fields.get("nik")
+    nik_shown = mask_pii(nik) if nik else "-"
+    usaha = sess.fields.get("business_name") or sess.fields.get("applicant_name") or "-"
+    return [
+        "Data pemohon yang kami baca:",
+        f"- Nama: {name}",
+        f"- NIK: {nik_shown}",
+        f"- Nama usaha: {usaha}",
     ]
-    issues = result.get("issues") or []
-    if issues:
-        for it in issues[:5]:
-            lines.append(f"- {it.get('message', '')}".rstrip())
+
+
+def _fmt_confirm_message(sess: SubmissionSession, score: Optional[dict[str, Any]]) -> str:
+    """The consolidated, warm reply after the upload burst settles: how many
+    docs / completeness / score + the data read back (NIK masked) + a natural
+    confirmation question. The score's own rendered message carries the
+    per-document detail; we add the warm framing + the read-back + the question.
+    """
+    pct = score.get("score_percent") if isinstance(score, dict) else None
+    complete = bool(score and score.get("ok"))
+
+    lines: list[str] = []
+    if complete:
+        head = (
+            "Baik Bapak/Ibu, dokumen sudah kami terima dan sudah lengkap "
+            "sesuai persyaratan"
+        )
+        if pct is not None:
+            head += f", dengan estimasi kelayakan {pct}%"
+        head += "."
+        lines.append(head)
     else:
-        lines.append(f"- {result.get('summary', 'Dokumen belum lengkap.')}")
-    lines += [
-        "",
-        "Perbaiki poin di atas, lalu ketik *KIRIM* untuk mencoba lagi, atau "
-        "*BATAL* untuk membatalkan.",
-    ]
-    return "\n".join(lines)
+        head = "Baik Bapak/Ibu, dokumen sudah kami terima"
+        if pct is not None:
+            head += f", dengan estimasi kelayakan {pct}%"
+        head += "."
+        lines.append(head)
+
+    # The detailed per-document score message (completeness, type checks,
+    # suitability, issues) — already PII-masked + emoji-free by citizen_scorer.
+    if score and score.get("message"):
+        lines += ["", score["message"]]
+
+    lines += [""] + _data_readback_lines(sess)
+
+    if complete:
+        lines += [
+            "",
+            "Apakah Bapak/Ibu yakin untuk mengajukan izin ini sekarang?",
+        ]
+    else:
+        lines += [
+            "",
+            "Jika berkenan, Bapak/Ibu bisa melengkapi atau memperbaiki dokumen "
+            "di atas lalu mengirimnya lagi. Atau jika ingin tetap mengajukan apa "
+            "adanya, beri tahu saya saja.",
+        ]
+    return "\n".join(lines).rstrip()
+
+
+def _ask_missing_field(sess: SubmissionSession, missing: list[str]) -> str:
+    """Warmly ask for a required field BIMA couldn't read from the documents,
+    without restarting the flow."""
+    if "applicant_name" in missing and "nik" in missing:
+        return (
+            "Dokumen sudah saya terima, terima kasih. Hanya saja saya belum bisa "
+            "membaca KTP-nya dengan jelas. Boleh kirim ulang foto KTP yang lebih "
+            "jelas, atau ketik nama lengkap dan NIK (16 digit) Bapak/Ibu di sini?"
+        )
+    if "nik" in missing:
+        name = sess.fields.get("applicant_name") or "Bapak/Ibu"
+        return (
+            f"Terima kasih, {name}. Saya belum bisa membaca NIK dari dokumennya. "
+            "Boleh kirim ulang foto KTP yang lebih jelas, atau ketik NIK "
+            "(16 digit) di sini?"
+        )
+    if "applicant_name" in missing:
+        return (
+            "Terima kasih, dokumennya sudah saya terima. Saya belum bisa membaca "
+            "nama lengkapnya dengan jelas. Boleh sebutkan nama lengkap sesuai KTP?"
+        )
+    # Shouldn't reach here (only name/NIK are required), but be safe.
+    return (
+        "Terima kasih, dokumennya sudah saya terima. Boleh lengkapi sedikit lagi "
+        "data Bapak/Ibu supaya bisa saya proses?"
+    )
 
 
 # ===========================================================================
-# State-machine handlers
+# State transitions
 # ===========================================================================
 
 async def _start_session(user_id: str, message: str) -> str:
-    """Begin a new guided submission: resolve the licence the citizen named.
-
-    Resolution is LLM-driven and grounded in the WHOLE SIAP licence catalogue
-    (`services.license_resolver.resolve_license_intent`). We pass the RAW
-    message — the model understands intent, expands acronyms, and tolerates
-    typos/word-order/synonyms, so the old regex stopword-stripping (which
-    polluted a substring ILIKE) is no longer needed. The resolver returns the
-    same {found, matches, note} shape the previous `siap_lookup_license` path
-    did, so the downstream logic below is unchanged.
-    """
+    """Begin a new guided submission: resolve the licence the citizen named via
+    the LLM resolver grounded in the whole SIAP catalogue."""
     from services.license_resolver import resolve_license_intent
 
     sess = SubmissionSession(user_id=user_id)
-
     lookup = await resolve_license_intent(message)
 
     if not lookup.get("found"):
-        # Could not resolve — keep the session in RESOLVING_LICENSE and ask
-        # the citizen to name the licence precisely.
         sess.stage = Stage.RESOLVING_LICENSE
         await _put_session(sess)
         note = lookup.get("note", "")
-        logger.info(
-            "Guided-submission start — licence unresolved | user=%s",
-            _mask(user_id),
-        )
+        logger.info("Guided-submission start — licence unresolved | user=%s", _mask(user_id))
         return (
-            "Saya siap membantu Anda mengajukan izin lewat SIAP Jateng.\n\n"
-            "Mohon sebutkan *nama izin* yang ingin Anda ajukan "
-            "(contoh: \"Izin Pemakaian Tanah\")."
-            + (f"\n\n_{note}_" if note else "")
+            "Dengan senang hati saya bantu pengajuan izin Bapak/Ibu lewat SIAP "
+            "Jateng. Boleh sebutkan nama izin yang ingin diajukan? "
+            "Contohnya \"Izin Pemakaian Tanah\"."
+            + (f"\n\n{note}" if note else "")
         )
 
     matches = lookup.get("matches") or []
     if len(matches) > 1:
-        # Ambiguous — let the citizen pick from a numbered shortlist.
         sess.candidates = matches[:8]
         sess.stage = Stage.RESOLVING_LICENSE
         await _put_session(sess)
         lines = [
-            "Saya menemukan beberapa jenis izin yang cocok. Mohon pilih "
-            "dengan membalas *nomornya*:",
+            "Ada beberapa jenis izin yang sepertinya cocok. Boleh pilih salah "
+            "satu dengan membalas nomornya:",
             "",
         ]
         for idx, m in enumerate(matches[:8], start=1):
-            sektor = f" _(Bidang: {m['sektor']})_" if m.get("sektor") else ""
+            sektor = f" (Bidang: {m['sektor']})" if m.get("sektor") else ""
             lines.append(f"{idx}. {m['name']}{sektor}")
-        lines += ["", "Ketik *BATAL* untuk membatalkan."]
         return "\n".join(lines)
 
-    # Exactly one match — lock it in and fetch requirements.
     return await _lock_license(sess, matches[0])
 
 
 async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
-    """Pin the chosen licence onto the session, show its requirements, and ask
-    the citizen to confirm they are ready before field collection begins.
-
-    We do NOT jump straight into the form: the citizen should be able to read
-    the document checklist first. So we park the session in CONFIRMING_START
-    and ask for an explicit "SIAP". maybe_handle advances on an affirmative.
-    """
+    """Pin the chosen licence, fetch requirements, and go STRAIGHT to document
+    collection with a warm requirements + upload invite. No readiness gate."""
     from services.siap_tools import siap_get_requirements
 
     sess.license_id = int(match["license_id"])
@@ -1039,227 +1098,121 @@ async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
         sess.sla_working_days = reqs.get("sla_working_days")
         sess.retribution_fee = reqs.get("retribution_fee")
 
-    sess.stage = Stage.CONFIRMING_START
+    sess.stage = Stage.COLLECTING_DOCS
     sess.touch()
+
+    # Demo-rehearsal fallback ONLY (production never sets the packet env): if a
+    # curated packet is configured, auto-load + process it now so the rehearsal
+    # doesn't require live uploads.
+    if not sess.documents and _demo_packet_dir() is not None:
+        loaded = _load_demo_packet(sess)
+        if loaded:
+            await _put_session(sess)
+            logger.info(
+                "Guided-submission licence locked (+demo packet) | user=%s | license_id=%s",
+                _mask(sess.user_id), sess.license_id,
+            )
+            return await _process_collected_documents(sess)
+
     await _put_session(sess)
     logger.info(
         "Guided-submission licence locked | user=%s | license_id=%s",
         _mask(sess.user_id), sess.license_id,
     )
-
-    intro_lines = [
-        f"Baik! Anda akan mengajukan *{sess.license_name}* lewat SIAP Jateng.",
-    ]
-    if sess.requirements:
-        intro_lines += [
-            "",
-            "Dokumen yang nanti perlu Anda siapkan:",
-        ]
-        for r in sess.requirements[:8]:
-            intro_lines.append(f"- {r}")
-    intro_lines += [
-        "",
-        f"Apakah Anda siap saya pandu untuk mengajukan {sess.license_name}? "
-        "Balas *SIAP* untuk mulai, atau *BATAL* untuk membatalkan.",
-    ]
-    return "\n".join(intro_lines).rstrip()
+    return _fmt_requirements_invite(sess)
 
 
-async def _begin_field_collection(sess: SubmissionSession) -> str:
-    """Move CONFIRMING_START → COLLECTING_FIELDS and ask the first field."""
-    sess.stage = Stage.COLLECTING_FIELDS
-    sess.touch()
-    await _put_session(sess)
-    logger.info(
-        "Guided-submission field collection started | user=%s | license_id=%s",
-        _mask(sess.user_id), sess.license_id,
-    )
-    lines = [
-        "Baik, kita mulai. Saya akan menanyakan data pemohon satu per satu. "
-        "Ketik *BATAL* kapan saja untuk membatalkan.",
-        "",
-    ]
-    first = sess.next_missing_field()
-    lines.append(f"1. {first.question}" if first else "")
-    return "\n".join(lines).rstrip()
+async def _process_collected_documents(sess: SubmissionSession) -> str:
+    """The consolidated pass after the upload burst settles (or on an explicit
+    'I'm done' text / demo packet): score ALL docs once, extract the applicant
+    fields, and move to CONFIRM with ONE warm reply.
 
+    If a REQUIRED field can't be extracted, ask for JUST that field (stay at
+    COLLECTING_DOCS so a re-upload / typed answer continues the same flow).
 
-def _handle_license_choice(sess: SubmissionSession, message: str) -> Optional[dict]:
-    """At RESOLVING_LICENSE with candidates: parse the citizen's numeric pick.
-    Returns the chosen match dict, or None if the message was not a valid pick.
+    Returns the citizen-facing reply string. Never raises (callers — the
+    debounce task and maybe_handle — both rely on this).
     """
-    if not sess.candidates:
-        return None
-    m = re.match(r"^\s*(\d{1,2})\s*$", message.strip())
-    if not m:
-        return None
-    idx = int(m.group(1))
-    if 1 <= idx <= len(sess.candidates):
-        return sess.candidates[idx - 1]
-    return None
-
-
-async def _collect_field(sess: SubmissionSession, message: str) -> str:
-    """At COLLECTING_FIELDS: validate the answer to the pending question,
-    store it, then ask the next field — or move to REVIEW when done."""
-    spec = sess.next_missing_field()
-    if spec is None:
-        # Defensive — shouldn't happen; jump straight to review.
-        sess.stage = Stage.REVIEW
-        sess.touch()
-        await _put_session(sess)
-        return _fmt_review(sess)
-
-    ok, cleaned = spec.validate(message)
-    if not ok:
-        sess.touch()
-        await _put_session(sess)
-        # cleaned holds the error message in the failure case.
-        return f"{cleaned}\n\n{spec.question}"
-
-    sess.fields[spec.key] = cleaned
-    sess.touch()
-    # PII: log ONLY the field NAME + a non-PII length indicator. The field VALUE
-    # (applicant name / NIK / phone / business name) must NEVER appear in logs.
-    logger.info(
-        "Guided-submission field collected | user=%s | field=%s | value_len=%d",
-        _mask(sess.user_id), spec.key, len(cleaned),
-    )
-
-    nxt = sess.next_missing_field()
-    if nxt is None:
-        # All applicant fields collected. Ask the citizen to send their
-        # requirement documents (explicit document-collection step).
-        return await _ask_for_documents(sess)
-
-    await _put_session(sess)
-    collected = len(sess.fields)
-    return f"Tercatat.\n\n{collected + 1}. {nxt.question}"
-
-
-# The explicit "now send the file" prompt shown once the last applicant field
-# is collected. The citizen sends photos/PDFs and types SELESAI when done.
-_DOC_PROMPT = (
-    "Data pemohon lengkap. Sekarang silakan kirim dokumen persyaratan dalam "
-    "bentuk foto (JPG/PNG) atau PDF, maksimal 10 MB. Anda boleh mengirim "
-    "beberapa dokumen sekaligus. Ketik SELESAI jika semua dokumen sudah "
-    "dikirim."
-)
-
-
-async def _ask_for_documents(sess: SubmissionSession) -> str:
-    """Transition COLLECTING_FIELDS → COLLECTING_DOCS and ask for the files.
-
-    The live path is real uploads: we park in COLLECTING_DOCS and explicitly
-    ask the citizen to send their documents (then type SELESAI). The ONLY
-    exception is the demo fallback: when GUIDED_SUBMISSION_DEMO_PACKET is set
-    (NOT in production), auto-load that packet and score immediately so the
-    rehearsal doesn't require live uploads.
-    """
-    sess.stage = Stage.COLLECTING_DOCS
-    sess.touch()
-
-    # Demo fallback only — production does not set GUIDED_SUBMISSION_DEMO_PACKET,
-    # so this is a no-op there and the citizen is asked to upload for real.
-    if not sess.documents and _demo_packet_dir() is not None:
-        loaded = _load_demo_packet(sess)
-        if loaded:
-            return await _enter_doc_scoring(sess)
-
-    await _put_session(sess)
-    return _DOC_PROMPT
-
-
-async def _enter_doc_scoring(sess: SubmissionSession) -> str:
-    """Run the live content-score over the in-session documents → REVIEW.
-
-    Called when the citizen types SELESAI at COLLECTING_DOCS (real uploads) or
-    when the demo packet was auto-loaded. BIMA CONTENT-scores the documents and
-    shows the citizen the score before asking for confirmation. When no
-    documents are available (and no packet), fall back to the demo-fixture
-    review path so the flow still works on a transport that hasn't wired media.
-    """
-    sess.touch()
-
     # Pull in the curated demo packet if real media hasn't arrived (no-op in
-    # production where GUIDED_SUBMISSION_DEMO_PACKET is unset).
+    # production where the packet env is unset).
     _load_demo_packet(sess)
 
-    if sess.documents:
-        score = await _run_content_score(sess)
-        if score is not None:
-            sess.last_score = score
-            sess.stage = Stage.REVIEW
-            await _put_session(sess)
-            head = "Semua dokumen sudah saya terima.\n\n"
-            # The live content-score message is the centerpiece the citizen sees.
-            return (
-                head
-                + score["message"]
-                + "\n\n"
-                + _fmt_review(sess)
-            )
+    if not sess.documents:
+        # Nothing to process — stay collecting, gently nudge.
+        sess.stage = Stage.COLLECTING_DOCS
+        await _put_session(sess)
+        return (
+            "Saya belum menerima dokumennya, Bapak/Ibu. Silakan upload foto "
+            "(JPG/PNG) atau PDF dokumen persyaratan di sini ya."
+        )
 
-    # No in-session documents (or scoring unavailable) → fixture review path.
-    sess.stage = Stage.REVIEW
+    # Score + extract in this single pass.
+    score = await _run_content_score(sess)
+    if score is not None:
+        sess.last_score = score
+    await _extract_fields_from_documents(sess)
+
+    missing = sess.missing_required_fields()
+    if missing:
+        # Keep the docs + score, stay at COLLECTING_DOCS, ask for the gap. A
+        # typed name/NIK is consumed by the COLLECTING_DOCS text handler.
+        sess.stage = Stage.COLLECTING_DOCS
+        sess.touch()
+        await _put_session(sess)
+        logger.info(
+            "Guided-submission missing fields after extract | user=%s | missing=%s",
+            _mask(sess.user_id), missing,
+        )
+        return _ask_missing_field(sess, missing)
+
+    sess.stage = Stage.CONFIRM
+    sess.touch()
     await _put_session(sess)
-    return "Semua data pemohon terkumpul.\n\n" + _fmt_review(sess)
+    return _fmt_confirm_message(sess, score)
 
+
+# ===========================================================================
+# Submit to SIAP — preserved end to end (officer notify, PII, fallbacks).
+# ===========================================================================
 
 async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
-    """REVIEW + citizen confirmed: run the validator, then submit to SIAP.
+    """CONFIRM + citizen affirmed: score/validate, then submit to SIAP.
 
-    Validation issues → tell the citizen what to fix, do NOT submit, and offer
-    a "send as-is" override.
-    `force=True` → the citizen has explicitly consented to send the
-    sub-threshold packet anyway (second KIRIM); bypass the ok-gate and submit.
-    Clean validation  → POST to SIAP, return ticket + portal track link.
+    Sub-threshold + not forced → offer "ajukan apa adanya" and remember it, so
+    the next AFFIRM force-submits (no submit dead-end). Clean → POST to SIAP,
+    return ticket + portal track link. Fires the officer hand-off on success.
     """
     from services.siap_submission_client import get_siap_submission_client
 
-    # --- Step 1: score / validate the submission ------------------------
-    # Prefer the LIVE content-score (real Gemini Vision over the documents the
-    # citizen sent in-session). Reuse the score computed at the field→review
-    # transition when present; otherwise score now. Fall back to the demo
-    # fixture path only when there are no in-session documents at all.
+    # --- Step 1: score / validate ---
     result: dict[str, Any]
     score = sess.last_score
-    # Re-score when there's no score yet OR when only the JSON-safe score
-    # survived a Redis rehydrate (the rich `result` dataclass is dropped on
-    # encode — see _score_for_redis). Without the `result` the score can't drive
-    # the officer brief / sub-threshold message correctly, so a post-restart
-    # KIRIM must re-score from the rehydrated document bytes.
+    # Re-score when there's no score yet OR only the JSON-safe fields survived a
+    # Redis rehydrate (the rich `result` was dropped on encode).
     if (score is None or "result" not in score) and sess.documents:
         score = await _run_content_score(sess)
         sess.last_score = score
     if score is not None:
         result = score
     else:
-        result = _run_validation(sess)
+        result = {"ok": False, "status": "unverified", "score_percent": 0,
+                  "message": "", "issues": []}
 
-    if not result["ok"] and not force:
-        # Sub-threshold and not yet force-confirmed. Keep the session at REVIEW,
-        # OFFER the "send as-is" override, and remember we offered it so the
-        # next KIRIM/YA submits past the gate (prevents the KIRIM dead-end loop).
-        sess.stage = Stage.REVIEW
+    if not result.get("ok") and not force:
+        sess.stage = Stage.CONFIRM
         sess.override_offered = True
         sess.touch()
         await _put_session(sess)
-        # The content-score path already renders a full WhatsApp message; the
-        # fixture path uses the legacy issue formatter.
-        if score is not None:
-            return (
-                result["message"]
-                + "\n\nKetik *KIRIM* untuk mengirim apa adanya, atau *BATAL* "
-                "untuk membatalkan."
-            )
+        body = result.get("message") or (
+            "Dokumen Bapak/Ibu belum sepenuhnya lengkap sesuai persyaratan."
+        )
         return (
-            _fmt_validation_issues(result)
-            + "\n\nKetik *KIRIM* untuk mengirim apa adanya, atau *BATAL* "
-            "untuk membatalkan."
+            body
+            + "\n\nKalau Bapak/Ibu ingin tetap mengajukan apa adanya, beri tahu "
+            "saya saja, atau silakan lengkapi dulu dokumennya lalu kirim lagi."
         )
 
-    # --- Step 2: submit to SIAP -----------------------------------------
+    # --- Step 2: submit to SIAP ---
     client = get_siap_submission_client()
     if not client.is_configured():
         sess.stage = Stage.FAILED
@@ -1270,37 +1223,31 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
             _mask(sess.user_id),
         )
         return (
-            "Dokumen Anda sudah lengkap dan tervalidasi.\n\n"
-            "Namun kanal pengiriman otomatis ke SIAP belum aktif di sistem "
-            "saat ini. Permohonan Anda *belum terkirim*. Mohon hubungi "
-            "petugas DPMPTSP untuk menyelesaikan pengajuan, atau coba lagi "
-            "nanti. Mohon maaf atas ketidaknyamanannya."
+            "Dokumen Bapak/Ibu sudah lengkap dan tervalidasi. Namun kanal "
+            "pengiriman otomatis ke SIAP belum aktif saat ini, jadi permohonan "
+            "belum terkirim. Mohon hubungi petugas DPMPTSP untuk menyelesaikan "
+            "pengajuan, atau coba lagi nanti. Mohon maaf atas ketidaknyamanannya."
         )
 
-    # profile_id: in this slice we do not yet resolve a real SIAP profile_id
-    # from the citizen's NIK (that is a SIAP-side lookup endpoint BIMA does
-    # not have read access to). GUIDED_SUBMISSION_PROFILE_ID lets ops pin a
-    # known Beta-SIAP test profile for rehearsal. Real per-citizen profile
-    # resolution is a documented follow-up.
     profile_id_raw = os.getenv("GUIDED_SUBMISSION_PROFILE_ID", "").strip()
     if not profile_id_raw.isdigit():
         sess.stage = Stage.FAILED
         sess.touch()
         await _put_session(sess)
         logger.warning(
-            "Guided-submission: no GUIDED_SUBMISSION_PROFILE_ID configured | "
-            "user=%s", _mask(sess.user_id),
+            "Guided-submission: no GUIDED_SUBMISSION_PROFILE_ID configured | user=%s",
+            _mask(sess.user_id),
         )
         return (
-            "Dokumen Anda sudah lengkap dan tervalidasi.\n\n"
-            "Namun pemetaan profil pemohon ke SIAP belum dikonfigurasi di "
-            "sistem saat ini. Permohonan *belum terkirim* — mohon hubungi "
-            "petugas DPMPTSP untuk menyelesaikan pengajuan."
+            "Dokumen Bapak/Ibu sudah lengkap dan tervalidasi. Namun pemetaan "
+            "profil pemohon ke SIAP belum dikonfigurasi saat ini, jadi "
+            "permohonan belum terkirim. Mohon hubungi petugas DPMPTSP untuk "
+            "menyelesaikan pengajuan."
         )
 
     description = (
         f"Permohonan {sess.license_name} via BIMA-AI untuk usaha "
-        f"'{sess.fields.get('business_name', '-')}'."
+        f"'{sess.fields.get('business_name') or sess.fields.get('applicant_name') or '-'}'."
     )
     submit = await client.create_request(
         license_id=sess.license_id,
@@ -1318,27 +1265,20 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
             _mask(sess.user_id), note,
         )
         return (
-            "Dokumen Anda sudah tervalidasi, tetapi pengiriman ke SIAP "
-            f"gagal:\n\n_{note}_\n\n"
-            "Permohonan *belum terkirim*. Ketik *KIRIM* untuk mencoba lagi, "
-            "atau hubungi petugas DPMPTSP."
+            "Dokumen Bapak/Ibu sudah tervalidasi, tetapi pengiriman ke SIAP "
+            f"belum berhasil:\n\n{note}\n\nPermohonan belum terkirim. Beri tahu "
+            "saya jika ingin saya coba kirim lagi, atau hubungi petugas DPMPTSP."
         )
 
-    # --- Success --------------------------------------------------------
+    # --- Success ---
     ticket = submit.get("ticket")
     request_id = submit.get("request_id")
 
-    # SIAP's create endpoint returns a ticket but can omit the id/request_id on
-    # a successful submit. Flow-based officer resolution
-    # (officer_bridge.notify_officer_of_submission → siap_db.resolve_step_officers)
-    # is gated on a non-None request_id, so without it the officer notify
-    # silently skips flow resolution and (absent a BIMA_OFFICER_WA_PHONE
-    # fallback) notifies nobody. Recover the request_id from the freshly
-    # allocated ticket BEFORE the hand-off. Never let this crash the submit path.
+    # SIAP can omit request_id on a successful submit; recover it from the
+    # ticket so flow-based officer resolution (gated on request_id) still runs.
     if request_id is None and ticket:
         try:
             from services.siap_tools import siap_resolve_request_id
-
             request_id = await siap_resolve_request_id(ticket)
         except Exception:
             logger.exception(
@@ -1348,8 +1288,8 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
             request_id = None
         if request_id is None:
             logger.warning(
-                "officer notify: ticket=%s has no request_id; flow resolution "
-                "skipped", _mask(ticket),
+                "officer notify: ticket=%s has no request_id; flow resolution skipped",
+                _mask(ticket),
             )
 
     sess.ticket = ticket
@@ -1358,18 +1298,13 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     sess.touch()
     logger.info(
         "Guided-submission SUBMITTED | user=%s | license_id=%s | ticket=%s",
-        _mask(sess.user_id), sess.license_id, ticket,
+        _mask(sess.user_id), sess.license_id, _mask(ticket),
     )
 
-    # --- Officer hand-off: brief + score over WhatsApp/Telegram ---------
-    # Fire-and-forget so a notification hiccup never blocks the citizen's
-    # success reply. The officer bridge is feature-flagged + degrades to a
-    # no-op when unconfigured. We pass the in-session documents + the live
-    # score so the officer can chat with the docs and see the BIMA score.
+    # --- Officer hand-off: brief + score (fire-and-forget) ---
     if ticket:
         try:
             from services import officer_bridge
-
             await officer_bridge.notify_officer_of_submission(
                 ticket=ticket,
                 request_id=request_id,
@@ -1390,20 +1325,338 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     if ticket:
         track = _PORTAL_TRACK_URL.format(ticket=ticket)
         return (
-            "*Permohonan Anda berhasil dikirim ke SIAP Jateng!*\n\n"
-            f"*Jenis izin:* {sess.license_name}\n"
-            f"*Nomor tiket:* {ticket}\n\n"
-            f"Pantau status permohonan Anda kapan saja di:\n{track}\n\n"
-            "Simpan nomor tiket ini. Anda akan kami kabari saat status "
+            f"Permohonan Bapak/Ibu berhasil dikirim ke SIAP Jateng.\n\n"
+            f"Jenis izin: {sess.license_name}\n"
+            f"Nomor tiket: {ticket}\n\n"
+            f"Pantau status permohonan kapan saja di:\n{track}\n\n"
+            "Mohon simpan nomor tiket ini. Kami akan kabari saat status "
             "permohonan berubah. Terima kasih."
         )
-    # Submitted but SIAP did not return a ticket — still a success.
     return (
-        "*Permohonan Anda berhasil dikirim ke SIAP Jateng!*\n\n"
-        f"*Jenis izin:* {sess.license_name}\n\n"
-        "Nomor tiket akan tersedia sebentar lagi. Anda dapat memantau status "
-        f"di {_PORTAL_TRACK_URL.format(ticket='')[:-1]}. Terima kasih."
+        f"Permohonan Bapak/Ibu berhasil dikirim ke SIAP Jateng.\n\n"
+        f"Jenis izin: {sess.license_name}\n\n"
+        "Nomor tiket akan tersedia sebentar lagi. Bapak/Ibu dapat memantau "
+        f"status di {_PORTAL_TRACK_URL.format(ticket='')[:-1]}. Terima kasih."
     )
+
+
+# ===========================================================================
+# CONFIRM-stage handlers (intent-based, no rigid keyword).
+# ===========================================================================
+
+async def _handle_confirm(sess: SubmissionSession, message: str) -> str:
+    """Classify the citizen's CONFIRM-stage reply by INTENT and act:
+      AFFIRM   → submit
+      DECLINE  → warmly hold/cancel (clears the session)
+      CORRECT  → update the field, re-show the summary, re-ask
+      QUESTION → brief answer, then re-ask
+      UNCLEAR  → gentle clarifying question
+    """
+    from services import submission_intent
+
+    intent = await submission_intent.classify_confirm_intent(message)
+
+    if intent == submission_intent.AFFIRM:
+        return await _submit(sess, force=sess.override_offered)
+
+    if intent == submission_intent.DECLINE:
+        await _clear_session(sess.user_id)
+        logger.info("Guided-submission declined at confirm | user=%s", _mask(sess.user_id))
+        return (
+            "Baik Bapak/Ibu, pengajuannya kita tahan dulu. Kapan pun siap untuk "
+            "melanjutkan, cukup beri tahu saya ya."
+        )
+
+    if intent == submission_intent.CORRECT:
+        applied = _apply_correction(sess, message)
+        sess.touch()
+        await _put_session(sess)
+        if applied:
+            lines = ["Baik, sudah saya perbarui."]
+            lines += [""] + _data_readback_lines(sess)
+            lines += ["", "Apakah Bapak/Ibu yakin untuk mengajukan izin ini sekarang?"]
+            return "\n".join(lines)
+        # Couldn't parse a concrete correction — ask what to fix.
+        return (
+            "Baik, ada data yang ingin diperbaiki ya. Boleh sebutkan datanya, "
+            "misalnya \"NIK saya yang benar 3374...\" atau \"nama usaha PT Maju "
+            "Jaya\"?"
+        )
+
+    if intent == submission_intent.QUESTION:
+        answer = await _answer_confirm_question(sess, message)
+        return (
+            f"{answer}\n\n"
+            "Apakah Bapak/Ibu yakin untuk mengajukan izin ini sekarang?"
+        )
+
+    # UNCLEAR → gentle clarifier (re-anchor with a compact score reminder).
+    return (
+        _score_reminder_prefix(sess)
+        + "Mohon maaf, saya belum sepenuhnya menangkap maksud Bapak/Ibu. Apakah "
+        "kita lanjutkan pengajuan izin ini sekarang? Jika ada data yang ingin "
+        "diperbaiki, sebutkan saja datanya."
+    )
+
+
+# A correction message that supplies a NIK, e.g. "NIK saya 3374..." — extract
+# a 16-digit run anywhere in the text.
+_NIK_RUN_RE = re.compile(r"(?<!\d)(\d[\d .\-]{14,30}\d)(?!\d)")
+
+# A "nama usaha ..." correction — capture the trailing value.
+_BUSINESS_CORRECTION_RE = re.compile(
+    r"(?:nama\s+usaha|usaha(?:nya)?|badan\s+usaha|nama\s+pt|nama\s+cv)\s*"
+    r"(?:saya\s+)?(?:adalah\s+|yaitu\s+|:\s*)?(.+)$",
+    re.IGNORECASE,
+)
+
+# A "nama (saya) ..." correction (the person's name) — only when it doesn't
+# mention "usaha" (that's the business-name case above).
+_NAME_CORRECTION_RE = re.compile(
+    r"(?:nama(?:\s+lengkap)?|namanya)\s*(?:saya\s+)?(?:adalah\s+|yaitu\s+|:\s*)?(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _apply_correction(sess: SubmissionSession, message: str) -> bool:
+    """Parse a free-text correction and update sess.fields. Returns True when at
+    least one field was changed.
+
+    Handles the common shapes:
+      * a 16-digit NIK anywhere ("NIK saya yang benar 3374...") → nik
+      * "nama usaha PT Maju Jaya" / "usaha saya ..." → business_name
+      * "nama saya Budi" / "namanya Budi" → applicant_name
+    Conservative: if nothing parses cleanly, returns False and the caller asks.
+    """
+    msg = (message or "").strip()
+    changed = False
+
+    # NIK first — a 16-digit run is unambiguous.
+    m = _NIK_RUN_RE.search(msg)
+    if m:
+        nik = _v_nik(m.group(1))
+        if nik:
+            sess.fields["nik"] = nik
+            changed = True
+
+    # Business name (must check before the bare-name pattern, since "nama usaha"
+    # also matches the name regex).
+    mb = _BUSINESS_CORRECTION_RE.search(msg)
+    if mb:
+        val = _v_business_name(mb.group(1))
+        if val:
+            sess.fields["business_name"] = val
+            changed = True
+    elif "usaha" not in msg.lower():
+        mn = _NAME_CORRECTION_RE.search(msg)
+        if mn:
+            val = _v_name(_name_candidate_cleanup(mn.group(1)))
+            if val:
+                sess.fields["applicant_name"] = val
+                changed = True
+
+    return changed
+
+
+async def _answer_confirm_question(sess: SubmissionSession, message: str) -> str:
+    """A brief, grounded answer to a citizen question at the CONFIRM stage.
+
+    Kept deterministic + safe: we answer from the session's own facts (licence
+    name, SLA, retribution, data privacy) rather than a free LLM generation, so
+    a question never derails the flow or hallucinates. Falls back to a warm
+    generic reassurance.
+    """
+    q = (message or "").lower()
+    if any(w in q for w in ("berapa lama", "lama", "waktu", "proses berapa", "kapan selesai")):
+        if sess.sla_working_days:
+            return (
+                f"Perkiraan waktu prosesnya sekitar {sess.sla_working_days} hari "
+                "kerja setelah permohonan masuk dan diverifikasi petugas."
+            )
+        return (
+            "Lama prosesnya mengikuti ketentuan SIAP Jateng untuk izin ini; "
+            "setelah terkirim, Bapak/Ibu bisa memantau statusnya lewat portal."
+        )
+    if any(w in q for w in ("biaya", "bayar", "retribusi", "gratis", "harga")):
+        if sess.retribution_fee:
+            return f"Untuk biaya/retribusi izin ini: {sess.retribution_fee}."
+        return (
+            "Soal biaya/retribusi mengikuti ketentuan resmi SIAP Jateng untuk "
+            "izin ini. Petugas akan mengonfirmasi rinciannya bila ada."
+        )
+    if any(w in q for w in ("aman", "privasi", "data saya", "bocor", "rahasia")):
+        return (
+            "Data Bapak/Ibu hanya kami gunakan untuk memproses permohonan izin "
+            "ini ke SIAP Jateng dan tidak kami sebarkan."
+        )
+    if any(w in q for w in ("untuk apa", "buat apa", "kenapa", "kegunaan")):
+        return (
+            f"Pengajuan ini untuk menerbitkan {sess.license_name} Bapak/Ibu "
+            "lewat SIAP Jateng, sistem perizinan resmi DPMPTSP Jawa Tengah."
+        )
+    return (
+        "Tentu, saya bantu sebisanya. Untuk pertanyaan lebih rinci, petugas "
+        "DPMPTSP juga bisa membantu setelah permohonan masuk."
+    )
+
+
+# ===========================================================================
+# Score reminder (compact one-liner for CONFIRM re-prompts).
+# ===========================================================================
+
+_SCORE_STATUS_LABEL: dict[str, str] = {
+    "ready": "siap dikirim",
+    "needs_fix": "perlu diperbaiki",
+    "unverified": "belum tervalidasi",
+}
+
+
+def _score_reminder_prefix(sess: SubmissionSession) -> str:
+    """A compact 'Skor terkini: X% (status)' line prepended to a CONFIRM re-
+    prompt so the citizen keeps the score context across turns. Empty string
+    when no score has been computed yet. Survives a restart via the JSON-safe
+    last_score fields."""
+    score = sess.last_score
+    if not isinstance(score, dict) or "score_percent" not in score:
+        return ""
+    pct = score.get("score_percent")
+    status = _SCORE_STATUS_LABEL.get(str(score.get("status", "")), "")
+    tail = f" ({status})" if status else ""
+    return f"Skor terkini: {pct}%{tail}\n\n"
+
+
+# ===========================================================================
+# COLLECTING_DOCS text handler — the citizen typed something while we wait for
+# (or have already gathered) documents.
+# ===========================================================================
+
+# Soft "I'm done sending documents" signal. Unlike the old hard SELESAI gate,
+# this just lets the citizen nudge BIMA to process now if the debounce hasn't
+# fired yet; it's not required.
+_DONE_HINT_RE = re.compile(
+    r"\b(selesai|sudah\s+semua|sudah\s+lengkap|udah\s+semua|udah\s+selesai|"
+    r"itu\s+saja|sekian|cukup|done|finish(?:ed)?|sudah\s+saya\s+kirim|"
+    r"sudah\s+upload)\b",
+    re.IGNORECASE,
+)
+
+
+async def _handle_collecting_docs_text(sess: SubmissionSession, message: str) -> str:
+    """A text message arrived at COLLECTING_DOCS. Possibilities:
+      * the citizen is supplying a missing field we asked for (a name or NIK) →
+        capture it, then process if both are now present;
+      * the citizen says 'sudah semua' → process now if docs exist;
+      * a typed name+NIK pair before any doc → capture what we can, nudge;
+      * otherwise → a warm reminder to upload.
+    Document arrival itself is handled out-of-band by the debounce, not here.
+    """
+    msg = message.strip()
+
+    # Capture a typed correction/answer for a missing field (name / NIK).
+    captured = _capture_typed_field(sess, msg)
+    if captured:
+        sess.touch()
+        await _put_session(sess)
+        missing = sess.missing_required_fields()
+        if not missing and sess.documents:
+            # All required fields present + docs on hand → consolidate to CONFIRM.
+            return await _process_collected_documents(sess)
+        if missing:
+            return _ask_missing_field(sess, missing)
+        # Fields complete but no docs yet — ask for the upload.
+        return (
+            "Terima kasih, datanya sudah saya catat. Tinggal upload dokumen "
+            "persyaratannya ya (foto JPG/PNG atau PDF, boleh beberapa sekaligus)."
+        )
+
+    # Soft "I'm done" → process whatever we have now.
+    if _DONE_HINT_RE.search(msg):
+        if sess.documents:
+            return await _process_collected_documents(sess)
+        return (
+            "Saya belum menerima dokumennya, Bapak/Ibu. Silakan upload foto "
+            "(JPG/PNG) atau PDF dokumen persyaratan di sini terlebih dahulu ya."
+        )
+
+    # Otherwise — a warm reminder. If documents are already attached but the
+    # debounce somehow hasn't fired (e.g. lost on a restart), processing them is
+    # the most helpful response.
+    if sess.documents and (time.time() - sess.last_doc_at) >= _debounce_seconds():
+        return await _process_collected_documents(sess)
+
+    return (
+        f"Baik Bapak/Ibu. Untuk mengajukan {sess.license_name}, silakan upload "
+        "dokumen persyaratannya di sini sebagai foto (JPG/PNG) atau PDF "
+        "(boleh beberapa sekaligus). Saya periksa setelah semuanya masuk."
+    )
+
+
+def _capture_typed_field(sess: SubmissionSession, message: str) -> bool:
+    """If the citizen TYPED a missing field (a bare NIK, a name, or 'NIK 33..'),
+    store it. Returns True when a field was captured.
+
+    Only fills fields that are currently MISSING — a typed value never silently
+    overwrites a value already read from the KTP (a CORRECT at CONFIRM does that
+    explicitly).
+    """
+    msg = (message or "").strip()
+    changed = False
+
+    if not sess.fields.get("nik"):
+        m = _NIK_RUN_RE.search(msg)
+        if m:
+            nik = _v_nik(m.group(1))
+            if nik:
+                sess.fields["nik"] = nik
+                changed = True
+
+    if not sess.fields.get("applicant_name"):
+        # Try a "nama ..." pattern first; else, if the whole message reads like
+        # a plain name (and isn't just a NIK), take it as the name.
+        mn = _NAME_CORRECTION_RE.search(msg)
+        candidate = mn.group(1) if mn else msg
+        candidate = _name_candidate_cleanup(candidate)
+        # Don't treat a pure-digits message (a typed NIK) as a name.
+        if candidate and not re.fullmatch(r"[\d .\-]+", candidate.strip()):
+            cleaned = _v_name(candidate)
+            if cleaned:
+                sess.fields["applicant_name"] = cleaned
+                changed = True
+
+    return changed
+
+
+def _name_candidate_cleanup(candidate: str) -> str:
+    """Trim a name candidate so a co-located NIK / second clause doesn't bleed
+    into the name. "Andi Wijaya, NIK 3312..." -> "Andi Wijaya".
+
+    Cuts at the first comma, semicolon, or a 'NIK'/digit-run boundary — names
+    don't contain those, so this only ever removes accidental run-on.
+    """
+    s = (candidate or "").strip()
+    # Cut at an explicit separator first.
+    s = re.split(r"[,;\n]", s, maxsplit=1)[0]
+    # Cut before a 'NIK' clause or a long digit run.
+    s = re.split(r"\b(?:nik|nomor)\b", s, maxsplit=1, flags=re.IGNORECASE)[0]
+    s = re.split(r"\d{6,}", s, maxsplit=1)[0]
+    return s.strip(" .-")
+
+
+# ===========================================================================
+# RESOLVING_LICENSE handler.
+# ===========================================================================
+
+def _handle_license_choice(sess: SubmissionSession, message: str) -> Optional[dict]:
+    """At RESOLVING_LICENSE with candidates: parse the citizen's numeric pick."""
+    if not sess.candidates:
+        return None
+    m = _NUMERIC_PICK_RE.match(message.strip())
+    if not m:
+        return None
+    idx = int(m.group(1))
+    if 1 <= idx <= len(sess.candidates):
+        return sess.candidates[idx - 1]
+    return None
 
 
 # ===========================================================================
@@ -1413,15 +1666,9 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
 async def maybe_handle(user_id: str, message: str) -> Optional[str]:
     """Guided-submission FAST-PATH for `ai_handler`.
 
-    Returns:
-      * a reply string — the message belonged to (or started) a guided
-        submission; `ai_handler` should return it directly without calling
-        Gemma.
-      * None — not a submission message; `ai_handler` proceeds normally.
-
-    The flow only ever engages when `BIMA_GUIDED_SUBMISSION_ENABLED` is on.
-    With the flag off this returns None unconditionally, so `ai_handler`
-    behaves exactly as it did before this module existed.
+    Returns a reply string when the message belonged to (or started) a guided
+    submission; None when ai_handler should proceed normally. Engages only when
+    `BIMA_GUIDED_SUBMISSION_ENABLED` is on. NEVER raises into the chat path.
     """
     if not is_enabled():
         return None
@@ -1432,75 +1679,32 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
     # --- No active session: only engage on a fresh submission intent ----
     if sess is None or sess.stage in (Stage.DONE, Stage.FAILED):
         if detect_submission_intent(msg):
-            logger.info(
-                "Guided-submission intent detected — starting flow | user=%s",
-                _mask(user_id),
-            )
+            logger.info("Guided-submission intent detected — starting flow | user=%s", _mask(user_id))
             try:
                 return await _start_session(user_id, msg)
             except Exception:
-                logger.exception(
-                    "Guided-submission start crashed | user=%s", _mask(user_id)
-                )
+                logger.exception("Guided-submission start crashed | user=%s", _mask(user_id))
                 await _clear_session(user_id)
-                return None  # degrade: let ai_handler take the message
+                return None
         return None
 
-    # --- Active session: this message belongs to the flow ---------------
-    # A citizen can bail out of the form at any step.
-    if _CANCEL_PATTERN.match(msg):
+    # --- Active session ---
+    from services import submission_intent
+
+    # Strong literal cancel ('batal'/'cancel'/'stop') works at ANY stage,
+    # regardless of the LLM (the owner kept 'batal' as a hard decline).
+    if submission_intent.is_hard_cancel(msg):
         await _clear_session(user_id)
-        logger.info("Guided-submission cancelled | user=%s", _mask(user_id))
+        logger.info("Guided-submission cancelled (hard) | user=%s", _mask(user_id))
         return (
-            "Baik, pengajuan izin dibatalkan. Jika sewaktu-waktu ingin "
+            "Baik Bapak/Ibu, pengajuan izin dibatalkan. Kapan pun ingin "
             "mengajukan lagi, cukup beri tahu saya."
         )
 
-    # MULAI BARU — switch to a fresh submission. Runs at ANY active stage,
-    # BEFORE the per-stage dispatch consumes the message as a field/SIAP/SELESAI.
-    #   * with a pending intercepted intent → clear the current form and START a
-    #     fresh resolution from the stashed message (same path _start_session
-    #     uses), so the new licence resolves cleanly.
-    #   * without one → behave like BATAL but ask them to name the new licence.
-    if _RESTART_PATTERN.match(msg):
-        pending = sess.pending_new_intent
-        if pending:
-            logger.info(
-                "Guided-submission MULAI BARU — restarting from intercepted "
-                "intent | user=%s",
-                _mask(user_id),
-            )
-            try:
-                # _start_session builds a brand-new SubmissionSession and writes
-                # it through under this user_id, so the old form is replaced.
-                return await _start_session(user_id, pending)
-            except Exception:
-                logger.exception(
-                    "Guided-submission MULAI BARU restart crashed | user=%s",
-                    _mask(user_id),
-                )
-                await _clear_session(user_id)
-                return None
-        await _clear_session(user_id)
-        logger.info("Guided-submission MULAI BARU (no pending) | user=%s", _mask(user_id))
-        return (
-            "Baik, pengajuan sebelumnya dibatalkan. Mohon sebutkan *nama izin* "
-            "yang ingin Anda ajukan (contoh: \"Izin Pemakaian Tanah\")."
-        )
-
-    # New-submission intent INTERCEPT (FIX A) — while a form is ACTIVE
-    # (CONFIRMING_START / COLLECTING_FIELDS / COLLECTING_DOCS, NOT
-    # RESOLVING_LICENSE), a clear "saya mau ajukan izin …" must NOT be eaten as
-    # a field answer / SELESAI / doc trigger. We stash it and offer MULAI BARU.
-    # detect_submission_intent is conservative (verb-phrase + licensing-object),
-    # so a normal name ("Budi Santoso"), a NIK, "SIAP", or "SELESAI" never trips
-    # it. RESOLVING_LICENSE is excluded — there a licence-name message is the
-    # expected input.
-    if sess.stage in (
-        Stage.CONFIRMING_START,
-        Stage.COLLECTING_FIELDS,
-        Stage.COLLECTING_DOCS,
-    ) and detect_submission_intent(msg):
+    # New-submission intent INTERCEPT while a form is ACTIVE (COLLECTING_DOCS /
+    # CONFIRM, NOT RESOLVING_LICENSE): a clear "saya mau ajukan izin ..." must
+    # not be eaten as a correction/answer. Offer to switch; stash the text.
+    if sess.stage in (Stage.COLLECTING_DOCS, Stage.CONFIRM) and detect_submission_intent(msg):
         sess.pending_new_intent = msg
         sess.touch()
         await _put_session(sess)
@@ -1509,94 +1713,60 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
             _mask(user_id), sess.stage.value,
         )
         return (
-            f"Anda sedang mengisi pengajuan {sess.license_name}. Ketik "
-            "*MULAI BARU* untuk mengganti dengan pengajuan baru, atau lanjutkan "
-            "dengan menjawab pertanyaan sebelumnya."
+            f"Bapak/Ibu sedang mengajukan {sess.license_name}. Jika ingin "
+            "mengganti dengan pengajuan yang baru, beri tahu saya \"ya, ganti\"; "
+            "atau lanjutkan saja yang sekarang."
         )
 
-    # The citizen sent neither a restart nor a new-submission intent — they are
-    # continuing the current form. Any previously-stashed intercepted intent is
-    # now stale (they chose to proceed), so clear it before the stage dispatch.
+    # If a new-intent was previously stashed and the citizen now confirms the
+    # switch, re-resolve from the stashed text (a fresh session).
     if sess.pending_new_intent is not None:
-        sess.pending_new_intent = None
-        sess.touch()
-        await _put_session(sess)
+        switch_intent = await submission_intent.classify_confirm_intent(msg)
+        pending = sess.pending_new_intent
+        if switch_intent == submission_intent.AFFIRM:
+            logger.info(
+                "Guided-submission switching to stashed new intent | user=%s",
+                _mask(user_id),
+            )
+            try:
+                return await _start_session(user_id, pending)
+            except Exception:
+                logger.exception("Guided-submission switch crashed | user=%s", _mask(user_id))
+                await _clear_session(user_id)
+                return None
+        if switch_intent == submission_intent.DECLINE:
+            # They chose to continue the current form — clear the stash + re-prompt.
+            sess.pending_new_intent = None
+            sess.touch()
+            await _put_session(sess)
+            # Fall through to the normal stage handler below with the cleared stash.
+        else:
+            # Ambiguous about the switch — keep the stash, ask plainly.
+            return (
+                f"Untuk memastikan: apakah Bapak/Ibu ingin mengganti ke "
+                "pengajuan yang baru, atau melanjutkan "
+                f"{sess.license_name} yang sekarang? Balas \"ganti\" atau "
+                "\"lanjutkan\"."
+            )
 
     try:
         if sess.stage == Stage.RESOLVING_LICENSE:
-            # Either a numeric pick from a shortlist, or a fresh licence name.
             choice = _handle_license_choice(sess, msg)
             if choice is not None:
                 return await _lock_license(sess, choice)
             if sess.candidates:
                 return (
-                    "Mohon balas dengan *nomor* dari daftar di atas, atau "
-                    "ketik *BATAL* untuk membatalkan."
+                    "Boleh pilih dengan membalas salah satu nomor dari daftar "
+                    "di atas ya, Bapak/Ibu."
                 )
-            # No candidates pending → treat the message as a licence query.
-            # Pass the RAW message: the LLM resolver understands intent on its
-            # own, so prepending "ajukan izin " (as before) only added filler
-            # the old substring matcher then choked on — e.g. "PKPP" became
-            # "ajukan izin PKPP" → 0 matches.
+            # No candidates pending → treat the message as a fresh licence query.
             return await _start_session(user_id, msg)
 
-        if sess.stage == Stage.CONFIRMING_START:
-            # Readiness gate: requirements were shown; advance only on an
-            # explicit affirmative (SIAP / YA / MULAI / OKE / SIAP DIPANDU).
-            if _AFFIRM_START_PATTERN.match(msg):
-                return await _begin_field_collection(sess)
-            # Anything else (BATAL is handled above) → re-prompt.
-            return (
-                f"Apakah Anda siap saya pandu untuk mengajukan "
-                f"{sess.license_name}? Balas *SIAP* untuk mulai, atau *BATAL* "
-                "untuk membatalkan."
-            )
-
-        if sess.stage == Stage.COLLECTING_FIELDS:
-            return await _collect_field(sess, msg)
-
         if sess.stage == Stage.COLLECTING_DOCS:
-            # Explicit document-collection step. The citizen sends their files
-            # (handled out-of-band by the media webhook → handle_inbound_documents)
-            # and types SELESAI here when finished.
-            if _DONE_PATTERN.match(msg):
-                if sess.documents:
-                    # At least one document → score now and move to REVIEW.
-                    return await _enter_doc_scoring(sess)
-                # No documents sent yet → nudge to send at least one.
-                return (
-                    "Belum ada dokumen yang saya terima. Mohon kirim minimal "
-                    "satu dokumen persyaratan (foto JPG/PNG atau PDF, maksimal "
-                    "10 MB) terlebih dahulu, lalu ketik SELESAI."
-                )
-            # A non-SELESAI text message while waiting for documents. In the
-            # demo-packet rehearsal path (NOT production) there are no live
-            # uploads, so fall through to scoring the auto-loaded packet. In the
-            # live path, re-show the prompt so the citizen knows to send files
-            # (or type SELESAI) — we do NOT score on arbitrary chatter, only on
-            # an explicit SELESAI.
-            if _demo_packet_dir() is not None:
-                return await _enter_doc_scoring(sess)
-            return _DOC_PROMPT
+            return await _handle_collecting_docs_text(sess, msg)
 
-        if sess.stage == Stage.REVIEW:
-            # If the "send as-is" override has already been offered for a
-            # sub-threshold packet, the next YA/KIRIM force-submits past the
-            # ok-gate. Otherwise it's the first confirm → validate normally.
-            if _AFFIRM_PATTERN.match(msg):
-                return await _submit(sess, force=sess.override_offered)
-            # "KIRIM" retry after a validation-issues message.
-            if re.match(r"^\s*kirim\s*$", msg, re.IGNORECASE):
-                return await _submit(sess, force=sess.override_offered)
-            # Any other REVIEW-stage message (e.g. a clarifying question before
-            # confirming): re-anchor the citizen with the latest score so they
-            # never lose the context of why validation passed/failed.
-            return (
-                _score_reminder_prefix(sess)
-                + "Ketik *YA* untuk memvalidasi dan mengirim permohonan, atau "
-                "*BATAL* untuk membatalkan. Jika ada data yang ingin diubah, "
-                "ketik *BATAL* lalu mulai ulang pengajuan."
-            )
+        if sess.stage == Stage.CONFIRM:
+            return await _handle_confirm(sess, msg)
     except Exception:
         logger.exception(
             "Guided-submission handler crashed | user=%s | stage=%s",
@@ -1604,9 +1774,9 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
         )
         await _clear_session(user_id)
         return (
-            "Maaf, terjadi gangguan saat memproses pengajuan Anda. "
-            "Pengajuan dibatalkan — mohon mulai ulang dengan menyebutkan "
-            "izin yang ingin Anda ajukan."
+            "Mohon maaf, terjadi gangguan saat memproses pengajuan Bapak/Ibu. "
+            "Pengajuan dibatalkan — silakan mulai lagi dengan menyebutkan izin "
+            "yang ingin diajukan."
         )
 
     # Unknown stage — clear and let ai_handler handle the message.
