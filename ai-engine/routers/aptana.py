@@ -357,16 +357,20 @@ async def _process_inbound_media(msisdn: str, media, message_id: str | None = No
         content=downloaded.content,
     )
 
+    # Attach the document SILENTLY and let the per-session DEBOUNCE produce ONE
+    # consolidated reply once the upload burst settles (sent OUT-OF-BAND by the
+    # debounce task via the channel sender). So a burst of N media webhooks ->
+    # N _process_inbound_media tasks -> N silent attaches -> exactly ONE reply,
+    # not N. handle_inbound_documents therefore returns None at the document-
+    # collection stages; we must NOT send a per-file acknowledgment here.
+    #
+    # It returns a NON-None string only for the early nudge (a file arrived
+    # before the citizen named a licence) — send that immediately.
     reply = await guided_submission.handle_inbound_documents(user_id, [doc])
-    if reply is None:
-        # Session vanished between checks, or scoring degraded. Give a generic
-        # acknowledgment rather than stranding the citizen.
-        reply = (
-            "Dokumen Anda sudah saya terima. Lanjutkan pengajuan Anda, ya."
-        )
-    delivered = await send_text(recipient_phone=msisdn, body=reply)
-    if not delivered:
-        logger.error("APTANA media reply delivery failed | user=%s", _mask(msisdn))
+    if reply is not None:
+        delivered = await send_text(recipient_phone=msisdn, body=reply)
+        if not delivered:
+            logger.error("APTANA media reply delivery failed | user=%s", _mask(msisdn))
 
 
 # ---------------------------------------------------------------------------

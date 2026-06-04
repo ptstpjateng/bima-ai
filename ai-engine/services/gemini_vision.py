@@ -179,3 +179,97 @@ async def extract_structured(
     )
 
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# KTP field extraction — used by the guided-submission redesign so the
+# applicant's name + NIK come from the uploaded document, NOT from a Q&A.
+#
+# This is a thin, purpose-built wrapper over `extract_structured`. It runs on
+# the same Gemini Vision model and accepts the same image/PDF bytes the
+# suitability judge already reads. Returns a small normalised dict or None on
+# any failure (caller then asks for the field naturally — never hard-blocks).
+#
+# PII: bytes are never logged here (extract_structured logs only field counts).
+# The caller is responsible for masking the NIK before it reaches a screen/log.
+# ---------------------------------------------------------------------------
+
+_KTP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "is_ktp": {
+            "type": "boolean",
+            "description": "True only if this document is an Indonesian KTP (Kartu Tanda Penduduk).",
+        },
+        "nama": {
+            "type": "string",
+            "description": "The full name (Nama) printed on the KTP, exactly as written.",
+        },
+        "nik": {
+            "type": "string",
+            "description": "The 16-digit NIK number printed on the KTP. Digits only.",
+        },
+        "jenis_kelamin": {
+            "type": "string",
+            "description": "Gender as printed: 'LAKI-LAKI' or 'PEREMPUAN'. Empty if not legible.",
+        },
+    },
+    "required": ["is_ktp"],
+}
+
+_KTP_PROMPT = (
+    "This is (or claims to be) an Indonesian KTP (Kartu Tanda Penduduk). "
+    "Read it carefully and extract: is_ktp (true only if it really is a KTP), "
+    "the full name (Nama), the 16-digit NIK (digits only, no spaces or dots), "
+    "and the gender (Jenis Kelamin: LAKI-LAKI or PEREMPUAN). If a field is not "
+    "legible, return an empty string for it. Do not guess or invent digits."
+)
+
+
+async def extract_ktp_fields(
+    *,
+    image_bytes: bytes,
+    mime_type: str,
+) -> Optional[dict[str, Any]]:
+    """Extract {name, nik, gender, is_ktp} from a KTP image/PDF.
+
+    Returns a normalised dict:
+      {"is_ktp": bool, "name": str|None, "nik": str|None, "gender": str|None}
+    or None when Vision is unconfigured / the call fails / output is unusable.
+
+    `nik` is returned ONLY when it is exactly 16 digits (KTP invariant); a
+    partial/garbled read yields nik=None so the caller asks for it rather than
+    storing a wrong value. NEVER raises.
+    """
+    if not is_configured():
+        logger.info("extract_ktp_fields: Gemini Vision not configured")
+        return None
+
+    parsed = await extract_structured(
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        prompt=_KTP_PROMPT,
+        response_schema=_KTP_SCHEMA,
+    )
+    if parsed is None:
+        return None
+
+    import re as _re
+
+    name = str(parsed.get("nama", "") or "").strip() or None
+    raw_nik = str(parsed.get("nik", "") or "")
+    nik_digits = _re.sub(r"\D", "", raw_nik)
+    nik = nik_digits if len(nik_digits) == 16 else None
+    gender_raw = str(parsed.get("jenis_kelamin", "") or "").strip().upper()
+    gender = None
+    if "LAKI" in gender_raw:
+        gender = "LAKI-LAKI"
+    elif "PEREMPUAN" in gender_raw or "WANITA" in gender_raw:
+        gender = "PEREMPUAN"
+
+    return {
+        "is_ktp": bool(parsed.get("is_ktp", False)),
+        "name": name,
+        "nik": nik,
+        "gender": gender,
+    }

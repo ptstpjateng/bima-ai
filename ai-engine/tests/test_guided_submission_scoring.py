@@ -1,27 +1,27 @@
 """
-Tests for the live content-scoring additions to the guided-submission flow —
-the new document intake + suitability-judge wiring in
-`services/guided_submission.py`.
+Tests for the scoring + field-extraction + submit internals of the REDESIGNED
+guided-submission flow (`services/guided_submission.py`).
 
 Run standalone (no pytest):
 
-    python -m tests.test_guided_submission_scoring     # from ai-engine/
-    python tests/test_guided_submission_scoring.py     # also works
+    python3 tests/test_guided_submission_scoring.py
 
-Covers:
-  * attach_documents — attaches in-session bytes to an active session, caps
-    count, no-ops on a terminal/missing session.
-  * _load_demo_packet — reads a directory of files, derives claimed types
-    from filenames, respects the env flag.
-  * _run_content_score — calls the citizen scorer (mocked) and normalises the
-    result; returns None when there are no in-session docs.
-  * _enter_doc_scoring — packet present → live score shown + REVIEW;
-    no packet → fixture fallback path.
-  * _submit officer hand-off — on a successful SIAP create, the officer
-    bridge is invoked with the score + documents (mocked).
+Covers the helper surface the new flow exposes:
+  * attach_documents / _attach_documents — attach in-session bytes, cap count,
+    no-op on a terminal/missing session, stamp last_doc_at.
+  * _load_demo_packet — reads a directory of files, derives claimed types.
+  * _run_content_score — calls the citizen scorer (mocked), normalises the
+    result; None when no in-session docs.
+  * _extract_fields_from_documents — KTP Vision (mocked) → name + NIK; phone
+    from the msisdn; business name from a NIB filename hint.
+  * _process_collected_documents — the consolidated pass: score + extract →
+    CONFIRM (or ask for a missing field, staying at COLLECTING_DOCS).
+  * _submit officer hand-off — on a successful SIAP create the officer bridge
+    is invoked with the score + documents; request_id recovered from ticket.
+  * _submit re-score after a Redis rehydrate dropped the rich `result`.
+  * the CONFIRM-stage score reminder on a non-AFFIRM clarifying turn.
 
-No real Gemini, no real DB, no real SIAP. The citizen scorer, the SIAP
-submission client, and the officer bridge are all patched.
+No real Gemini, no real DB, no real SIAP.
 """
 
 from __future__ import annotations
@@ -81,17 +81,21 @@ def _suitability_result(percent=90, critical=False):
     )
 
 
-def _make_session(stage=gs.Stage.COLLECTING_FIELDS):
+_KTP = {"is_ktp": True, "name": "Budi Santoso", "nik": "3374012345678901", "gender": "LAKI-LAKI"}
+
+
+def _make_session(stage=gs.Stage.COLLECTING_DOCS, *, with_fields=True):
     sess = gs.SubmissionSession(user_id="wa-628123")
     sess.license_id = 358
     sess.license_name = "Izin Penelitian"
     sess.stage = stage
-    sess.fields = {
-        "applicant_name": "Budi",
-        "nik": "3374012345678901",
-        "business_name": "CV Riset",
-        "phone": "628123",
-    }
+    if with_fields:
+        sess.fields = {
+            "applicant_name": "Budi",
+            "nik": "3374012345678901",
+            "business_name": "CV Riset",
+            "phone": "628123",
+        }
     return sess
 
 
@@ -99,7 +103,7 @@ class TestAttachDocuments(unittest.TestCase):
     def setUp(self):
         gs._sessions.clear()
 
-    def test_attaches_to_active_session(self):
+    def test_attaches_to_active_session_and_stamps_last_doc_at(self):
         sess = _make_session(gs.Stage.COLLECTING_DOCS)
         _run(gs._put_session(sess))
         ok = _run(gs.attach_documents(sess.user_id, [
@@ -107,6 +111,7 @@ class TestAttachDocuments(unittest.TestCase):
         ]))
         self.assertTrue(ok)
         self.assertEqual(len(gs._sessions[sess.user_id].documents), 1)
+        self.assertGreater(gs._sessions[sess.user_id].last_doc_at, 0.0)
 
     def test_noop_when_no_session(self):
         self.assertFalse(_run(gs.attach_documents("wa-nobody", [
@@ -175,35 +180,147 @@ class TestContentScore(unittest.TestCase):
         self.assertFalse(out["ok"])
 
 
-class TestEnterDocScoring(unittest.TestCase):
+class TestFieldExtraction(unittest.TestCase):
+    """Fields come from the documents + msisdn, not from Q&A."""
+
     def setUp(self):
         gs._sessions.clear()
 
-    def test_with_packet_shows_score_and_enters_review(self):
-        with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "ktp.jpg").write_bytes(b"\xff\xd8\xff fake")
-            sess = _make_session()
-            _run(gs._put_session(sess))
-            fake = _suitability_result(percent=82)
-            env = {"GUIDED_SUBMISSION_DEMO_PACKET": d}
-            with patch.dict(os.environ, env, clear=False):
-                with patch("services.citizen_scorer.score_session_documents",
-                           new=AsyncMock(return_value=fake)):
-                    reply = _run(gs._enter_doc_scoring(sess))
-            self.assertEqual(sess.stage, gs.Stage.REVIEW)
-            self.assertIsNotNone(sess.last_score)
-            # The live score message AND the review summary are both shown.
-            self.assertIn("82%", reply)
-            self.assertIn("Jenis izin", reply)
+    def test_ktp_populates_name_and_nik(self):
+        sess = _make_session(with_fields=False)
+        sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"\xff\xd8\xff")]
+        with patch("services.gemini_vision.extract_ktp_fields",
+                   new=AsyncMock(return_value=_KTP)), \
+             patch("services.gemini_vision.is_configured", return_value=True):
+            _run(gs._extract_fields_from_documents(sess))
+        self.assertEqual(sess.fields.get("applicant_name"), "Budi Santoso")
+        self.assertEqual(sess.fields.get("nik"), "3374012345678901")
+        # Phone always comes from the msisdn ('wa-628123').
+        self.assertEqual(sess.fields.get("phone"), "628123")
 
-    def test_without_packet_falls_back_to_fixture_review(self):
-        sess = _make_session()
+    def test_phone_from_msisdn_without_documents(self):
+        sess = _make_session(with_fields=False)
+        with patch("services.gemini_vision.is_configured", return_value=False):
+            _run(gs._extract_fields_from_documents(sess))
+        self.assertEqual(sess.fields.get("phone"), "628123")
+        # No KTP read (vision off) → name/NIK remain missing → required gap.
+        self.assertEqual(sess.missing_required_fields(), ["applicant_name", "nik"])
+
+    def test_business_name_from_nib_filename_hint(self):
+        sess = _make_session(with_fields=False)
+        sess.documents = [
+            gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"\xff\xd8\xff"),
+            gs.SessionDocument("d2", "nib cv maju jaya", "nib_cv_maju_jaya.pdf",
+                               "application/pdf", b"%PDF"),
+        ]
+        with patch("services.gemini_vision.extract_ktp_fields",
+                   new=AsyncMock(return_value=_KTP)), \
+             patch("services.gemini_vision.is_configured", return_value=True):
+            _run(gs._extract_fields_from_documents(sess))
+        self.assertEqual(sess.fields.get("business_name"), "nib cv maju jaya")
+
+    def test_vision_failure_leaves_field_missing_not_raises(self):
+        sess = _make_session(with_fields=False)
+        sess.documents = [gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"\xff\xd8\xff")]
+        with patch("services.gemini_vision.extract_ktp_fields",
+                   new=AsyncMock(side_effect=RuntimeError("vision boom"))), \
+             patch("services.gemini_vision.is_configured", return_value=True):
+            _run(gs._extract_fields_from_documents(sess))   # must NOT raise
+        self.assertIsNone(sess.fields.get("applicant_name"))
+        self.assertIsNone(sess.fields.get("nik"))
+
+
+class TestProcessCollectedDocuments(unittest.TestCase):
+    """The consolidated pass: score + extract → CONFIRM, or ask for a gap."""
+
+    def setUp(self):
+        gs._sessions.clear()
+
+    def test_complete_packet_moves_to_confirm_with_masked_nik(self):
+        sess = _make_session(gs.Stage.COLLECTING_DOCS, with_fields=False)
+        sess.documents = [gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"\xff\xd8\xff")]
+        _run(gs._put_session(sess))
+        with patch("services.citizen_scorer.score_session_documents",
+                   new=AsyncMock(return_value=_suitability_result(91))), \
+             patch("services.gemini_vision.extract_ktp_fields",
+                   new=AsyncMock(return_value=_KTP)), \
+             patch("services.gemini_vision.is_configured", return_value=True):
+            reply = _run(gs._process_collected_documents(sess))
+        self.assertEqual(sess.stage, gs.Stage.CONFIRM)
+        self.assertIsNotNone(sess.last_score)
+        self.assertIn("91%", reply)
+        self.assertIn("Budi Santoso", reply)
+        self.assertNotIn("3374012345678901", reply)   # NIK masked in the read-back
+        self.assertIn("yakin", reply.lower())
+
+    def test_missing_ktp_asks_for_field_stays_collecting(self):
+        sess = _make_session(gs.Stage.COLLECTING_DOCS, with_fields=False)
+        sess.documents = [gs.SessionDocument("d1", "foto", "foto.jpg", "image/jpeg", b"\xff\xd8\xff")]
+        _run(gs._put_session(sess))
+        no_ktp = {"is_ktp": False, "name": None, "nik": None, "gender": None}
+        with patch("services.citizen_scorer.score_session_documents",
+                   new=AsyncMock(return_value=_suitability_result(60))), \
+             patch("services.gemini_vision.extract_ktp_fields",
+                   new=AsyncMock(return_value=no_ktp)), \
+             patch("services.gemini_vision.is_configured", return_value=True):
+            reply = _run(gs._process_collected_documents(sess))
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+        self.assertIn("ktp", reply.lower())
+
+    def test_no_documents_nudges(self):
+        sess = _make_session(gs.Stage.COLLECTING_DOCS, with_fields=False)
         _run(gs._put_session(sess))
         with patch.dict(os.environ, {"GUIDED_SUBMISSION_DEMO_PACKET": ""}, clear=False):
-            reply = _run(gs._enter_doc_scoring(sess))
-        self.assertEqual(sess.stage, gs.Stage.REVIEW)
-        self.assertIsNone(sess.last_score)
-        self.assertIn("Jenis izin", reply)
+            reply = _run(gs._process_collected_documents(sess))
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+        self.assertIn("belum menerima", reply.lower())
+
+
+class TestHandleInboundDocumentsSilent(unittest.TestCase):
+    """handle_inbound_documents attaches SILENTLY (returns None) at the
+    document-collection stages — the debounce produces the consolidated reply
+    out-of-band; there is no per-file ack."""
+
+    def setUp(self):
+        gs._sessions.clear()
+        gs._debounce_tasks.clear()
+
+    def test_collecting_docs_returns_none_and_arms_debounce(self):
+        async def scenario():
+            sess = _make_session(gs.Stage.COLLECTING_DOCS)
+            await gs._put_session(sess)
+            with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true",
+                                         "GUIDED_SUBMISSION_DEBOUNCE_SECONDS": "30"}, clear=False):
+                r1 = await gs.handle_inbound_documents(
+                    sess.user_id, [gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"x")])
+                r2 = await gs.handle_inbound_documents(
+                    sess.user_id, [gs.SessionDocument("d2", "nib", "nib.pdf", "application/pdf", b"%PDF")])
+                # Both silent; ONE debounce task; both attached.
+                self.assertIsNone(r1)
+                self.assertIsNone(r2)
+                self.assertEqual(len(gs._debounce_tasks), 1)
+                self.assertEqual(len(gs._sessions[sess.user_id].documents), 2)
+        _run(scenario())
+        # Cleanup the long-debounce task left running.
+        gs._debounce_tasks.clear()
+
+    def test_resolving_license_upload_nudges_for_licence(self):
+        sess = _make_session(gs.Stage.RESOLVING_LICENSE, with_fields=False)
+        sess.license_id = None
+        sess.license_name = None
+        _run(gs._put_session(sess))
+        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
+            reply = _run(gs.handle_inbound_documents(
+                sess.user_id, [gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"x")]))
+        self.assertIsNotNone(reply)
+        self.assertIn("izin", reply.lower())
+        # No doc attached to a license-less session.
+        self.assertEqual(len(gs._sessions[sess.user_id].documents), 0)
+
+    def test_none_when_no_active_session(self):
+        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
+            doc = gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")
+            self.assertIsNone(_run(gs.handle_inbound_documents("wa-nobody", [doc])))
 
 
 class TestSubmitOfficerHandoff(unittest.TestCase):
@@ -211,7 +328,7 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
         gs._sessions.clear()
 
     def test_officer_bridge_invoked_on_success(self):
-        sess = _make_session(gs.Stage.REVIEW)
+        sess = _make_session(gs.Stage.CONFIRM)
         sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
         sess.last_score = {
             "ok": True, "status": "ready", "score_percent": 90,
@@ -219,7 +336,6 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
         }
         _run(gs._put_session(sess))
 
-        # SIAP submission client returns a ticket.
         fake_client = types.SimpleNamespace(
             is_configured=lambda: True,
             create_request=AsyncMock(return_value={
@@ -230,20 +346,13 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
         bridge_stub = types.ModuleType("services.officer_bridge")
         bridge_stub.notify_officer_of_submission = notify_mock
 
-        # _submit does `from services import officer_bridge`. If the REAL
-        # officer_bridge was already imported (e.g. another test file ran
-        # first under pytest), the `services` package holds it as an ATTRIBUTE
-        # and the from-import returns that attribute, NOT sys.modules — so
-        # patching sys.modules alone is silently ineffective. Patch BOTH the
-        # package attribute and sys.modules so this is order-independent.
         import services as _services_pkg
         env = {"GUIDED_SUBMISSION_PROFILE_ID": "12345"}
         with patch.dict(os.environ, env, clear=False):
             with patch("services.siap_submission_client.get_siap_submission_client",
                        return_value=fake_client):
                 with patch.dict(sys.modules, {"services.officer_bridge": bridge_stub}):
-                    with patch.object(_services_pkg, "officer_bridge", bridge_stub,
-                                      create=True):
+                    with patch.object(_services_pkg, "officer_bridge", bridge_stub, create=True):
                         reply = _run(gs._submit(sess))
 
         self.assertIn("000999888", reply)
@@ -255,11 +364,7 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
         self.assertEqual(kwargs["score"]["score_percent"], 90)
 
     def test_request_id_resolved_from_ticket_when_siap_omits_it(self):
-        # FIX 1: SIAP returns a ticket but a None request_id on a successful
-        # submit. _submit must recover the request_id from the ticket (so
-        # flow-based officer resolution, which is gated on request_id, runs) and
-        # pass the recovered id into the officer hand-off.
-        sess = _make_session(gs.Stage.REVIEW)
+        sess = _make_session(gs.Stage.CONFIRM)
         sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
         sess.last_score = {
             "ok": True, "status": "ready", "score_percent": 90,
@@ -270,13 +375,12 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
         fake_client = types.SimpleNamespace(
             is_configured=lambda: True,
             create_request=AsyncMock(return_value={
-                "ok": True, "ticket": "000999888", "request_id": None,  # omitted!
+                "ok": True, "ticket": "000999888", "request_id": None,
             }),
         )
         notify_mock = AsyncMock(return_value=True)
         bridge_stub = types.ModuleType("services.officer_bridge")
         bridge_stub.notify_officer_of_submission = notify_mock
-        # The ticket→request_id recovery seam.
         resolve_mock = AsyncMock(return_value=4242)
 
         import services as _services_pkg
@@ -286,24 +390,17 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
                        return_value=fake_client):
                 with patch("services.siap_tools.siap_resolve_request_id", resolve_mock):
                     with patch.dict(sys.modules, {"services.officer_bridge": bridge_stub}):
-                        with patch.object(_services_pkg, "officer_bridge", bridge_stub,
-                                          create=True):
+                        with patch.object(_services_pkg, "officer_bridge", bridge_stub, create=True):
                             reply = _run(gs._submit(sess))
 
         self.assertIn("000999888", reply)
-        # Recovery was attempted with the freshly-allocated ticket.
         resolve_mock.assert_awaited_once_with("000999888")
-        # ...and the recovered id flows into the officer hand-off.
         notify_mock.assert_awaited_once()
         _, kwargs = notify_mock.call_args
         self.assertEqual(kwargs["request_id"], 4242)
 
     def test_submit_succeeds_when_request_id_unrecoverable(self):
-        # FIX 1 degradation: ticket present, request_id None, and the ticket
-        # lookup also yields nothing. _submit must NOT crash — it proceeds with
-        # request_id=None (notify falls back to env as today) and the citizen
-        # still gets the success reply with the ticket.
-        sess = _make_session(gs.Stage.REVIEW)
+        sess = _make_session(gs.Stage.CONFIRM)
         sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
         sess.last_score = {
             "ok": True, "status": "ready", "score_percent": 90,
@@ -320,7 +417,7 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
         notify_mock = AsyncMock(return_value=False)
         bridge_stub = types.ModuleType("services.officer_bridge")
         bridge_stub.notify_officer_of_submission = notify_mock
-        resolve_mock = AsyncMock(return_value=None)  # ticket lookup misses too
+        resolve_mock = AsyncMock(return_value=None)
 
         import services as _services_pkg
         env = {"GUIDED_SUBMISSION_PROFILE_ID": "12345"}
@@ -329,8 +426,7 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
                        return_value=fake_client):
                 with patch("services.siap_tools.siap_resolve_request_id", resolve_mock):
                     with patch.dict(sys.modules, {"services.officer_bridge": bridge_stub}):
-                        with patch.object(_services_pkg, "officer_bridge", bridge_stub,
-                                          create=True):
+                        with patch.object(_services_pkg, "officer_bridge", bridge_stub, create=True):
                             reply = _run(gs._submit(sess))
 
         self.assertIn("000999888", reply)
@@ -340,25 +436,21 @@ class TestSubmitOfficerHandoff(unittest.TestCase):
 
 
 class TestSubmitRescoresAfterRehydrate(unittest.TestCase):
-    """FIX 3: after a Redis rehydrate, last_score is a non-None dict whose rich
-    `result` was stripped on encode. _submit must re-score (so the officer brief
-    / sub-threshold message get the full result), not reuse the trimmed dict."""
+    """After a Redis rehydrate, last_score is a non-None dict whose rich
+    `result` was stripped on encode. _submit must re-score, not reuse the trim."""
 
     def setUp(self):
         gs._sessions.clear()
 
     def test_rescore_when_result_missing_from_rehydrated_score(self):
-        sess = _make_session(gs.Stage.REVIEW)
+        sess = _make_session(gs.Stage.CONFIRM)
         sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
-        # Rehydrated score: JSON-safe fields only, NO `result` key.
         sess.last_score = {
             "ok": True, "status": "ready", "score_percent": 90,
             "summary": "s", "message": "m", "issues": [],
         }
         _run(gs._put_session(sess))
 
-        # SIAP unconfigured → _submit stops right after scoring (before any
-        # network), which is all we need to observe the re-score decision.
         unconfigured = types.SimpleNamespace(is_configured=lambda: False)
         fresh = _suitability_result(percent=90)
         score_mock = AsyncMock(return_value=fresh)
@@ -367,16 +459,13 @@ class TestSubmitRescoresAfterRehydrate(unittest.TestCase):
                 with patch("services.siap_submission_client.get_siap_submission_client",
                            return_value=unconfigured):
                     _run(gs._submit(sess))
-        # Re-scored from the rehydrated document bytes...
         score_mock.assert_awaited_once()
-        # ...and the rich result is now present on the session score.
         self.assertIn("result", sess.last_score)
         self.assertIs(sess.last_score["result"], fresh)
 
     def test_no_rescore_when_result_already_present(self):
-        sess = _make_session(gs.Stage.REVIEW)
+        sess = _make_session(gs.Stage.CONFIRM)
         sess.documents = [gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
-        # A complete in-memory score (rich result intact) → no re-score.
         sess.last_score = {
             "ok": True, "status": "ready", "score_percent": 90,
             "summary": "s", "message": "m", "issues": [], "result": _suitability_result(90),
@@ -393,143 +482,36 @@ class TestSubmitRescoresAfterRehydrate(unittest.TestCase):
 
 
 class TestScoreReminder(unittest.TestCase):
-    """Part C: a compact 'Skor terkini: X% (status)' line is prepended to a
-    REVIEW-stage clarifying message (not YA/KIRIM) once a score exists, using
-    the persisted last_score."""
+    """A compact 'Skor terkini: X% (status)' line is prepended to an UNCLEAR
+    CONFIRM re-prompt once a score exists (using the persisted last_score)."""
 
     def setUp(self):
         gs._sessions.clear()
 
-    def test_reminder_prepended_in_review(self):
-        sess = _make_session(gs.Stage.REVIEW)
+    def test_reminder_prepended_on_unclear_confirm(self):
+        sess = _make_session(gs.Stage.CONFIRM)
         sess.last_score = {
             "ok": False, "status": "needs_fix", "score_percent": 73,
             "summary": "s", "message": "m", "issues": [],
         }
         _run(gs._put_session(sess))
         with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
-            # A non-YA / non-KIRIM message in REVIEW → fallback reply with the
-            # compact score reminder prepended.
-            reply = _run(gs.maybe_handle(sess.user_id, "apakah ini sudah benar?"))
+            with patch("services.submission_intent.classify_confirm_intent",
+                       new=AsyncMock(return_value="UNCLEAR")):
+                reply = _run(gs.maybe_handle(sess.user_id, "hmm bagaimana ya"))
         self.assertIsNotNone(reply)
         self.assertIn("Skor terkini: 73%", reply)
         self.assertIn("perlu diperbaiki", reply)
-        # The standard confirm instruction still follows.
-        self.assertIn("YA", reply.upper())
 
     def test_no_reminder_without_score(self):
-        sess = _make_session(gs.Stage.REVIEW)
+        sess = _make_session(gs.Stage.CONFIRM)
         sess.last_score = None
         _run(gs._put_session(sess))
         with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
-            reply = _run(gs.maybe_handle(sess.user_id, "halo?"))
+            with patch("services.submission_intent.classify_confirm_intent",
+                       new=AsyncMock(return_value="UNCLEAR")):
+                reply = _run(gs.maybe_handle(sess.user_id, "hmm"))
         self.assertNotIn("Skor terkini", reply)
-
-
-class TestHandleInboundDocuments(unittest.TestCase):
-    """Part B seam: handle_inbound_documents attaches + scores + returns a
-    reply, or acknowledges while still collecting fields."""
-
-    def setUp(self):
-        gs._sessions.clear()
-
-    def test_scores_when_in_review(self):
-        sess = _make_session(gs.Stage.REVIEW)
-        _run(gs._put_session(sess))
-        fake = _suitability_result(percent=91)
-        doc = gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")
-        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
-            with patch("services.citizen_scorer.score_session_documents",
-                       new=AsyncMock(return_value=fake)):
-                reply = _run(gs.handle_inbound_documents(sess.user_id, [doc]))
-        self.assertIsNotNone(reply)
-        self.assertIn("91%", reply)
-        self.assertEqual(len(gs._sessions[sess.user_id].documents), 1)
-
-    def test_acknowledges_when_collecting_fields(self):
-        sess = _make_session(gs.Stage.COLLECTING_FIELDS)
-        # Make one field missing so there's a "next question".
-        sess.fields.pop("phone", None)
-        _run(gs._put_session(sess))
-        doc = gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")
-        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
-            reply = _run(gs.handle_inbound_documents(sess.user_id, [doc]))
-        self.assertIsNotNone(reply)
-        self.assertIn("Dokumen diterima", reply)
-        # Document is stored for later scoring.
-        self.assertEqual(len(gs._sessions[sess.user_id].documents), 1)
-
-    def test_collecting_docs_running_count_no_score(self):
-        # FIX D: at COLLECTING_DOCS, a document arriving is acknowledged with a
-        # running TOTAL count and is NOT scored (scoring waits for SELESAI).
-        sess = _make_session(gs.Stage.COLLECTING_DOCS)
-        _run(gs._put_session(sess))
-        score_mock = AsyncMock(return_value=_suitability_result(91))
-        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
-            with patch("services.citizen_scorer.score_session_documents", score_mock):
-                r1 = _run(gs.handle_inbound_documents(
-                    sess.user_id, [gs.SessionDocument("doc-1", "ktp", "ktp.jpg",
-                                                       "image/jpeg", b"x")]))
-                r2 = _run(gs.handle_inbound_documents(
-                    sess.user_id, [gs.SessionDocument("doc-2", "nib", "nib.pdf",
-                                                       "application/pdf", b"%PDF")]))
-        self.assertIn("1 total", r1)
-        self.assertIn("2 total", r2)
-        self.assertIn("SELESAI", r1)
-        # Never scored on upload; session still at COLLECTING_DOCS.
-        score_mock.assert_not_awaited()
-        self.assertEqual(gs._sessions[sess.user_id].stage, gs.Stage.COLLECTING_DOCS)
-        self.assertEqual(len(gs._sessions[sess.user_id].documents), 2)
-
-    def test_confirming_start_upload_acknowledged_early(self):
-        # A document sent during the readiness gate (CONFIRMING_START) is stored
-        # and acknowledged early — not scored, not dropped.
-        sess = _make_session(gs.Stage.CONFIRMING_START)
-        _run(gs._put_session(sess))
-        doc = gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")
-        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
-            reply = _run(gs.handle_inbound_documents(sess.user_id, [doc]))
-        self.assertIn("Dokumen diterima", reply)
-        self.assertEqual(len(gs._sessions[sess.user_id].documents), 1)
-
-    def test_none_when_no_active_session(self):
-        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
-            doc = gs.SessionDocument("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"x")
-            self.assertIsNone(_run(gs.handle_inbound_documents("wa-nobody", [doc])))
-
-
-class TestAskForDocuments(unittest.TestCase):
-    """FIX D: the field→docs transition asks for files (live path) but
-    auto-loads + scores the curated demo packet when one is configured."""
-
-    def setUp(self):
-        gs._sessions.clear()
-
-    def test_live_path_asks_for_documents(self):
-        sess = _make_session(gs.Stage.COLLECTING_FIELDS)
-        _run(gs._put_session(sess))
-        with patch.dict(os.environ, {"GUIDED_SUBMISSION_DEMO_PACKET": ""}, clear=False):
-            reply = _run(gs._ask_for_documents(sess))
-        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
-        self.assertIn("kirim dokumen", reply.lower())
-        self.assertIn("SELESAI", reply)
-        self.assertEqual(len(sess.documents), 0)
-
-    def test_demo_packet_autoloads_and_scores(self):
-        with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "ktp.jpg").write_bytes(b"\xff\xd8\xff fake")
-            sess = _make_session(gs.Stage.COLLECTING_FIELDS)
-            _run(gs._put_session(sess))
-            fake = _suitability_result(percent=90)
-            env = {"GUIDED_SUBMISSION_DEMO_PACKET": d}
-            with patch.dict(os.environ, env, clear=False):
-                with patch("services.citizen_scorer.score_session_documents",
-                           new=AsyncMock(return_value=fake)):
-                    reply = _run(gs._ask_for_documents(sess))
-        # Rehearsal path: packet auto-loaded → scored → REVIEW.
-        self.assertEqual(sess.stage, gs.Stage.REVIEW)
-        self.assertIn("90%", reply)
-        self.assertIn("Jenis izin", reply)
 
 
 if __name__ == "__main__":
