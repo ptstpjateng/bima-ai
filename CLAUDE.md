@@ -18,17 +18,17 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 *   **Live URLs:** see Service Map below.
 *   **WhatsApp UX:** sub-second typing acknowledgment (text bubble; APTANA doesn't expose Meta's native indicator — see [[Decisions]] §9). Final reply ~9–13 s.
 
-### 🧠 Primary LLM: Hosted Gemma via Google AI Studio
-*   **Model:** `gemma-3-27b-it` accessed via the Google Generative Language REST API
-    (`generativelanguage.googleapis.com/v1beta/models/gemma-3-27b-it:generateContent`)
-*   **Why Gemma:** Open-weights model hosted by Google — no VPS GPU needed, same API key/infra as Gemini, no vendor lock-in on weights.
-*   **Key differences from Gemini:**
-    - No `thinkingConfig` support — remove that field from all payloads
-    - No API-level `response_mime_type: application/json` — enforce JSON via prompt only
-    - Response parsing: strip Markdown code fences (` ```json ... ``` `) before `json.loads()` — Gemma sometimes wraps JSON in fences even when instructed not to
-    - `finishReason` values: `STOP` / `MAX_TOKENS` (same as Gemini, no `thought` parts)
+### 🧠 Primary LLM: Gemini 2.5 Flash via Google AI Studio
+*   **Model:** `gemini-2.5-flash` accessed via the Google Generative Language REST API
+    (`generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`)
+*   **Env var:** `GEMINI_MODEL=models/gemini-2.5-flash` in `ai-engine/.env`
+*   **Fallback ladder** (`ai_handler.py`; override via `GEMINI_FALLBACK_MODELS` env, comma-separated): on 429/503/network errors the citizen-chat path walks **`gemini-2.5-flash` → `gemini-2.5-pro` → `gemini-2.0-flash`** — version-diverse so a single model-line quota/outage doesn't take down the whole ladder. All rungs share the one API key. `license_resolver.py` and `submission_intent.py` run their own lightweight JSON-only pre-calls on the same precedence (`GEMINI_INTENT_MODEL` → `GEMINI_MODEL`).
+*   **⚠️ Billing — prepay is mandatory:** the Google AI Studio project MUST have a prepayment method set up (Billing → *Set up prepay*). Without it, even a paid **Tier 1** account is flagged *"Prepay required"* and rate-restricted, so **every call 429s regardless of spend** — this took BIMA fully offline on 2026-06-05 (the whole fallback ladder 429'd; BIMA could only send static apologies). Keep a **Monthly spend cap** set as the blast-radius backstop, and note the secret-redaction below.
+*   **Secret hygiene:** httpx logs the request URL at INFO and the API key rides in `?key=`. `logging_setup.py` (`configure_logging()` at `main.py` startup) redacts `generativelanguage.googleapis.com/...?key=` so the key never lands in container logs. If the key is ever exposed, rotate it in AI Studio → API Keys.
 *   **Intent classification:** `analyze_user_intent()` in `ai_handler.py` does a lightweight JSON-mode pre-call to extract phase (1/2/3) and KBLI code before the main generation call. This tightens RAG queries for KBLI-specific questions.
-*   **Env var:** `GEMINI_MODEL=models/gemma-3-27b-it` in `ai-engine/.env`
+*   **Response parsing:** strip Markdown code fences (` ```json ... ``` `) before `json.loads()` — the models sometimes wrap JSON in fences even when told not to.
+
+> **On Gemma / the open-weights story:** BIMA originally ran **`gemma-3-27b-it`** as primary — open-weights, hosted by Google (no VPS GPU, same API key/infra as Gemini, "no vendor lock-in on weights"). **Google has since RETIRED Gemma 3** — `gemma-3-27b-it` now **404s** on `generateContent`. The live open-weights line is **`gemma-4-31b-it`** (or `gemma-4-26b-a4b-it`). To put Gemma back in the loop, point `GEMINI_MODEL` / `GEMINI_FALLBACK_MODELS` at a Gemma-4 model — but mind the **Gemma payload differences** vs Gemini: no `thinkingConfig` field, no API-level `response_mime_type: application/json` (enforce JSON via prompt only), and strip code fences before parsing. `finishReason` values are the same (`STOP` / `MAX_TOKENS`, no `thought` parts). The default ladder is kept all-Gemini for drop-in payload compatibility.
 
 ## 🎨 UI & Design System
 
@@ -96,7 +96,7 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 *   **Raw Excel files on VPS:** `data-pipeline/data/raw_excel/kbli.xlsx` and `pb_umku.xlsx` (mounted at `/app/data/raw_excel/` inside container)
 
 ### Caddy Routing (`caddy/Caddyfile`, ports 80 + 443)
-*   `/webhook/*` → `ai-engine:8000` (read_timeout 120s for Gemma latency)
+*   `/webhook/*` → `ai-engine:8000` (read_timeout 120s for Gemini latency)
 *   `/admin-api/*` → `admin-api:8001` (handle_path strips the prefix)
 *   `/` (bare root) → `301 https://portal.nolongin.com` (anonymous visitors land on the public portal, not the legacy admin login)
 *   everything else (`/api`, `/sanctum`, `/admin`, `/livewire`, `/css`, `/js`, `/fonts`, `/storage`, `/up`, …) → `backend:80` (read_timeout 300s for Filament Excel imports)
