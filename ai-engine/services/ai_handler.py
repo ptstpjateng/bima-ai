@@ -12,7 +12,7 @@ Channel-specific dispatch (sending the reply back to the user) lives in:
   - WhatsApp via APTANA: services/whatsapp_sender.py + routers/aptana.py
   - Web chat via Next.js portal: routers/webhooks.py:web_chat
 
-Primary LLM: gemma-3-27b-it (default) via Google Generative Language API.
+Primary LLM: gemini-2.5-flash (default) via Google Generative Language API.
 Persona & lifecycle model: see BIMA_PERSONA.md in the project root.
 """
 
@@ -40,8 +40,10 @@ logger = logging.getLogger("bima_ai.ai_handler")
 _LARAVEL_BACKEND_URL: str = os.getenv("LARAVEL_BACKEND_URL", "http://backend:80")
 _LARAVEL_API_KEY: str     = os.getenv("LARAVEL_API_KEY", "")
 _GEMINI_API_KEY: str      = os.getenv("GEMINI_API_KEY", "")
-# Primary model for full responses (open-weights, hosted on Google AI Studio).
-_GEMINI_MODEL: str        = os.getenv("GEMINI_MODEL", "models/gemma-3-27b-it")
+# Primary model for full responses. Prod sets GEMINI_MODEL=models/gemini-2.5-flash.
+# NOTE: the old default "models/gemma-3-27b-it" was RETIRED by Google (404 on
+# generateContent) — Gemma 3 was replaced by Gemma 4 (models/gemma-4-31b-it).
+_GEMINI_MODEL: str        = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
 # Lightweight model for JSON-only intent classification — can be a smaller/faster
 # variant. Defaults to the same model; override with GEMINI_INTENT_MODEL env var.
 # E.g. set to models/gemma-3-4b-it for ~10x faster intent calls on free tier.
@@ -49,15 +51,20 @@ _GEMINI_INTENT_MODEL: str = os.getenv("GEMINI_INTENT_MODEL", "") or _GEMINI_MODE
 
 # Model-fallback ladder for the citizen-chat path. When the primary model
 # returns 429/503/network errors and exhausts its per-model retries, we walk
-# this list and try each fallback in order. Default ladder: Gemini Pro then
-# hosted Gemma 3 27b — both run on the same Google Generative Language API
-# key so no extra credentials. Override via the GEMINI_FALLBACK_MODELS env
-# (comma-separated). Set to empty string to disable (single-model behavior).
+# this list and try each fallback in order. Default ladder: Gemini 2.5 Pro
+# then Gemini 2.0 Flash — version-diverse so a 2.5-line quota/outage doesn't
+# take down the whole ladder, and both run on the same Google Generative
+# Language API key so no extra credentials. (The previous bottom rung,
+# models/gemma-3-27b-it, was RETIRED by Google — 404 on generateContent —
+# so the ladder silently lost its last fallback. Gemma 4 is the live line:
+# models/gemma-4-31b-it, but it needs Gemma-specific payload handling, so we
+# keep the default ladder all-Gemini for drop-in compatibility.) Override via
+# the GEMINI_FALLBACK_MODELS env (comma-separated). Empty string = single model.
 _GEMINI_FALLBACK_MODELS: list[str] = [
     m.strip()
     for m in os.getenv(
         "GEMINI_FALLBACK_MODELS",
-        "models/gemini-2.5-pro,models/gemma-3-27b-it",
+        "models/gemini-2.5-pro,models/gemini-2.0-flash",
     ).split(",")
     if m.strip()
 ]

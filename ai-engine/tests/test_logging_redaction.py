@@ -43,6 +43,7 @@ _FAKE_TG_TOKEN = "123456789:AAEhBP0av28pFa3KZ6F-fakeFAKEfake123abc"
 _FAKE_TG_WEBHOOK_SECRET = "f3a8e9c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c"
 _FAKE_APTANA_SECRET = "deadbeefcafefacebabe0123456789abcdef0123456789abcdef0123456789ab"
 _FAKE_META_TOKEN = "EAAGm0PX4ZCpsBOzqK4fakeMetaTokenZ1Q2W3E4R5T6Y7"
+_FAKE_GEMINI_KEY = "AIzaSyD_FAKE_gemini_key_1234567890abcdEFGHijk"
 
 
 class TestMaskUrlSecrets(unittest.TestCase):
@@ -73,6 +74,18 @@ class TestMaskUrlSecrets(unittest.TestCase):
         out = mask_url_secrets(url)
         self.assertNotIn(_FAKE_META_TOKEN, out)
         self.assertIn("access_token=<redacted>", out)
+
+    def test_gemini_generativelanguage_key_query_param_is_redacted(self) -> None:
+        # httpx's INFO line for a Gemini/Gemma call leaks the API key as ?key=
+        line = (
+            "HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/"
+            f"models/gemini-2.5-flash:generateContent?key={_FAKE_GEMINI_KEY} "
+            '"HTTP/1.1 429 Too Many Requests"'
+        )
+        out = mask_url_secrets(line)
+        self.assertNotIn(_FAKE_GEMINI_KEY, out)
+        self.assertIn("key=<redacted>", out)
+        self.assertIn("HTTP/1.1 429 Too Many Requests", out)  # context preserved
 
     def test_telegram_webhook_path_secret_is_redacted(self) -> None:
         path = f"/webhook/telegram/{_FAKE_TG_WEBHOOK_SECRET}"

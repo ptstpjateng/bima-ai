@@ -66,7 +66,7 @@ logger = logging.getLogger("bima_ai.license_resolver")
 _RESOLVER_MODEL: str = (
     os.getenv("GEMINI_INTENT_MODEL", "")
     or os.getenv("GEMINI_MODEL", "")
-    or "models/gemma-3-27b-it"
+    or "models/gemini-2.5-flash"  # gemma-3-27b-it was retired by Google (404)
 )
 
 # Cap the per-call generation — the model returns a tiny JSON object.

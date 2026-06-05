@@ -30,6 +30,7 @@ WHY we keep INFO level on httpx (not lift to WARNING):
 The patterns covered (in mask_url_secrets):
   - api.telegram.org/bot<TOKEN>/...      → api.telegram.org/bot<redacted>/...
   - graph.facebook.com/.../?access_token=<TOKEN>  → ...?access_token=<redacted>
+  - generativelanguage.googleapis.com/...?key=<KEY> → ...?key=<redacted>  (Gemini/Gemma)
   - /webhook/telegram/<secret>           → /webhook/telegram/<redacted>
   - /webhook/aptana/inbound/<secret>     → /webhook/aptana/inbound/<redacted>
   - /webhook/aptana/status/<secret>      → /webhook/aptana/status/<redacted>
@@ -84,6 +85,16 @@ _PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"(graph\.facebook\.com/[^?\s]*[?&]access_token=)[^&\s\"']+",
+            re.IGNORECASE,
+        ),
+        r"\1" + _REDACTED,
+    ),
+    # Google Generative Language API (Gemini / Gemma) API key. httpx logs the
+    # full request URL at INFO, and the key (AIza...) is the `?key=<KEY>` query
+    # param — e.g. generativelanguage.googleapis.com/v1beta/models/...:generateContent?key=AIza...
+    (
+        re.compile(
+            r"(generativelanguage\.googleapis\.com/[^?\s]*[?&]key=)[^&\s\"']+",
             re.IGNORECASE,
         ),
         r"\1" + _REDACTED,
