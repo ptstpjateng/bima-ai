@@ -999,5 +999,48 @@ class TestScoreReminderOnFollowUp(unittest.TestCase):
         self.assertNotIn("Skor terkini", reply)
 
 
+class TestInboundCaptionedMediaRouting(unittest.TestCase):
+    """Demo-breaker regression: a media message that ALSO carries a caption
+    (text) must still be routed to the media path WHEN a guided submission is
+    active — a photo-with-caption is the normal way a citizen uploads a KTP.
+    The old `if msisdn and not text` gate silently dropped these uploads."""
+
+    def setUp(self):
+        _reset_all()
+
+    def _captioned_payload(self):
+        # A flat `text` (the caption) AND a document message → BOTH
+        # _extract_text_from_payload and _extract_media_from_payload fire.
+        return {"phoneNumber": "628111222333",
+                "payload": {"text": "ini KTP saya ya",
+                            "messages": [{"type": "document", "id": "wamid.D",
+                                          "document": {"id": "D1",
+                                                       "mime_type": "application/pdf"}}]}}
+
+    def test_payload_yields_both_text_and_media(self):
+        p = self._captioned_payload()["payload"]
+        self.assertEqual(aptana._extract_text_from_payload(p), "ini KTP saya ya")
+        media = aptana._extract_media_from_payload(p)
+        self.assertIsNotNone(media)
+        self.assertEqual(media.kind, "document")
+
+    def test_captioned_media_routed_when_session_active(self):
+        # Officer number differs from the sender, so the sender is a citizen.
+        env = {"BIMA_OFFICER_NOTIFY_ENABLED": "true",
+               "BIMA_OFFICER_WA_PHONE": "628000000000",
+               "BIMA_OFFICER_TG_CHAT": ""}
+        bg = _FakeBackground()
+        with patch.dict(os.environ, env, clear=False), \
+             patch.object(aptana, "_PATH_SECRET", "s3cret"), \
+             patch("services.guided_submission.has_active_session",
+                   new=AsyncMock(return_value=True)):
+            res = _run(aptana.aptana_inbound(
+                "s3cret", _FakeRequest(self._captioned_payload()), bg))
+        # Routed to the media task despite the caption.
+        self.assertEqual(res.get("media"), "document")
+        self.assertEqual(len(bg.tasks), 1)
+        self.assertIs(bg.tasks[0][0], aptana._process_inbound_media)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

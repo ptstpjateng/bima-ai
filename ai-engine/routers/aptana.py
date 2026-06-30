@@ -108,18 +108,17 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
     message_id = _extract_message_id_from_payload(raw_payload)
 
     # --- Inbound MEDIA (image / PDF) intake for the guided-submission flow ---
-    # If the message carries no text but DOES carry media, route it to the
-    # media path so the citizen can upload their documents in chat. The media
-    # is downloaded + attached + scored in a background task (so APTANA still
-    # gets a fast 200). Only engages when the sender has an active guided
-    # submission; otherwise we reply with a gentle nudge.
-    if msisdn and not text:
+    # Route media to the media path whenever it's present, EVEN IF the message
+    # also carries a caption — a photo-with-caption is the normal way citizens
+    # upload a KTP, and gating on `not text` silently dropped those uploads.
+    # When there's a caption but NO active submission, fall through to the text
+    # path so the caption still gets answered (rather than nudged).
+    if msisdn:
         media = _extract_media_from_payload(raw_payload)
         if media is not None:
-            # An officer's media-only message must NOT enter the citizen media
-            # flow (it would reply with the "no active submission" nudge meant
-            # for citizens). The officer copilot has no document-upload path
-            # over chat, so just drop the media for the configured officer.
+            # An officer's media message must NOT enter the citizen media flow
+            # (it would reply with the citizen "no active submission" nudge).
+            # The officer copilot has no document-upload path over chat.
             from services import officer_bridge
             if officer_bridge.is_officer_channel_id(msisdn):
                 logger.info(
@@ -127,10 +126,15 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
                     _mask(msisdn),
                 )
                 return {"ok": True, "skipped": "officer_media_ignored"}
-            background.add_task(
-                _process_inbound_media, msisdn=msisdn, media=media, message_id=message_id
-            )
-            return {"ok": True, "media": media.kind}
+            # Process as an upload when it's media-only OR when a guided
+            # submission is active (the caption is then secondary). Otherwise
+            # let the captioned media fall through to the normal text handler.
+            from services import guided_submission
+            if not text or await guided_submission.has_active_session(f"wa-{msisdn}"):
+                background.add_task(
+                    _process_inbound_media, msisdn=msisdn, media=media, message_id=message_id
+                )
+                return {"ok": True, "media": media.kind}
 
     if not msisdn or not text:
         # Unrecognized / non-text-non-media payload. Log the SHAPE (key names

@@ -63,6 +63,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
     async with SessionFactory() as session:
         try:
             yield session
+            await session.commit()  # commit on clean return (matches the docstring)
         except Exception:
             await session.rollback()
             raise
