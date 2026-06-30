@@ -325,6 +325,7 @@ async def _call_llm_resolver(message: str, catalogue: list[dict]) -> Optional[di
         max_tokens=_RESOLVER_MAX_TOKENS,
         temperature=0.0,
         model_override=_RESOLVER_MODEL,
+        disable_thinking=True,  # Gemini 2.5 thinking otherwise eats the budget → truncated JSON
     )
     cleaned = _strip_json_fences(raw)
     try:
