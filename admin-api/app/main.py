@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 import uuid
@@ -99,6 +100,10 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+# /docs, /redoc and the OpenAPI schema are publicly routed via Caddy
+# (nolongin.com/admin-api/docs) — a free recon map of every route + auth
+# surface. Expose only when BIMA_ENABLE_DOCS is explicitly truthy (dev).
+_DOCS_ON = os.getenv("BIMA_ENABLE_DOCS", "").strip().lower() in {"1", "true", "yes", "on"}
 app = FastAPI(
     title="BIMA admin-api",
     description=(
@@ -107,8 +112,9 @@ app = FastAPI(
         "Sprint C: ingestion-sources + users CRUD."
     ),
     version="0.2.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if _DOCS_ON else None,
+    redoc_url="/redoc" if _DOCS_ON else None,
+    openapi_url="/openapi.json" if _DOCS_ON else None,
     lifespan=lifespan,
 )
 

@@ -238,6 +238,24 @@ def _format_name(raw: str) -> str:
     return raw.title()
 
 
+def _mask_name(raw: str) -> str:
+    """Privacy-preserving applicant name for an UNAUTHENTICATED ticket lookup.
+
+    SIAP tickets are sequential 9-digit numbers, so anyone can enumerate them
+    over the public WhatsApp line. Returning the full real name lets an attacker
+    harvest names at scale (and link them to NIKs elsewhere). We keep the given
+    name + the last-name initial so the owner still recognises their own
+    application, but the full surname never leaves the system.
+    'FAJAR JOKO WASKITO' → 'Fajar W.'  ·  'BUDI' → 'Budi'  ·  '' → ''
+    """
+    parts = [p for p in (raw or "").split() if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0].title()
+    return f"{parts[0].title()} {parts[-1][0].upper()}."
+
+
 def format_status_reply(record: dict) -> str:
     """
     Render a SIAP monitoring-berkas record into a WhatsApp-friendly Indonesian
@@ -248,7 +266,7 @@ def format_status_reply(record: dict) -> str:
     who want a richer view.
     """
     ticket = record.get("no_tiket", "??")
-    nama_pemohon = _format_name(record.get("nama_pemohon", ""))
+    nama_pemohon = _mask_name(record.get("nama_pemohon", ""))
     nama_perizinan = record.get("nama_perizinan", "permohonan Anda")
     nama_bidang = record.get("nama_bidang", "")
     posisi_berkas = record.get("posisi_berkas", "—")

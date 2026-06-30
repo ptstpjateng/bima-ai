@@ -98,14 +98,17 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 # App instance
 # ---------------------------------------------------------------------------
+# /docs, /redoc and the OpenAPI schema are a free recon map of every route +
+# auth surface; expose them only when BIMA_ENABLE_DOCS is explicitly truthy
+# (dev), never by default in production.
+_DOCS_ON = os.getenv("BIMA_ENABLE_DOCS", "").strip().lower() in {"1", "true", "yes", "on"}
 app = FastAPI(
     title="BIMA-AI Engine",
     description="Omnichannel AI orchestrator for DPMPTSP licensing assistant.",
     version="0.1.0",
-    # Disable automatic /docs and /redoc in production by checking env; kept
-    # enabled here for development convenience – override via env if needed.
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if _DOCS_ON else None,
+    redoc_url="/redoc" if _DOCS_ON else None,
+    openapi_url="/openapi.json" if _DOCS_ON else None,
     lifespan=lifespan,
 )
 
