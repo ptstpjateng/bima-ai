@@ -1871,7 +1871,7 @@ async def _generate_and_send_docs(sess: SubmissionSession) -> str:
         lock = " (terkunci - buka dengan NIK Anda)" if nik else ""
         if await _send_doc_to_user(
             sess.user_id, f"{base}/dl/{token}", filename,
-            caption=f"Draf {d['label']}{lock}. Tanda tangan + e-meterai via Mekari.",
+            caption=f"Draf {d['label']}{lock}.",
         ):
             sent += 1
 
@@ -1897,8 +1897,13 @@ async def _generate_and_send_docs(sess: SubmissionSession) -> str:
     )
     return (
         f"{lead}\n\n{lock_note}Langkah berikutnya:\n\n"
-        f"1) *Tanda tangan + e-meterai* ketiga dokumen lewat Mekari: {_mekari_sign_url()}\n"
-        "2) Unggah kembali ketiga dokumen yang sudah ditandatangani ke sini.\n"
+        "1) *Tanda tangani + bubuhi meterai Rp10.000* pada ketiga dokumen. "
+        "Pilih cara yang paling mudah - keduanya sama-sah secara hukum:\n"
+        f"   - *Digital*: tanda tangan elektronik + e-meterai lewat Mekari: {_mekari_sign_url()}\n"
+        "   - *Manual*: cetak dokumennya, tanda tangan basah, lalu tempel "
+        "meterai tempel Rp10.000 seperti biasa.\n"
+        "2) Unggah kembali ketiga dokumen yang sudah ditandatangani (foto/scan "
+        "yang jelas bila manual) ke sini.\n"
         f"3) Lengkapi juga {len(up)} dokumen berikut:\n{up_list}\n\n"
         "Kirim semua dokumennya di sini ya, Bapak/Ibu - saya periksa "
         "kelengkapannya sebelum diajukan ke SIAP."
