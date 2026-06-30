@@ -188,6 +188,84 @@ async def send_text(recipient_phone: str, body: str, *, preview_url: bool = Fals
     return False
 
 
+async def send_document(
+    recipient_phone: str,
+    link: str,
+    filename: str,
+    *,
+    caption: str | None = None,
+) -> bool:
+    """Send a WhatsApp *document* message — a PDF link APTANA fetches + delivers.
+
+    `link` must be a publicly reachable URL; BIMA hosts generated PDFs at
+    `/dl/{token}` (services.generated_docs + routers.downloads). Mirrors
+    send_text's transport (same /api/v1/messages, Api-Token header, retry
+    ladder); kept standalone so the notify path in send_text stays untouched.
+    The WhatsApp 24-hour session-window rule applies. Never raises.
+    """
+    if not _API_TOKEN or not _SENDER_NUMBER:
+        logger.error("Cannot send WhatsApp document: APTANA_API_TOKEN or APTANA_SENDER_NUMBER unset.")
+        return False
+
+    url = f"{_API_BASE}/api/v1/messages"
+    headers = {
+        "Api-Token": _API_TOKEN,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    document: dict[str, str] = {"link": link, "filename": filename}
+    if caption:
+        document["caption"] = format_for_whatsapp(caption)[:1024]
+    payload = {
+        "channel": "wa",
+        "sender": _SENDER_NUMBER,
+        "recipient": normalize_phone(recipient_phone),
+        "type": "document",
+        "document": document,
+    }
+    masked_to = payload["recipient"][:4] + "…" + payload["recipient"][-4:]
+
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+
+            if resp.status_code < 300:
+                logger.info(
+                    "APTANA send-doc ok | to=%s status=%d attempt=%d",
+                    masked_to, resp.status_code, attempt + 1,
+                )
+                return True
+
+            if resp.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS - 1:
+                wait = 2 ** attempt
+                logger.warning(
+                    "APTANA send-doc transient | to=%s status=%d attempt=%d retry_in=%ds",
+                    masked_to, resp.status_code, attempt + 1, wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            logger.error(
+                "APTANA send-doc failed | to=%s status=%d body=%s",
+                masked_to, resp.status_code, resp.text[:500],
+            )
+            return False
+
+        except (httpx.RequestError, asyncio.TimeoutError) as exc:
+            if attempt < _MAX_ATTEMPTS - 1:
+                wait = 2 ** attempt
+                logger.warning(
+                    "APTANA send-doc error | to=%s err=%s attempt=%d retry_in=%ds",
+                    masked_to, exc.__class__.__name__, attempt + 1, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error("APTANA send-doc exhausted retries | to=%s err=%s", masked_to, exc)
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Typing acknowledgment.
 # ---------------------------------------------------------------------------

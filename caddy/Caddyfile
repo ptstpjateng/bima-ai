@@ -99,6 +99,26 @@ nolongin.com, www.nolongin.com, bimaptsp.com, www.bimaptsp.com {
 		}
 	}
 
+	# BIMA-generated PDFs (Pakta Integritas etc.) for the PPKP guided-submission
+	# co-pilot. APTANA fetches these to deliver them as WhatsApp *document*
+	# messages; the citizen may also open the link. Tokens are unguessable +
+	# short-lived (services/generated_docs.py). Path preserved — the downloads
+	# router expects /dl/<token>. Rate-limited as a public, PII-bearing route.
+	handle /dl/* {
+		rate_limit {
+			zone downloads {
+				key {remote_host}
+				events 120
+				window 1m
+			}
+		}
+		reverse_proxy ai-engine:8000 {
+			transport http {
+				read_timeout 30s
+			}
+		}
+	}
+
 	# Root → public portal. During migration window, both old and new portal
 	# URLs are valid; bimaptsp.com visitors land on portal.bimaptsp.com.
 	# Citizens who saved portal.nolongin.com/track/... links still work because

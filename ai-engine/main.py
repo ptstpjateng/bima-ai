@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from logging_setup import configure_logging, mask_url_secrets
-from routers import aptana, copilot, notify, telegram, validator, vectorize, webhooks
+from routers import aptana, copilot, downloads, notify, telegram, validator, vectorize, webhooks
 from services.transparency_poller import run_transparency_poller_loop
 
 # ---------------------------------------------------------------------------
@@ -280,6 +280,7 @@ app.include_router(telegram.router, tags=["Telegram"])
 app.include_router(validator.router)
 app.include_router(copilot.router)
 app.include_router(notify.router)
+app.include_router(downloads.router, tags=["Downloads"])
 
 
 # ---------------------------------------------------------------------------
