@@ -48,6 +48,18 @@ class TestDocGenerator(unittest.TestCase):
         with self.assertRaises(KeyError):
             dg.generate("nope", self.DATA)
 
+    def test_encryption_locks_pdf_with_password(self):
+        plain = dg.generate(dg.PAKTA_INTEGRITAS, self.DATA)
+        enc = dg.generate(dg.PAKTA_INTEGRITAS, self.DATA, encrypt_password="3301234567890001")
+        self.assertEqual(enc[:5], b"%PDF-")       # header is still a valid PDF
+        self.assertIn(b"/Encrypt", enc)           # encryption dictionary present
+        self.assertNotIn(b"/Encrypt", plain)      # plaintext build has none
+        self.assertNotEqual(enc, plain)
+
+    def test_blank_password_means_no_encryption(self):
+        enc = dg.generate(dg.PAKTA_INTEGRITAS, self.DATA, encrypt_password="")
+        self.assertNotIn(b"/Encrypt", enc)
+
 
 @unittest.skipUnless(_HAS, "fpdf2 not installed")
 class TestPpkpGuide(unittest.TestCase):

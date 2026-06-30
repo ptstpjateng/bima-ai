@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 # a real import (e.g. under the fpdf2-equipped venv) intact — generation still
 # works there, the flow assertions hold either way.
 _fake_dg = types.ModuleType("services.doc_generator")
-_fake_dg.generate = lambda dt, data: b"%PDF-1.4 stub " + str(dt).encode()
+_fake_dg.generate = lambda dt, data, **kw: b"%PDF-1.4 stub " + str(dt).encode()
 _fake_dg.DOC_TYPES = {
     "pakta_integritas": "Pakta Integritas",
     "surat_permohonan": "Surat Permohonan",

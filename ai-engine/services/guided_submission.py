@@ -1853,21 +1853,25 @@ async def _generate_and_send_docs(sess: SubmissionSession) -> str:
     data["license_name"] = sess.license_name or ""
 
     base = _public_base_url()
-    safe = re.sub(r"[^A-Za-z0-9]+", "_", sess.fields.get("applicant_name") or "warga").strip("_")[:30] or "warga"
+    # The PDF is AES-encrypted with the citizen's NIK (they know it; it is never
+    # transmitted), so a leaked /dl link is an unreadable file. The filename is
+    # neutral — no name/NIK in the URL or the Content-Disposition header.
+    nik = (sess.fields.get("nik") or "").strip()
     sent = 0
     for d in (guide.get("generate_docs") or []):
         try:
-            pdf = doc_generator.generate(d["doc_type"], data)
+            pdf = doc_generator.generate(d["doc_type"], data, encrypt_password=nik or None)
         except Exception:
             logger.exception(
                 "doc generate failed | user=%s | doc=%s", _mask(sess.user_id), d.get("key"),
             )
             continue
-        filename = f"{d['label'].replace(' ', '_').replace('/', '-')}_{safe}.pdf"
+        filename = f"{d['label'].replace(' ', '_').replace('/', '-')}.pdf"
         token = generated_docs.store(pdf, filename)
+        lock = " (terkunci - buka dengan NIK Anda)" if nik else ""
         if await _send_doc_to_user(
             sess.user_id, f"{base}/dl/{token}", filename,
-            caption=f"Draf {d['label']} - mohon tanda tangan + e-meterai.",
+            caption=f"Draf {d['label']}{lock}. Tanda tangan + e-meterai via Mekari.",
         ):
             sent += 1
 
@@ -1886,8 +1890,13 @@ async def _generate_and_send_docs(sess: SubmissionSession) -> str:
         if sent
         else "Maaf, ada kendala saat mengirim draf dokumennya. Tim kami akan bantu. "
     )
+    lock_note = (
+        "_Demi keamanan data Anda, dokumennya terkunci - buka dengan *NIK* Anda "
+        "(16 digit)._\n\n"
+        if nik else ""
+    )
     return (
-        f"{lead}Langkah berikutnya:\n\n"
+        f"{lead}\n\n{lock_note}Langkah berikutnya:\n\n"
         f"1) *Tanda tangan + e-meterai* ketiga dokumen lewat Mekari: {_mekari_sign_url()}\n"
         "2) Unggah kembali ketiga dokumen yang sudah ditandatangani ke sini.\n"
         f"3) Lengkapi juga {len(up)} dokumen berikut:\n{up_list}\n\n"
