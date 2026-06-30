@@ -56,7 +56,7 @@ _INTENT_MODEL: str = (
     or "models/gemini-2.5-flash"  # gemma-3-27b-it was retired by Google (404)
 )
 
-_MAX_TOKENS = 80
+_MAX_TOKENS = 128
 
 # Canonical intent vocabulary.
 AFFIRM = "AFFIRM"
@@ -194,6 +194,7 @@ async def classify_confirm_intent(message: str) -> str:
             max_tokens=_MAX_TOKENS,
             temperature=0.0,
             model_override=_INTENT_MODEL,
+            disable_thinking=True,  # Gemini 2.5 thinking otherwise eats the budget → truncated JSON
         )
         parsed = json.loads(_strip_json_fences(raw))
         intent = str(parsed.get("intent", "")).strip().upper()
