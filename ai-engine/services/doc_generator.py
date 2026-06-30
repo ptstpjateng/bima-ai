@@ -100,7 +100,8 @@ class _Doc(FPDF):
         self.multi_cell(
             0, 4,
             "Draf dibuat dengan bantuan BIMA-AI — DPMPTSP Provinsi Jawa Tengah. "
-            "Wajib ditandatangani dan dibubuhi e-meterai (via Mekari) sebelum diunggah.",
+            "Tanda tangani dan bubuhi meterai Rp10.000 sebelum diunggah — "
+            "e-meterai (mis. Mekari) atau meterai tempel, keduanya sah.",
             align="C",
         )
         self.set_text_color(0)
