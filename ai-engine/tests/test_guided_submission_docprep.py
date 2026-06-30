@@ -105,7 +105,9 @@ class TestDocPrepFlow(unittest.TestCase):
         reply = _run(gs._handle_preparing_docs(sess, "ini semua datanya"))
         self.assertEqual(len(self.sent), 3)                  # 3 drafts delivered
         self.assertEqual(sess.stage, Stage.COLLECTING_DOCS)  # rejoined upload flow
-        self.assertIn("Mekari", reply)                       # sign hand-off present
+        self.assertIn("Mekari", reply)                       # digital sign option present
+        self.assertIn("Manual", reply)                       # manual sign option present
+        self.assertIn("tersendiri", reply)                   # unique-meterai-per-doc guidance
         self.assertEqual(sess.fields["applicant_name"], "BUDI SANTOSO")  # seeded for KTP step
 
     def test_missing_data_asks_not_generates(self):
