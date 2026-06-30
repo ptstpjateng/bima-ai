@@ -50,13 +50,29 @@ class TrackingResponse(BaseModel):
     )
 
 
+def _mask_name(raw: str) -> str:
+    """Privacy-preserving applicant name for the UNAUTHENTICATED portal lookup.
+
+    Tickets are sequential 9-digit numbers and the portal /track/{ticket} page
+    is public, so returning the full real name lets anyone harvest names by
+    enumeration. Keep the given name + last-name initial; drop the surname.
+    'FAJAR JOKO WASKITO' → 'Fajar W.'  ·  'BUDI' → 'Budi'  ·  '' → ''
+    """
+    parts = [p for p in (raw or "").split() if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0].title()
+    return f"{parts[0].title()} {parts[-1][0].upper()}."
+
+
 def _to_response(record: dict, ticket: str) -> TrackingResponse:
     """Map SIAP's snake_case-ish field names to our public response shape."""
     return TrackingResponse(
         ticket=record.get("no_tiket", ticket),
         license_name=record.get("nama_perizinan", "—"),
         sector_name=record.get("nama_bidang"),
-        applicant_name=(record.get("nama_pemohon") or "").title(),
+        applicant_name=_mask_name(record.get("nama_pemohon") or ""),
         current_desk=record.get("posisi_berkas", "—"),
         status=record.get("status_permohonan", "—"),
         submitted_at=record.get("tanggal_permohonan"),
