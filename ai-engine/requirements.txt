@@ -22,3 +22,7 @@ sentence-transformers>=3.0,<6.0
 # Pinned to the same range admin-api uses so a JWT minted there validates
 # here byte-for-byte. Keep them in lock-step.
 python-jose[cryptography]>=3.3.0,<4
+# PDF generation for the PPKP guided-submission copilot (services/doc_generator.py).
+# Fills Pakta Integritas / Surat Permohonan / Surat Pesanan with the citizen's
+# data into ready-to-sign PDFs. Pure-Python — no system libraries needed.
+fpdf2>=2.7.8,<3
