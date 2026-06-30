@@ -1073,8 +1073,9 @@ async def analyze_user_intent(message: str) -> dict:
     try:
         raw = await _call_gemma(
             _INTENT_SYSTEM, message,
-            max_tokens=160, temperature=0.0,
+            max_tokens=256, temperature=0.0,
             model_override=_GEMINI_INTENT_MODEL,
+            disable_thinking=True,
         )
         cleaned = _strip_json_fences(raw)
         intent = json.loads(cleaned)
@@ -1226,6 +1227,7 @@ async def _call_gemma(
     temperature: float = 0.5,
     history: list[dict] | None = None,
     model_override: str | None = None,
+    disable_thinking: bool = False,
 ) -> str:
     """
     Call hosted Gemma (or any Generative Language API model) via REST.
@@ -1254,6 +1256,11 @@ async def _call_gemma(
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
+            # Gemini 2.5 "thinks" by default and can burn the whole token budget
+            # before emitting output. For small-budget JSON pre-calls (intent
+            # classifier), disable it so the model returns the JSON directly —
+            # otherwise a 160-token call yields a truncated, unparseable blob.
+            **({"thinkingConfig": {"thinkingBudget": 0}} if disable_thinking else {}),
         },
     }
     try:
