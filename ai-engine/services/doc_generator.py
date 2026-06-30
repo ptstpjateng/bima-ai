@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import io
 import logging
+import secrets
 from datetime import datetime, timezone, timedelta
 
 from fpdf import FPDF
+from fpdf.enums import EncryptionMethod
 
 logger = logging.getLogger("bima_ai.doc_generator")
 
@@ -198,7 +200,7 @@ def _pakta_integritas(data: dict) -> bytes:
     _para(pdf, "Demikian Pakta Integritas ini saya buat dengan penuh kesadaran "
                "dan tanggung jawab tanpa ada paksaan dari pihak manapun.")
     _signature_block(pdf, _v(data, "applicant_name"))
-    return bytes(pdf.output())
+    return pdf
 
 
 def _surat_permohonan(data: dict) -> bytes:
@@ -226,7 +228,7 @@ def _surat_permohonan(data: dict) -> bytes:
                "persyaratan sesuai ketentuan yang berlaku. Atas perhatian dan "
                "persetujuan Bapak/Ibu, kami ucapkan terima kasih.")
     _signature_block(pdf, _v(data, "applicant_name"), role="Hormat kami,")
-    return bytes(pdf.output())
+    return pdf
 
 
 def _surat_pesanan(data: dict) -> bytes:
@@ -252,7 +254,7 @@ def _surat_pesanan(data: dict) -> bytes:
     _para(pdf, "Demikian Surat Pesanan ini dibuat dengan sebenarnya untuk "
                "dipergunakan sebagai kelengkapan permohonan perizinan.")
     _signature_block(pdf, _v(data, "applicant_name"), role="PEMESAN,")
-    return bytes(pdf.output())
+    return pdf
 
 
 _GENERATORS = {
@@ -262,12 +264,35 @@ _GENERATORS = {
 }
 
 
-def generate(doc_type: str, data: dict) -> bytes:
+def generate(doc_type: str, data: dict, *, encrypt_password: str | None = None) -> bytes:
     """Render `doc_type` as a filled PDF (bytes). Raises KeyError on unknown type.
-    Missing data fields render as a blank line — never invented."""
+    Missing data fields render as a blank line — never invented.
+
+    If `encrypt_password` is given, the PDF is AES-128 encrypted: it opens ONLY
+    with that password. The flow passes the citizen's NIK — which they already
+    know and which is never transmitted — so a leaked download URL yields an
+    unreadable file. The owner password is random (nobody holds owner rights),
+    and default permissions (3900 = all) are kept so the citizen can still
+    print / sign / e-meterai it via Mekari.
+    """
     gen = _GENERATORS.get(doc_type)
     if gen is None:
         raise KeyError(f"unknown doc_type: {doc_type!r}")
     pdf = gen(data or {})
-    logger.info("Generated %s | bytes=%d", doc_type, len(pdf))
-    return pdf
+    pwd = str(encrypt_password).strip() if encrypt_password else ""
+    if pwd:
+        owner = secrets.token_urlsafe(18)  # random → nobody holds owner rights
+        try:
+            pdf.set_encryption(
+                owner_password=owner, user_password=pwd,
+                encryption_method=EncryptionMethod.AES_128,
+            )
+        except Exception:  # AES needs `cryptography`; fall back to RC4 if absent
+            logger.warning("AES-128 unavailable — using RC4 for encrypted %s", doc_type)
+            pdf.set_encryption(
+                owner_password=owner, user_password=pwd,
+                encryption_method=EncryptionMethod.RC4,
+            )
+    out = bytes(pdf.output())
+    logger.info("Generated %s | bytes=%d | encrypted=%s", doc_type, len(out), bool(pwd))
+    return out

@@ -27,5 +27,12 @@ async def download(token: str):
     return Response(
         content=pdf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            # Keep the PII-bearing PDF out of caches, search indexes, and referers.
+            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+            "Pragma": "no-cache",
+            "X-Robots-Tag": "noindex, nofollow",
+            "Referrer-Policy": "no-referrer",
+        },
     )

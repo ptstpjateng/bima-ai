@@ -26,3 +26,6 @@ python-jose[cryptography]>=3.3.0,<4
 # Fills Pakta Integritas / Surat Permohonan / Surat Pesanan with the citizen's
 # data into ready-to-sign PDFs. Pure-Python — no system libraries needed.
 fpdf2>=2.7.8,<3
+# AES-128 encryption of the generated PDFs (doc_generator) needs `cryptography`.
+# Already pulled by python-jose[cryptography] above, so the container has it and
+# uses AES; doc_generator falls back to RC4 only if it is ever absent.
