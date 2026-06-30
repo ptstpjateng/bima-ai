@@ -113,8 +113,12 @@ services:
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-me-in-production}
       # admin-api's TrustedHostMiddleware derives allowed hosts from this list.
       # Include nolongin.com so requests proxied via Caddy (Host: nolongin.com)
-      # are accepted, in addition to admin.nolongin.com (the eventual Vercel host).
-      ADMIN_FRONTEND_URL: https://admin.nolongin.com,https://nolongin.com
+      # are accepted, in addition to admin.nolongin.com (the Vercel host). The
+      # bimaptsp.com pair is pre-allowed for the planned domain migration
+      # (currently DNS-sinkholed, so harmless until it resolves). This mirrors
+      # the manual edit that had drifted onto the VPS — now committed so deploys
+      # that touch this file no longer abort on the local change.
+      ADMIN_FRONTEND_URL: https://admin.nolongin.com,https://nolongin.com,https://admin.bimaptsp.com,https://bimaptsp.com
       LOG_LEVEL: INFO
       # Sprint C ingestion-upload: tell admin-api where data-pipeline lives
       # so /ingestion/upload can trigger /pipeline/etl-excel on the internal
