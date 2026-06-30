@@ -42,6 +42,9 @@ services:
       context: ./ai-engine
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Generous memory cap (VPS has 27G) — a safety net against a torch/embedder
+    # leak OOM-killing peers, far above the ~350M steady-state usage.
+    mem_limit: 4g
     env_file: ./ai-engine/.env
     environment:
       - CHROMA_HOST=${CHROMA_HOST:-ai-engine}
@@ -69,7 +72,12 @@ services:
     build:
       context: ./data-pipeline
       dockerfile: Dockerfile
-    restart: "no"
+    # Was `restart: "no"` → the service died permanently on any crash or VPS
+    # reboot, silently 502-ing the "Sync ke ChromaDB" flow. It's idempotent and
+    # only acts when triggered, so auto-recover is safe.
+    restart: unless-stopped
+    # Cap a runaway Playwright/Chromium scrape (generous; VPS has 27G).
+    mem_limit: 4g
     env_file: ./data-pipeline/.env
     volumes:
       - ./data-pipeline/data:/app/data
@@ -149,9 +157,13 @@ services:
       - "443:443"
     networks:
       - bima-public
+    # Wait for upstreams to be HEALTHY (not merely started) so Caddy doesn't
+    # accept :443 and 502 the first webhook/admin requests during boot.
     depends_on:
-      - backend
-      - ai-engine
+      backend:
+        condition: service_healthy
+      ai-engine:
+        condition: service_healthy
 
   # ──────────────────────────────────────────────
   # TALL Backend (Laravel 13 + FrankenPHP)
@@ -218,6 +230,12 @@ services:
       AI_ENGINE_URL: http://ai-engine:8000
       QUEUE_CONNECTION: redis
     command: ["php", "artisan", "queue:work", "--sleep=3", "--tries=3", "--max-time=3600", "--timeout=90"]
+    # This worker shares the backend image, whose Dockerfile HEALTHCHECK probes
+    # the FrankenPHP admin port (2019). A queue:work worker serves no HTTP, so
+    # that check ALWAYS fails → a permanent false "unhealthy". Disable it; the
+    # container exits if the worker dies and `restart: unless-stopped` recovers.
+    healthcheck:
+      disable: true
     volumes:
       - backend_storage:/var/www/html/storage/app
     networks:
