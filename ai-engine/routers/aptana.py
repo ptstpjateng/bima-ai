@@ -218,6 +218,16 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
         )
         return {"ok": True, "skipped": "greeted"}
 
+    # Bare greeting → short canned hello (or nothing if the static welcome just
+    # fired). Never the verbose LLM greeting that produced the "double hello".
+    # Real questions fall through to the normal AI/RAG path below.
+    if _is_bare_greeting(sanitized):
+        if _was_recently_greeted(msisdn, window=120.0):
+            logger.info("Bare greeting after welcome — skipped | user=%s", _mask(msisdn))
+        else:
+            background.add_task(send_text, recipient_phone=msisdn, body=_SHORT_GREETING)
+        return {"ok": True, "skipped": "bare_greeting"}
+
     background.add_task(
         _process_inbound, msisdn=msisdn, text=sanitized, name=name, message_id=message_id
     )
@@ -414,21 +424,47 @@ _GREETING_BODY = (
 # for both APTANA workers to fire and arrive at BIMA.
 # ---------------------------------------------------------------------------
 import time as _time
-_GREETING_DEDUP_WINDOW_SECONDS = 8.0
+_GREETING_DEDUP_WINDOW_SECONDS = 8.0      # race-guard for duplicate greeting+message events
+_GREETING_STAMP_TTL_SECONDS = 180.0       # how long a greeting stamp is retained
 _recently_greeted: dict[str, float] = {}   # msisdn → unix timestamp of last greeting send
 
 
 def _mark_greeted(msisdn: str) -> None:
     _recently_greeted[msisdn] = _time.time()
-    # Prune entries older than the window to keep memory bounded.
-    cutoff = _time.time() - _GREETING_DEDUP_WINDOW_SECONDS
+    # Prune entries older than the retention TTL to keep memory bounded.
+    cutoff = _time.time() - _GREETING_STAMP_TTL_SECONDS
     for k in [k for k, v in list(_recently_greeted.items()) if v < cutoff]:
         _recently_greeted.pop(k, None)
 
 
-def _was_recently_greeted(msisdn: str) -> bool:
+def _was_recently_greeted(msisdn: str, window: float = _GREETING_DEDUP_WINDOW_SECONDS) -> bool:
     ts = _recently_greeted.get(msisdn)
-    return ts is not None and (_time.time() - ts) < _GREETING_DEDUP_WINDOW_SECONDS
+    return ts is not None and (_time.time() - ts) < window
+
+
+# A bare greeting ("halo", "hi", "assalamualaikum", "selamat pagi") needs no
+# full LLM re-introduction — that is what produced the "double hello" (static
+# welcome + a second generated greeting). Detect it cheaply and reply with a
+# short canned hello (or nothing, if the static welcome just fired).
+def _is_bare_greeting(text: str) -> bool:
+    t = (text or "").strip().lower().rstrip("!.?").strip()
+    if not t or len(t) > 30:
+        return False
+    import re as _re
+    t = _re.sub(r"(.)\1{2,}", r"\1", t)  # "halooo" -> "halo"
+    if t in {"halo", "hallo", "helo", "hai", "hi", "hello", "hey", "oi", "woi",
+             "pagi", "siang", "sore", "malam", "permisi", "menu", "mulai",
+             "start", "tes", "test", "ping", "p"}:
+        return True
+    if t in {"selamat pagi", "selamat siang", "selamat sore", "selamat malam"}:
+        return True
+    return t.startswith("assalamu")
+
+
+_SHORT_GREETING = (
+    "Halo! 👋 Saya BIMA, asisten perizinan DPMPTSP Jawa Tengah. Ada yang bisa "
+    "saya bantu seputar KBLI, syarat NIB, atau status izin Anda?"
+)
 
 
 @router.post("/webhook/aptana/greeting/{path_secret}")

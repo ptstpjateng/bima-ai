@@ -78,6 +78,34 @@ def normalize_phone(phone: str) -> str:
     return digits
 
 
+# WhatsApp text does NOT render Markdown links ([label](url)) or **double-star**
+# bold — they ship as literal characters. The LLM sometimes emits Markdown, so
+# normalise the common shapes to WhatsApp's own formatting (or plain text)
+# before sending, so replies look clean on the phone.
+_MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+_MD_BOLD = re.compile(r"\*\*([^*\n]+)\*\*")
+
+
+def format_for_whatsapp(text: str) -> str:
+    """Convert the Markdown the LLM commonly emits into WhatsApp-safe text:
+    [label](url) -> 'url' (or 'label: url'), and **bold** -> *bold*."""
+    if not text:
+        return text
+
+    def _link(m: "re.Match[str]") -> str:
+        label, url = m.group(1).strip(), m.group(2).strip()
+        bare = url.split("//", 1)[-1]
+        # Label is just the URL (or its bare domain) → drop it; WhatsApp
+        # auto-links a plain URL.
+        if label == url or label.rstrip("/") == bare.rstrip("/"):
+            return url
+        return f"{label}: {url}"
+
+    out = _MD_LINK.sub(_link, text)
+    out = _MD_BOLD.sub(r"*\1*", out)
+    return out
+
+
 async def send_text(recipient_phone: str, body: str, *, preview_url: bool = False) -> bool:
     """Send a freeform WhatsApp text message via APTANA.
 
@@ -91,6 +119,8 @@ async def send_text(recipient_phone: str, body: str, *, preview_url: bool = Fals
     if not _API_TOKEN or not _SENDER_NUMBER:
         logger.error("Cannot send WhatsApp: APTANA_API_TOKEN or APTANA_SENDER_NUMBER unset.")
         return False
+
+    body = format_for_whatsapp(body)
 
     # NOTE on path: APTANA's Postman cURL snippet (2026-05-13) shows /api/v1/messages.
     # An earlier endpoint card in the Postman docs displayed /api/v2/messages — likely a
