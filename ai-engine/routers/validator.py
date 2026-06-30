@@ -71,8 +71,12 @@ DemoFixtureName = Literal["clean", "name_mismatch", "nik_typo"]
 
 
 def _demo_fixtures_enabled() -> bool:
-    """Read at call-time, not import-time — lets tests/admin-api flip the env."""
-    return os.getenv("ENABLE_DEMO_FIXTURES", "true").strip().lower() in {"1", "true", "yes", "on"}
+    """Read at call-time, not import-time — lets tests/admin-api flip the env.
+
+    Defaults to OFF: a stray `?demo_fixture=clean` must never let a real ticket
+    receive a canned "ready" validation that masks a fraudulent submission.
+    """
+    return os.getenv("ENABLE_DEMO_FIXTURES", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_fixture(name: DemoFixtureName) -> dict[str, Any]:

@@ -335,7 +335,7 @@ _sessions: "OrderedDict[str, SubmissionSession]" = OrderedDict()
 # Module-level guard so a burst of N uploads spawns exactly ONE debounce task
 # per session, not N. Holds the user_ids that currently have a live debounce
 # task in flight. Mutated only from the event loop (single-threaded asyncio).
-_debounce_tasks: set[str] = set()
+_debounce_tasks: dict[str, asyncio.Task] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +482,7 @@ async def _put_session(sess: SubmissionSession) -> None:
 
 async def _clear_session(user_id: str) -> None:
     _sessions.pop(user_id, None)
-    _debounce_tasks.discard(user_id)
+    _debounce_tasks.pop(user_id, None)
     await session_store.delete(session_store.submission_key(user_id))
 
 
@@ -716,24 +716,30 @@ async def _send_to_user(user_id: str, text: str) -> bool:
 async def _arm_debounce(user_id: str) -> None:
     """Ensure exactly ONE debounce task is running for this session.
 
-    Guarded by the module-level `_debounce_tasks` set so a burst of N uploads
+    Guarded by the module-level `_debounce_tasks` dict so a burst of N uploads
     (each its own webhook → its own handle_inbound_documents call) spawns ONE
     task, not N. Subsequent uploads just re-stamp `last_doc_at`; the already-
     running task observes the later stamp and waits again.
+
+    We store the actual `asyncio.Task` (not just the user_id) and hold that
+    strong reference for the task's whole lifetime: the event loop only keeps a
+    WEAK reference to pending tasks, so a fire-and-forget `create_task` whose
+    handle is dropped can be garbage-collected mid-`sleep`, silently killing the
+    one consolidated "here's your score" reply the citizen is waiting for.
     """
     if user_id in _debounce_tasks:
         return  # a task is already watching this session
-    _debounce_tasks.add(user_id)
     try:
-        asyncio.create_task(_debounce_then_process(user_id))
+        task = asyncio.create_task(_debounce_then_process(user_id))
     except RuntimeError:
-        # No running event loop (shouldn't happen on the webhook path). Drop the
-        # guard so a later upload can retry; the docs are safely attached.
-        _debounce_tasks.discard(user_id)
+        # No running event loop (shouldn't happen on the webhook path). The docs
+        # are safely attached; a later upload can retry.
         logger.warning(
             "Guided-submission: could not schedule debounce (no loop) | user=%s",
             _mask(user_id),
         )
+        return
+    _debounce_tasks[user_id] = task  # strong ref until _debounce_then_process pops it
 
 
 async def _debounce_then_process(user_id: str) -> None:
@@ -772,7 +778,7 @@ async def _debounce_then_process(user_id: str) -> None:
             _mask(user_id),
         )
     finally:
-        _debounce_tasks.discard(user_id)
+        _debounce_tasks.pop(user_id, None)
 
 
 # ===========================================================================
@@ -801,7 +807,17 @@ async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]
         )
         for d in sess.documents
     ]
-    license_id = sess.license_id or _DEMO_LICENSE_ID
+    license_id = sess.license_id
+    if not license_id:
+        # Never score real documents against the hardcoded demo permit (358 has
+        # no structured requirements) — that yields a confidently-wrong %. With
+        # no resolved licence we skip scoring; the confirm message renders
+        # without a score and the citizen can still proceed.
+        logger.warning(
+            "Guided-submission content-score skipped: session has no license_id "
+            "| user=%s", _mask(sess.user_id),
+        )
+        return None
     try:
         result = await citizen_scorer.score_session_documents(
             license_id=license_id,

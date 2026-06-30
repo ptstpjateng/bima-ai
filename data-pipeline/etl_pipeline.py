@@ -398,7 +398,7 @@ def ingest_to_chromadb(records: list[dict]) -> int:
         batch_metas.append(metadata)
 
         if len(batch_ids) >= BATCH_SIZE:
-            embeddings = _get_embedder().encode(batch_docs, convert_to_numpy=True).tolist()
+            embeddings = _get_embedder().encode(batch_docs, convert_to_numpy=True, normalize_embeddings=True).tolist()
             collection.upsert(
                 ids=batch_ids,
                 documents=batch_docs,
@@ -410,7 +410,7 @@ def ingest_to_chromadb(records: list[dict]) -> int:
 
     # Flush remaining
     if batch_ids:
-        embeddings = _get_embedder().encode(batch_docs, convert_to_numpy=True).tolist()
+        embeddings = _get_embedder().encode(batch_docs, convert_to_numpy=True, normalize_embeddings=True).tolist()
         collection.upsert(
             ids=batch_ids,
             documents=batch_docs,

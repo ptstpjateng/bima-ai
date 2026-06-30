@@ -1252,15 +1252,23 @@ async def _call_gemma(
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            candidate = data["candidates"][0]
+            candidates = data.get("candidates") or []
+            if not candidates:
+                # Safety-blocked or empty completion → no candidates. Raise so the
+                # model-fallback ladder tries the next model / graceful RAG path,
+                # instead of a raw KeyError surfacing as a generic 500 to the user.
+                block = (data.get("promptFeedback") or {}).get("blockReason", "none")
+                raise RuntimeError(f"Gemma returned no candidates (block={block})")
+            candidate = candidates[0]
             finish_reason = candidate.get("finishReason", "UNKNOWN")
             if finish_reason not in ("STOP", "MAX_TOKENS"):
                 logger.warning("Gemma unexpected finishReason=%s", finish_reason)
             # Filter out thought parts (thinking/reasoning — gemma-4 returns these
             # as parts with thought=True which must not be shown to the user).
+            parts = (candidate.get("content") or {}).get("parts") or []
             text = "".join(
-                p["text"] for p in candidate["content"]["parts"]
-                if not p.get("thought", False)
+                p["text"] for p in parts
+                if not p.get("thought", False) and "text" in p
             ).strip()
             usage = data.get("usageMetadata", {})
             logger.info(
