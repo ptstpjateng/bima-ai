@@ -97,6 +97,7 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 
 ### Caddy Routing (`caddy/Caddyfile`, ports 80 + 443)
 *   `/webhook/*` → `ai-engine:8000` (read_timeout 120s for Gemini latency)
+*   `/dl/*` → `ai-engine:8000` (rate-limit 120/min) — PPKP doc-prep PDFs. BIMA generates the sign-required docs (Pakta Integritas etc.), hosts them in-memory at `/dl/{token}` (unguessable token, 2h TTL — `ai-engine/services/generated_docs.py` + `routers/downloads.py`), and APTANA fetches them to deliver as WhatsApp **document** messages. ⚠️ **Caddy reload didn't apply this route via `caddy reload` — needed `docker compose restart proxy`** (admin API returns 0 bytes, so `caddy reload` silently no-ops here; restart re-reads the mounted Caddyfile).
 *   `/admin-api/*` → `admin-api:8001` (handle_path strips the prefix)
 *   `/` (bare root) → `301 https://portal.nolongin.com` (anonymous visitors land on the public portal, not the legacy admin login)
 *   everything else (`/api`, `/sanctum`, `/admin`, `/livewire`, `/css`, `/js`, `/fonts`, `/storage`, `/up`, …) → `backend:80` (read_timeout 300s for Filament Excel imports)
