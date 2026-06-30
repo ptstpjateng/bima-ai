@@ -8,20 +8,23 @@ from SIAP later.
 """
 from __future__ import annotations
 
-from services import doc_generator as dg
-
+# doc_type values are the string constants from services.doc_generator
+# (PAKTA_INTEGRITAS / SURAT_PERMOHONAN / SURAT_PESANAN). We hardcode the strings
+# rather than importing doc_generator so this module stays free of the fpdf2
+# dependency — importable in the test harness (and at _lock_license time)
+# without fpdf2 installed. test_doc_generator asserts they match DOC_TYPES.
 PPKP_LICENSE_ID = 459
 
 # Each requirement: key, label, kind ('generate'|'upload'), optional doc_type, note.
 _PPKP_REQUIREMENTS: list[dict] = [
     {"key": "pakta_integritas", "label": "Pakta Integritas", "kind": "generate",
-     "doc_type": dg.PAKTA_INTEGRITAS,
+     "doc_type": "pakta_integritas",
      "note": "BIMA buatkan drafnya — Anda tinggal tanda tangan + e-meterai."},
     {"key": "permohonan", "label": "Surat Permohonan PPKP", "kind": "generate",
-     "doc_type": dg.SURAT_PERMOHONAN,
+     "doc_type": "surat_permohonan",
      "note": "BIMA buatkan drafnya — Anda tinggal tanda tangan + e-meterai."},
     {"key": "surat_pesanan", "label": "Surat Pesanan/Kontrak dengan galangan", "kind": "generate",
-     "doc_type": dg.SURAT_PESANAN,
+     "doc_type": "surat_pesanan",
      "note": "BIMA buatkan draf — Anda & galangan tanda tangani + e-meterai."},
     {"key": "siup_oss", "label": "SIUP OSS (NIB/izin berusaha)", "kind": "upload"},
     {"key": "ktp", "label": "KTP Pemilik/Penanggung Jawab", "kind": "upload"},

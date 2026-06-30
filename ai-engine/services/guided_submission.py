@@ -261,6 +261,10 @@ def _msisdn_from_user_id(user_id: str) -> Optional[str]:
 
 class Stage(str, Enum):
     RESOLVING_LICENSE = "resolving_license"
+    # PREPARING_DOCS: a curated licence (e.g. PPKP) is locked; BIMA collects the
+    # data its sign-required documents need, drafts + delivers them, and hands
+    # off to Mekari for e-signature + e-meterai before the upload step.
+    PREPARING_DOCS = "preparing_docs"
     # COLLECTING_DOCS: the licence is locked and its requirements shown; BIMA is
     # gathering the citizen's uploaded files. Uploads attach SILENTLY and a
     # per-session debounce produces ONE consolidated reply once they settle.
@@ -1114,8 +1118,24 @@ async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
         sess.sla_working_days = reqs.get("sla_working_days")
         sess.retribution_fee = reqs.get("retribution_fee")
 
-    sess.stage = Stage.COLLECTING_DOCS
     sess.touch()
+
+    # Curated licences (e.g. PPKP) get the doc-prep co-pilot: BIMA drafts the
+    # sign-required documents, so collect their data + generate them BEFORE the
+    # upload step. Non-curated licences keep the plain upload flow untouched.
+    from services import license_guides
+
+    guide = license_guides.get_guide(sess.license_id)
+    if guide is not None and not sess.documents:
+        sess.stage = Stage.PREPARING_DOCS
+        await _put_session(sess)
+        logger.info(
+            "Guided-submission locked (curated -> doc-prep) | user=%s | license_id=%s",
+            _mask(sess.user_id), sess.license_id,
+        )
+        return _fmt_doc_prep_intro(sess, guide)
+
+    sess.stage = Stage.COLLECTING_DOCS
 
     # Demo-rehearsal fallback ONLY (production never sets the packet env): if a
     # curated packet is configured, auto-load + process it now so the rehearsal
@@ -1679,6 +1699,232 @@ def _handle_license_choice(sess: SubmissionSession, message: str) -> Optional[di
 # Public entry point — called by ai_handler as a FAST-PATH.
 # ===========================================================================
 
+# --------------------------------------------------------------------------- #
+# PPKP doc-prep co-pilot (curated licences)
+#
+# After a curated licence is locked, BIMA collects the data its sign-required
+# documents need, drafts them with `doc_generator`, delivers them as WhatsApp
+# *document* messages (hosted at /dl/{token}), and hands off to Mekari for
+# e-signature + e-meterai — THEN rejoins the normal upload / score / submit
+# flow. Everything here is gated behind `license_guides.get_guide(...)`, so a
+# non-curated submission never enters this path.
+# --------------------------------------------------------------------------- #
+
+# Data the generated docs need, in the sess.fields key convention (shared with
+# the applicant extraction, so name/NIK collected here pre-fill the KTP step).
+_DOC_REQUIRED_FIELDS = [
+    "applicant_name", "nik", "jabatan", "business_name", "alamat",
+    "nama_kapal", "galangan",
+]
+_DOC_OPTIONAL_FIELDS = ["gt_kapal", "bahan_kapal"]
+_DOC_FIELD_LABELS = {
+    "applicant_name": "Nama lengkap (sesuai KTP)",
+    "nik": "NIK (16 digit)",
+    "jabatan": "Jabatan (mis. Direktur / Pemilik)",
+    "business_name": "Nama perusahaan",
+    "alamat": "Alamat perusahaan",
+    "nama_kapal": "Nama kapal",
+    "galangan": "Nama galangan pembuat kapal",
+    "gt_kapal": "Ukuran kapal (GT)",
+    "bahan_kapal": "Bahan kapal (Baja / Kayu / Fiber)",
+}
+
+_DOC_EXTRACT_SYSTEM = (
+    "Anda mengekstrak data dari pesan warga untuk mengisi formulir izin. "
+    "Kembalikan HANYA satu objek JSON, tanpa penjelasan dan tanpa code fence. "
+    "Sertakan sebuah kunci HANYA jika nilainya jelas tersurat di pesan; bila "
+    "tidak ada, jangan sertakan kuncinya (jangan mengarang). Kunci yang mungkin: "
+    "applicant_name (nama orang), nik (16 digit angka), jabatan, business_name "
+    "(nama perusahaan/usaha), alamat, nama_kapal, gt_kapal (ukuran GT), "
+    "bahan_kapal, galangan (nama galangan kapal)."
+)
+
+
+def _public_base_url() -> str:
+    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://nolongin.com").rstrip("/")
+
+
+def _mekari_sign_url() -> str:
+    # Stub deep-link for the Mekari e-sign + e-meterai hand-off. The real
+    # integration lands later; the demo shows the intended flow via a
+    # configurable URL.
+    return os.getenv("BIMA_MEKARI_SIGN_URL", "https://mekari.com/esign").rstrip("/")
+
+
+def _fmt_doc_prep_intro(sess: SubmissionSession, guide: dict[str, Any]) -> str:
+    gen = guide.get("generate_docs") or []
+    up = guide.get("upload_docs") or []
+    lines = [
+        f"Baik Bapak/Ibu, untuk *{sess.license_name}* ada "
+        f"{len(gen) + len(up)} persyaratan. Kabar baiknya, {len(gen)} dokumen "
+        "bisa *saya buatkan drafnya* sekarang:",
+        "",
+    ]
+    lines += [f"{i}. {d['label']}" for i, d in enumerate(gen, 1)]
+    lines += ["", f"dan {len(up)} dokumen tinggal Bapak/Ibu unggah nanti:"]
+    lines += [f"{i}. {d['label']}" for i, d in enumerate(up, 1)]
+    lines += [
+        "",
+        "Untuk membuat draf dokumennya, saya perlu beberapa data. Boleh kirim "
+        "sekaligus dalam satu pesan:",
+    ]
+    lines += [f"- {_DOC_FIELD_LABELS[k]}" for k in _DOC_REQUIRED_FIELDS + _DOC_OPTIONAL_FIELDS]
+    return "\n".join(lines)
+
+
+def _missing_doc_fields(sess: SubmissionSession) -> list[str]:
+    return [k for k in _DOC_REQUIRED_FIELDS if not str(sess.fields.get(k) or "").strip()]
+
+
+def _ask_doc_fields(sess: SubmissionSession, missing: list[str]) -> str:
+    labels = [_DOC_FIELD_LABELS[k] for k in missing]
+    if len(labels) == 1:
+        return f"Terima kasih. Tinggal satu lagi: *{labels[0]}*?"
+    listed = "\n".join(f"- {lab}" for lab in labels)
+    return (
+        "Terima kasih. Masih ada data yang saya perlukan untuk melengkapi "
+        f"dokumennya:\n{listed}"
+    )
+
+
+async def _extract_doc_fields(text: str, sess: SubmissionSession) -> dict[str, str]:
+    """Pull whatever doc fields the citizen just typed, via a JSON-only LLM call.
+    Returns only keys clearly present (never invents). Logs no field values."""
+    text = (text or "").strip()
+    if not text:
+        return {}
+    try:
+        from services.ai_handler import _call_gemma, _strip_json_fences
+
+        raw = await _call_gemma(
+            _DOC_EXTRACT_SYSTEM,
+            text[:1500],
+            max_tokens=256,
+            temperature=0.0,
+            disable_thinking=True,
+        )
+        data = json.loads(_strip_json_fences(raw))
+    except Exception:
+        logger.warning("doc-field extraction failed | user=%s", _mask(sess.user_id))
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k in _DOC_REQUIRED_FIELDS + _DOC_OPTIONAL_FIELDS:
+        v = data.get(k)
+        if isinstance(v, (str, int)) and str(v).strip():
+            out[k] = str(v).strip()
+    if "nik" in out:  # NIK must be 16 digits, else drop it (never invent identity)
+        digits = re.sub(r"\D", "", out["nik"])
+        if len(digits) == 16:
+            out["nik"] = digits
+        else:
+            out.pop("nik", None)
+    return out
+
+
+async def _send_doc_to_user(
+    user_id: str, link: str, filename: str, *, caption: str = ""
+) -> bool:
+    """Deliver a generated PDF on the citizen's channel — WhatsApp document, or a
+    text link on Telegram (no doc-send wired there yet). Never raises."""
+    try:
+        if user_id.startswith("wa-"):
+            from services.whatsapp_sender import send_document
+
+            return await send_document(
+                recipient_phone=user_id[3:], link=link, filename=filename,
+                caption=caption or None,
+            )
+        if user_id.startswith("tg-"):
+            return await _send_to_user(user_id, f"{caption}\n{link}".strip())
+    except Exception:
+        logger.exception("doc send failed | user=%s", _mask(user_id))
+    return False
+
+
+async def _generate_and_send_docs(sess: SubmissionSession) -> str:
+    """All required data present: draft the docs, deliver them, hand off to
+    Mekari, and rejoin COLLECTING_DOCS for the signed + uploaded set."""
+    from services import doc_generator, generated_docs, license_guides
+
+    guide = license_guides.get_guide(sess.license_id) or {}
+    data = {k: sess.fields.get(k, "") for k in (_DOC_REQUIRED_FIELDS + _DOC_OPTIONAL_FIELDS)}
+    data["license_name"] = sess.license_name or ""
+
+    base = _public_base_url()
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", sess.fields.get("applicant_name") or "warga").strip("_")[:30] or "warga"
+    sent = 0
+    for d in (guide.get("generate_docs") or []):
+        try:
+            pdf = doc_generator.generate(d["doc_type"], data)
+        except Exception:
+            logger.exception(
+                "doc generate failed | user=%s | doc=%s", _mask(sess.user_id), d.get("key"),
+            )
+            continue
+        filename = f"{d['label'].replace(' ', '_').replace('/', '-')}_{safe}.pdf"
+        token = generated_docs.store(pdf, filename)
+        if await _send_doc_to_user(
+            sess.user_id, f"{base}/dl/{token}", filename,
+            caption=f"Draf {d['label']} - mohon tanda tangan + e-meterai.",
+        ):
+            sent += 1
+
+    sess.stage = Stage.COLLECTING_DOCS
+    sess.touch()
+    await _put_session(sess)
+    logger.info(
+        "Guided-submission docs drafted | user=%s | license_id=%s | sent=%d",
+        _mask(sess.user_id), sess.license_id, sent,
+    )
+
+    up = guide.get("upload_docs") or []
+    up_list = "\n".join(f"{i}. {d['label']}" for i, d in enumerate(up, 1))
+    lead = (
+        f"Selesai - {sent} draf dokumen sudah saya kirim di atas. "
+        if sent
+        else "Maaf, ada kendala saat mengirim draf dokumennya. Tim kami akan bantu. "
+    )
+    return (
+        f"{lead}Langkah berikutnya:\n\n"
+        f"1) *Tanda tangan + e-meterai* ketiga dokumen lewat Mekari: {_mekari_sign_url()}\n"
+        "2) Unggah kembali ketiga dokumen yang sudah ditandatangani ke sini.\n"
+        f"3) Lengkapi juga {len(up)} dokumen berikut:\n{up_list}\n\n"
+        "Kirim semua dokumennya di sini ya, Bapak/Ibu - saya periksa "
+        "kelengkapannya sebelum diajukan ke SIAP."
+    )
+
+
+async def _handle_preparing_docs(sess: SubmissionSession, msg: str) -> str:
+    """Collect the data the generated docs need; once complete, draft + deliver."""
+    text = (msg or "").strip()
+    missing_before = _missing_doc_fields(sess)
+
+    extracted = await _extract_doc_fields(text, sess)
+    for k, v in extracted.items():
+        sess.fields[k] = v
+
+    missing_now = _missing_doc_fields(sess)
+    # Single-field follow-up the LLM didn't catch: take the short reply verbatim
+    # (never for NIK — it needs 16 validated digits).
+    if (
+        len(missing_before) == 1
+        and missing_before == missing_now
+        and text
+        and missing_before[0] != "nik"
+        and len(text) <= 60
+    ):
+        sess.fields[missing_before[0]] = text
+        missing_now = _missing_doc_fields(sess)
+
+    sess.touch()
+    if missing_now:
+        await _put_session(sess)
+        return _ask_doc_fields(sess, missing_now)
+    return await _generate_and_send_docs(sess)
+
+
 async def maybe_handle(user_id: str, message: str) -> Optional[str]:
     """Guided-submission FAST-PATH for `ai_handler`.
 
@@ -1777,6 +2023,9 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
                 )
             # No candidates pending → treat the message as a fresh licence query.
             return await _start_session(user_id, msg)
+
+        if sess.stage == Stage.PREPARING_DOCS:
+            return await _handle_preparing_docs(sess, msg)
 
         if sess.stage == Stage.COLLECTING_DOCS:
             return await _handle_collecting_docs_text(sess, msg)
