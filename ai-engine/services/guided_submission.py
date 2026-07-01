@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -618,9 +619,18 @@ async def _attach_documents(user_id: str, docs: list[SessionDocument]) -> bool:
     if sess is None or sess.stage in (Stage.DONE, Stage.FAILED):
         return False
     have = {d.file_id for d in sess.documents}
+    have_hashes = {
+        hashlib.sha256(d.content).hexdigest() for d in sess.documents if d.content
+    }
     added = 0
     for d in docs:
         if d.file_id in have:
+            continue
+        chash = hashlib.sha256(d.content).hexdigest() if d.content else None
+        if chash is not None and chash in have_hashes:
+            # Same bytes already attached under a DIFFERENT file_id — an APTANA
+            # re-delivery or a re-sent identical file. Skip it so the packet
+            # (and the score) isn't inflated with repeats.
             continue
         if len(d.content) > _MAX_DOC_BYTES:
             logger.warning(
@@ -632,6 +642,8 @@ async def _attach_documents(user_id: str, docs: list[SessionDocument]) -> bool:
             break
         sess.documents.append(d)
         have.add(d.file_id)
+        if chash is not None:
+            have_hashes.add(chash)
         added += 1
     sess.last_doc_at = time.time()
     sess.touch()

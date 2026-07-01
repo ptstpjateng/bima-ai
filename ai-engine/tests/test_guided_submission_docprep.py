@@ -208,5 +208,27 @@ class TestSwitchKeywords(unittest.TestCase):
         self.assertEqual(reply, "CONFIRM_HANDLED")   # fell through to the stage handler
 
 
+class TestAttachDedup(unittest.TestCase):
+    """A re-delivered / re-sent identical file (same bytes, new file_id) must not
+    attach twice — else the packet + score double-count it."""
+
+    def setUp(self):
+        os.environ["BIMA_GUIDED_SUBMISSION_ENABLED"] = "true"
+
+    def tearDown(self):
+        gs._sessions.clear()
+
+    def test_dedups_identical_content_across_file_ids(self):
+        sess = SubmissionSession(user_id="wa-900", license_id=459,
+                                 license_name="PPKP", stage=Stage.COLLECTING_DOCS)
+        gs._sessions[sess.user_id] = sess
+        d1 = gs.SessionDocument("id-1", "ktp", "ktp.jpg", "image/jpeg", b"SAMEBYTES")
+        d2 = gs.SessionDocument("id-2", "ktp", "ktp.jpg", "image/jpeg", b"SAMEBYTES")  # dup bytes, new id
+        d3 = gs.SessionDocument("id-3", "nib", "nib.pdf", "application/pdf", b"OTHER")
+        _run(gs._attach_documents(sess.user_id, [d1, d2, d3]))
+        self.assertEqual(len(sess.documents), 2)  # d2 skipped as a content duplicate
+        self.assertEqual({d.file_id for d in sess.documents}, {"id-1", "id-3"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
