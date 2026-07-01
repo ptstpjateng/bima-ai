@@ -482,11 +482,15 @@ def _documents_digest(score: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
     digest: list[dict[str, Any]] = []
     for f in findings:
         confidence = getattr(f, "confidence", None)
+        doc_name = getattr(f, "document_name", None)
         digest.append({
             "filename": mask_pii(str(getattr(f, "file", "") or "")),
             "detected_type": mask_pii(str(getattr(f, "detected_type", "") or "")),
+            "document_name": mask_pii(str(doc_name)) if doc_name else None,
             "claimed_type": mask_pii(str(getattr(f, "claimed_type", "") or "")),
             "has_meterai": getattr(f, "has_meterai", None),
+            "has_signature": getattr(f, "has_signature", None),
+            "has_stamp": getattr(f, "has_stamp", None),
             "confidence": (
                 round(float(confidence), 2)
                 if isinstance(confidence, (int, float))

@@ -205,6 +205,104 @@ class TestRenderScoreMessage(unittest.TestCase):
         self.assertIn("SIAP DB tidak tersedia.", msg)
 
 
+class TestNameAnyDocument(unittest.TestCase):
+    """Open-vocabulary naming — an 'Other' doc that Vision could still title
+    renders that free-text title (masked) instead of the flat 'Dokumen lain'."""
+
+    def test_other_with_document_name_shows_name(self):
+        res = _result(
+            type_correctness=[
+                TypeCorrectnessFinding(
+                    file="scan.pdf",
+                    file_id="doc-1",
+                    claimed_type="Other",
+                    detected_type="Other",
+                    confidence=0.6,
+                    matches=False,
+                    document_name="Nota Kesepahaman",
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        self.assertIn("Nota Kesepahaman", msg)
+        self.assertNotIn("Dokumen lain", msg)
+
+    def test_other_without_document_name_falls_back_to_label(self):
+        res = _result(
+            type_correctness=[
+                TypeCorrectnessFinding(
+                    file="scan.pdf",
+                    file_id="doc-1",
+                    claimed_type="Other",
+                    detected_type="Other",
+                    confidence=0.6,
+                    matches=False,
+                    document_name=None,
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        self.assertIn("Dokumen lain", msg)
+
+    def test_known_class_ignores_document_name(self):
+        # A real enum class still leads with its human label, not the free text.
+        res = _result(
+            type_correctness=[
+                TypeCorrectnessFinding(
+                    file="ktp.jpg",
+                    file_id="doc-1",
+                    claimed_type="KTP",
+                    detected_type="KTP",
+                    confidence=0.95,
+                    matches=True,
+                    document_name="KARTU TANDA PENDUDUK Republik Indonesia",
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        self.assertIn("KTP", msg)
+
+    def test_document_name_is_pii_masked(self):
+        # document_name can echo a business/person name AND embedded PII — a
+        # 16-digit NIK riding in the title must be masked before display.
+        res = _result(
+            type_correctness=[
+                TypeCorrectnessFinding(
+                    file="scan.pdf",
+                    file_id="doc-1",
+                    claimed_type="Other",
+                    detected_type="Other",
+                    confidence=0.5,
+                    matches=False,
+                    document_name="Surat 3327080511740081",
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        self.assertNotIn("3327080511740081", msg)
+
+    def test_new_sign_signals_surface_when_missing(self):
+        # A Surat Pesanan missing signature + stamp shows the compact flags.
+        res = _result(
+            type_correctness=[
+                TypeCorrectnessFinding(
+                    file="pesanan.pdf",
+                    file_id="doc-1",
+                    claimed_type="Surat_Pesanan",
+                    detected_type="Surat_Pesanan",
+                    confidence=0.9,
+                    matches=True,
+                    has_signature=False,
+                    has_stamp=False,
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        self.assertIn("Surat Pesanan", msg)
+        self.assertIn("tanda tangan belum terlihat", msg)
+        self.assertIn("cap belum terlihat", msg)
+
+
 class TestMaskPiiUnit(unittest.TestCase):
     """Direct unit cover for the reusable `services.pii.mask_pii` helper."""
 

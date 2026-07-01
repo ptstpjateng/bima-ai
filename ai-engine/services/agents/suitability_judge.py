@@ -86,6 +86,12 @@ DOC_CLASSES: list[str] = [
     "Persetujuan_Nama_Kapal",
     "Desain_Kapal",
     "Spesifikasi_Alat_Tangkap",
+    # Common Indonesian civil/legal documents (the long tail is handled by the
+    # free-text `document_name`, so this stays small).
+    "Kartu_Keluarga",
+    "Surat_Pernyataan",
+    "Surat_Kuasa",
+    "Sertifikat_Tanah",
     "Other",
 ]
 
@@ -97,6 +103,21 @@ DOC_CLASSES: list[str] = [
 _METERAI_REQUIRED_CLASSES: set[str] = {
     "Pakta_Integritas",
     "Surat_Permohonan",
+}
+
+# Classes that need a company/agency stamp (cap/stempel) rather than a meterai.
+# A Surat Pesanan (purchase/build order to the galangan) is validated by the
+# shipyard's stamp, not a Rp10.000 meterai.
+_STAMP_REQUIRED_CLASSES: set[str] = {
+    "Surat_Pesanan",
+}
+
+# Sign-required documents — all three must carry a visible signature before
+# they can be filed.
+_SIGNATURE_REQUIRED_CLASSES: set[str] = {
+    "Pakta_Integritas",
+    "Surat_Permohonan",
+    "Surat_Pesanan",
 }
 
 
@@ -144,7 +165,10 @@ class TypeCorrectnessFinding:
     detected_type: str            # one of DOC_CLASSES (or "Unknown" on failure)
     confidence: float             # 0.0-1.0 — Gemini's self-reported score
     matches: bool                 # convenience: claimed_type == detected_type
-    has_meterai: Optional[bool] = None  # Vision: meterai/stamp visible? None = not assessed
+    document_name: Optional[str] = None  # Vision: free-text real title (names ANY doc)
+    has_meterai: Optional[bool] = None   # Vision: meterai visible? None = not assessed
+    has_signature: Optional[bool] = None # Vision: signature (tanda tangan) visible? None = n/a
+    has_stamp: Optional[bool] = None     # Vision: company/agency cap/stempel visible? None = n/a
     note: Optional[str] = None    # populated on vision failure
 
 
@@ -325,6 +349,17 @@ _DOC_CLASS_ALIASES: dict[str, str] = {
     "alat tangkap": "Spesifikasi_Alat_Tangkap",
     "siup": "NIB",
     "siup oss": "NIB",
+    # Common Indonesian civil/legal documents. Aliases kept conservative
+    # (full phrases, no short ambiguous substrings like a bare "kk").
+    "kartu keluarga": "Kartu_Keluarga",
+    "kartu_keluarga": "Kartu_Keluarga",
+    "surat pernyataan": "Surat_Pernyataan",
+    "surat_pernyataan": "Surat_Pernyataan",
+    "surat kuasa": "Surat_Kuasa",
+    "surat_kuasa": "Surat_Kuasa",
+    "sertifikat tanah": "Sertifikat_Tanah",
+    "sertifikat_tanah": "Sertifikat_Tanah",
+    "sertifikat hak milik": "Sertifikat_Tanah",
 }
 
 
@@ -383,6 +418,15 @@ _TYPE_DETECT_SCHEMA: dict[str, Any] = {
                 ". Pick the class that best describes the document. If unsure, pick 'Other'."
             ),
         },
+        "document_name": {
+            "type": "string",
+            "description": (
+                "The document's actual Indonesian title/type in free text "
+                "(e.g. 'Surat Keterangan Domisili Usaha', 'Nota Kesepahaman', "
+                "'Kartu Keluarga') — the real title even when detected_type is "
+                "'Other'. This is what lets us NAME any document."
+            ),
+        },
         "confidence": {
             "type": "number",
             "description": "Self-rated confidence 0.0-1.0.",
@@ -399,6 +443,20 @@ _TYPE_DETECT_SCHEMA: dict[str, Any] = {
                 "false if none is visible."
             ),
         },
+        "has_signature": {
+            "type": "boolean",
+            "description": (
+                "True if a signature (tanda tangan basah atau elektronik) is "
+                "visibly present; false if none is visible."
+            ),
+        },
+        "has_stamp": {
+            "type": "boolean",
+            "description": (
+                "True if a company/agency stamp (cap / stempel) is visibly "
+                "present — distinct from a meterai; false if none is visible."
+            ),
+        },
     },
     "required": ["detected_type", "confidence"],
 }
@@ -412,11 +470,17 @@ _TYPE_DETECT_PROMPT = (
     "'Desain_Kapal' = a ship design / rancang-bangun drawing; "
     "'Spesifikasi_Alat_Tangkap' = a fishing-gear (alat penangkapan ikan / API) "
     "specification. Use the visual layout, headers, official logos, and any "
-    "visible issuing-authority text. Also report whether a meterai (Rp10.000 "
-    "e-meterai stamp/QR, or a physical meterai tempel sticker) is visibly "
-    "affixed. Provide a 0.0-1.0 confidence score and a one-sentence rationale. "
-    "If the document is unreadable or clearly unrelated to Indonesian "
-    "licensing, return 'Other' with low confidence."
+    "visible issuing-authority text. Also return 'document_name' — the "
+    "document's real Indonesian title/type in free text (e.g. 'Surat "
+    "Keterangan Domisili Usaha', 'Nota Kesepahaman', 'Kartu Keluarga'), the "
+    "actual title even when detected_type is 'Other'. Report honestly which "
+    "legal-validity signals are visibly present: 'has_meterai' (a Rp10.000 "
+    "e-meterai stamp/QR, or a physical meterai tempel sticker), 'has_signature' "
+    "(a tanda tangan basah atau elektronik), and 'has_stamp' (a company/agency "
+    "cap/stempel, distinct from a meterai). Provide a 0.0-1.0 confidence score "
+    "and a one-sentence rationale. If the document is unreadable or clearly "
+    "unrelated to Indonesian licensing, return 'Other' with low confidence "
+    "(still give document_name if the title is legible)."
 )
 
 _SUITABILITY_SCHEMA: dict[str, Any] = {
@@ -506,6 +570,12 @@ async def detect_doc_type(doc: UploadedDoc) -> TypeCorrectnessFinding:
     confidence = max(0.0, min(1.0, confidence))
     hm = parsed.get("has_meterai")
     has_meterai = hm if isinstance(hm, bool) else None
+    hs = parsed.get("has_signature")
+    has_signature = hs if isinstance(hs, bool) else None
+    hst = parsed.get("has_stamp")
+    has_stamp = hst if isinstance(hst, bool) else None
+    raw_name = parsed.get("document_name")
+    document_name = raw_name.strip() or None if isinstance(raw_name, str) else None
 
     return TypeCorrectnessFinding(
         file=doc.filename,
@@ -514,7 +584,10 @@ async def detect_doc_type(doc: UploadedDoc) -> TypeCorrectnessFinding:
         detected_type=detected,
         confidence=confidence,
         matches=(detected == claimed_canonical),
+        document_name=document_name,
         has_meterai=has_meterai,
+        has_signature=has_signature,
+        has_stamp=has_stamp,
     )
 
 
@@ -735,10 +808,14 @@ def _build_issues(
                 detail=f.note,
             ))
 
-        # Meterai check — a sign-required document (Pakta Integritas / Surat
-        # Permohonan / Surat Pesanan) that Vision READ but where no meterai is
-        # visible. Guarded on `has_meterai is False` so we never flag a doc we
-        # couldn't actually read (has_meterai stays None then).
+        # Legal-validity signal checks. Each is an independent `if` — one
+        # document can miss more than one (e.g. a Surat Pesanan lacking both a
+        # signature AND a company stamp). All guard on the attribute being
+        # EXACTLY False so a doc we couldn't read (signal stays None) is never
+        # flagged.
+
+        # Meterai — a meterai-required document (Pakta Integritas / Surat
+        # Permohonan) that Vision READ but where no meterai is visible.
         if f.detected_type in _METERAI_REQUIRED_CLASSES and f.has_meterai is False:
             issues.append(Issue(
                 id=f"meterai:missing:{f.file_id}",
@@ -748,6 +825,35 @@ def _build_issues(
                     f"Dokumen '{f.file}' ({f.detected_type.replace('_', ' ')}) "
                     "wajib ditandatangani dan dibubuhi meterai Rp10.000 "
                     "(e-meterai atau meterai tempel) sebelum diajukan."
+                ),
+            ))
+
+        # Stamp — a Surat Pesanan (purchase/build order to the galangan) needs
+        # the shipyard's company stamp (cap/stempel), NOT a meterai.
+        if f.detected_type in _STAMP_REQUIRED_CLASSES and f.has_stamp is False:
+            issues.append(Issue(
+                id=f"stamp:missing:{f.file_id}",
+                severity=SEVERITY_HIGH,
+                title=f"Cap/stempel belum terlihat: {f.file}",
+                detail=(
+                    f"Dokumen '{f.file}' ({f.detected_type.replace('_', ' ')}) "
+                    "perlu dibubuhi cap/stempel perusahaan galangan sebelum "
+                    "diajukan — bukan meterai. Mohon minta pihak galangan "
+                    "membubuhkan cap resminya."
+                ),
+            ))
+
+        # Signature — every sign-required document must carry a visible
+        # signature (tanda tangan basah atau elektronik).
+        if f.detected_type in _SIGNATURE_REQUIRED_CLASSES and f.has_signature is False:
+            issues.append(Issue(
+                id=f"signature:missing:{f.file_id}",
+                severity=SEVERITY_HIGH,
+                title=f"Tanda tangan belum terlihat: {f.file}",
+                detail=(
+                    f"Dokumen '{f.file}' ({f.detected_type.replace('_', ' ')}) "
+                    "wajib ditandatangani (tanda tangan basah atau elektronik) "
+                    "sebelum diajukan."
                 ),
             ))
 
