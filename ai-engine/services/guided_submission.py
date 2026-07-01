@@ -495,6 +495,7 @@ async def has_active_session(user_id: str) -> bool:
     sess = await _get_session(user_id)
     return sess is not None and sess.stage in (
         Stage.RESOLVING_LICENSE,
+        Stage.PREPARING_DOCS,
         Stage.COLLECTING_DOCS,
         Stage.CONFIRM,
     )
@@ -573,6 +574,19 @@ async def handle_inbound_documents(
                 "Terima kasih sudah mengirim dokumennya, Bapak/Ibu. Sebelum "
                 "saya periksa, boleh sebutkan dulu izin apa yang ingin "
                 "diajukan? Contohnya \"Izin Pemakaian Tanah\"."
+            )
+
+        if sess.stage == Stage.PREPARING_DOCS:
+            # The citizen uploaded their OWN documents instead of sending data
+            # for BIMA to draft — they already have them. Skip generation and
+            # fall through to the normal collect + score flow (the debounce
+            # processor only runs at COLLECTING_DOCS/CONFIRM).
+            sess.stage = Stage.COLLECTING_DOCS
+            sess.touch()
+            await _put_session(sess)
+            logger.info(
+                "Guided-submission: upload during doc-prep -> COLLECTING_DOCS "
+                "(citizen brought own docs) | user=%s", _mask(user_id),
             )
 
         # COLLECTING_DOCS or CONFIRM (a late upload): attach silently + debounce.
