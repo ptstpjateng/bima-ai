@@ -1042,5 +1042,84 @@ class TestInboundCaptionedMediaRouting(unittest.TestCase):
         self.assertIs(bg.tasks[0][0], aptana._process_inbound_media)
 
 
+# ===========================================================================
+# Deferred slow-reply acknowledgment (routers.aptana._start_deferred_ack).
+#
+# Contract: the "💭 Sebentar ya…" bubble must NEVER fire for a fast reply
+# (Decisions §9 — clean chat) but MUST fire when generation outlasts the delay,
+# so the citizen isn't left staring at silence.
+# ===========================================================================
+class TestDeferredAck(unittest.TestCase):
+    def setUp(self):
+        _reset_all()
+
+    def test_disabled_returns_none(self):
+        with patch.object(aptana, "_SLOW_ACK_ENABLED", False):
+            self.assertIsNone(aptana._start_deferred_ack("628123"))
+
+    def test_fast_reply_no_bubble(self):
+        """Reply lands before the delay → _cancel_ack stops the bubble."""
+        async def scenario():
+            task = aptana._start_deferred_ack("628123")
+            aptana._cancel_ack(task)             # reply was instant
+            await asyncio.sleep(0.15)            # let the (tiny) timer lapse
+            return task
+
+        with _capture_sends(), \
+                patch.object(aptana, "_SLOW_ACK_ENABLED", True), \
+                patch.object(aptana, "_SLOW_ACK_DELAY_SECONDS", 0.02):
+            task = _run(scenario())
+        self.assertEqual([s for s in _SENT if "Sebentar" in (s["body"] or "")], [])
+        self.assertTrue(task.cancelled())
+
+    def test_slow_reply_fires_bubble_once(self):
+        """Generation outlasts the delay → the citizen gets exactly one bubble."""
+        async def scenario():
+            task = aptana._start_deferred_ack("628123")
+            await asyncio.sleep(0.15)            # "slow" generation
+            aptana._cancel_ack(task)             # cancel after it already fired
+            return task
+
+        with _capture_sends(), \
+                patch.object(aptana, "_SLOW_ACK_ENABLED", True), \
+                patch.object(aptana, "_SLOW_ACK_DELAY_SECONDS", 0.02):
+            _run(scenario())
+        acks = [s for s in _SENT if "Sebentar" in (s["body"] or "")]
+        self.assertEqual(len(acks), 1)
+        self.assertEqual(acks[0]["to"], "628123")
+
+    def test_officer_fastpath_gets_no_bubble(self):
+        """Regression (red-team finding): the officer copilot fast-path is a slow
+        LLM turn, but it must NOT receive the citizen-worded deferred bubble —
+        the ack is armed only on the citizen path, after the officer early-return.
+        This test would FAIL if the ack were armed before the officer bridge."""
+        import services as _services_pkg
+
+        fake_ob = types.ModuleType("services.officer_bridge")
+        fake_ob.CHANNEL_WHATSAPP = "whatsapp"
+
+        async def _slow_officer_reply(channel=None, channel_id=None, message=None):
+            await asyncio.sleep(0.15)   # outlasts the (tiny) ack delay below
+            return "Jawaban copilot untuk petugas."
+
+        fake_ob.maybe_handle_officer_reply = _slow_officer_reply
+
+        async def scenario():
+            await aptana._process_inbound(
+                "628999", "status berkas 123", name="Officer", message_id="wamid.O")
+
+        with _capture_sends(), \
+                patch.dict(sys.modules, {"services.officer_bridge": fake_ob}), \
+                patch.object(_services_pkg, "officer_bridge", fake_ob, create=True), \
+                patch.object(aptana, "_SLOW_ACK_ENABLED", True), \
+                patch.object(aptana, "_SLOW_ACK_DELAY_SECONDS", 0.02):
+            _run(scenario())
+
+        # The officer got their copilot reply...
+        self.assertTrue(any("copilot" in (s["body"] or "") for s in _SENT))
+        # ...and NOT the citizen-worded deferred bubble.
+        self.assertEqual([s for s in _SENT if "Sebentar" in (s["body"] or "")], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

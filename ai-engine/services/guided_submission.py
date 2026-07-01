@@ -743,6 +743,44 @@ async def _send_to_user(user_id: str, text: str) -> bool:
 # Debounce — one task per session; consolidated reply once uploads settle.
 # ===========================================================================
 
+# Scoring acknowledgment: once an upload burst settles, the consolidated pass
+# runs Gemini Vision over every page and can take 10-30s. Combined with the ~8s
+# debounce wait, the citizen would otherwise stare at silence for the better
+# part of a minute after their last upload (a live rehearsal on 2026-07-01
+# surfaced exactly this "did it break?" gap). Fire ONE deferred acknowledgment —
+# only if scoring actually runs long — so fast/edge cases stay clutter-free
+# (Decisions §9). One debounce task per session ⇒ at most one ack per burst.
+_SCORING_ACK_ENABLED = os.getenv("BIMA_SCORING_ACK_ENABLED", "true").lower() in ("1", "true", "yes")
+_SCORING_ACK_DELAY_SECONDS = float(os.getenv("BIMA_SCORING_ACK_DELAY_SECONDS", "2.5"))
+_SCORING_ACK_TEXT = os.getenv(
+    "BIMA_SCORING_ACK_TEXT",
+    "🔎 Dokumen Anda sedang saya periksa, mohon tunggu sebentar ya…",
+)
+
+
+def _start_scoring_ack(user_id: str) -> "Optional[asyncio.Task]":
+    """Schedule a deferred 'still checking' bubble for the scoring pass.
+
+    Returns the task so the caller can cancel it once scoring finishes; if
+    scoring is unexpectedly fast the bubble never fires. Best-effort — swallows
+    every error except cancellation, and reuses the channel-agnostic
+    `_send_to_user` so it works for WhatsApp and Telegram alike.
+    """
+    if not _SCORING_ACK_ENABLED:
+        return None
+
+    async def _run() -> None:
+        try:
+            await asyncio.sleep(_SCORING_ACK_DELAY_SECONDS)
+            await _send_to_user(user_id, _SCORING_ACK_TEXT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let a flaky ack disturb the scoring reply
+            logger.debug("Scoring ack failed | user=%s", _mask(user_id), exc_info=True)
+
+    return asyncio.create_task(_run())
+
+
 async def _arm_debounce(user_id: str) -> None:
     """Ensure exactly ONE debounce task is running for this session.
 
@@ -799,7 +837,15 @@ async def _debounce_then_process(user_id: str) -> None:
             if sess is None:
                 return
 
-        reply = await _process_collected_documents(sess)
+        # Uploads settled → the consolidated Vision pass can take 10-30s. Fire a
+        # deferred ack so the citizen isn't left in silence, but cancel it in
+        # `finally` if scoring returns fast (edge cases) so we don't clutter.
+        ack_task = _start_scoring_ack(user_id)
+        try:
+            reply = await _process_collected_documents(sess)
+        finally:
+            if ack_task is not None and not ack_task.done():
+                ack_task.cancel()
         if reply:
             await _send_to_user(user_id, reply)
     except Exception:

@@ -14,6 +14,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -313,6 +314,61 @@ class TestGenerateOnRequest(unittest.TestCase):
         self.assertEqual(len(sent), 1)             # one draft delivered
         self.assertIn("unggah kembali", reply)     # asked to sign + upload back
         self.assertEqual(s.stage, Stage.CONFIRM)   # stage unchanged
+
+
+class TestScoringAck(unittest.TestCase):
+    """Deferred scoring acknowledgment (guided_submission._start_scoring_ack).
+
+    The consolidated Vision pass can take 10-30s; this bubble fills that gap but
+    only when scoring actually runs long — a fast/edge pass cancels it so we
+    don't clutter (Decisions §9). Runs once per burst (one debounce task/session).
+    """
+
+    def test_disabled_returns_none(self):
+        with patch.object(gs, "_SCORING_ACK_ENABLED", False):
+            self.assertIsNone(gs._start_scoring_ack("wa-628"))
+
+    def test_slow_scoring_fires_ack(self):
+        sent: list = []
+
+        async def _rec(user_id, text):
+            sent.append((user_id, text))
+            return True
+
+        async def scenario():
+            task = gs._start_scoring_ack("wa-628")
+            await asyncio.sleep(0.15)             # scoring is "slow" > delay
+            if task is not None and not task.done():
+                task.cancel()
+            return task
+
+        with patch.object(gs, "_send_to_user", _rec), \
+                patch.object(gs, "_SCORING_ACK_ENABLED", True), \
+                patch.object(gs, "_SCORING_ACK_DELAY_SECONDS", 0.02):
+            _run(scenario())
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "wa-628")
+        self.assertIn("periksa", sent[0][1])
+
+    def test_fast_scoring_no_ack(self):
+        sent: list = []
+
+        async def _rec(user_id, text):
+            sent.append((user_id, text))
+            return True
+
+        async def scenario():
+            task = gs._start_scoring_ack("wa-628")
+            if task is not None and not task.done():
+                task.cancel()                     # scoring returned fast
+            await asyncio.sleep(0.15)
+            return task
+
+        with patch.object(gs, "_send_to_user", _rec), \
+                patch.object(gs, "_SCORING_ACK_ENABLED", True), \
+                patch.object(gs, "_SCORING_ACK_DELAY_SECONDS", 0.02):
+            _run(scenario())
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

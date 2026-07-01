@@ -58,6 +58,55 @@ if not _PATH_SECRET:
     )
 
 
+# ---------------------------------------------------------------------------
+# Deferred acknowledgment — "💭 Sebentar ya…" only when a reply is genuinely slow
+# ---------------------------------------------------------------------------
+# Decisions §9 disabled the ALWAYS-ON interim bubble on 2026-06-02: it cluttered
+# every exchange with a second message. But a totally silent gap during a long
+# wait (Gemini chat ~9-13s, Vision doc-scoring ~10-30s) leaves the citizen
+# wondering whether BIMA even received them — a failure a live rehearsal
+# surfaced on 2026-07-01.
+#
+# This keeps §9's clean-chat intent AND closes the gap: schedule the bubble, but
+# let the caller CANCEL it the instant the real reply is ready. A fast reply
+# (e.g. doc-gen, <1s) cancels before the timer fires → no bubble, clean chat. A
+# slow reply lets the timer elapse → the citizen gets feedback. The ack task is
+# fully decoupled from the reply path and never raises, so a flaky ack can never
+# break or delay a reply.
+_SLOW_ACK_ENABLED = os.getenv("BIMA_SLOW_ACK_ENABLED", "true").lower() in ("1", "true", "yes")
+_SLOW_ACK_DELAY_SECONDS = float(os.getenv("BIMA_SLOW_ACK_DELAY_SECONDS", "2.5"))
+_SLOW_ACK_TEXT = os.getenv("BIMA_SLOW_ACK_TEXT", "💭 Sebentar ya, sedang saya siapkan…")
+
+
+def _start_deferred_ack(msisdn: str) -> "asyncio.Task | None":
+    """Schedule a slow-reply acknowledgment bubble.
+
+    Returns the task so the caller can `_cancel_ack()` it once the real reply is
+    ready; if the reply beats ``_SLOW_ACK_DELAY_SECONDS`` the bubble never fires
+    and the citizen sees a clean single-message exchange. Returns None when
+    disabled. Best-effort: swallows every error except cancellation.
+    """
+    if not _SLOW_ACK_ENABLED:
+        return None
+
+    async def _run() -> None:
+        try:
+            await asyncio.sleep(_SLOW_ACK_DELAY_SECONDS)
+            await send_text(recipient_phone=msisdn, body=_SLOW_ACK_TEXT)
+        except asyncio.CancelledError:
+            raise  # fast reply won the race — clean chat, no bubble
+        except Exception:  # never let a flaky ack disturb the reply path
+            logger.debug("Deferred ack failed | user=%s", _mask(msisdn), exc_info=True)
+
+    return asyncio.create_task(_run())
+
+
+def _cancel_ack(task: "asyncio.Task | None") -> None:
+    """Cancel a pending deferred-ack task. No-op if already fired, done, or None."""
+    if task is not None and not task.done():
+        task.cancel()
+
+
 def _check_path_secret(provided: str) -> None:
     """Constant-time check against the configured secret. Raises 403 on mismatch."""
     if not _PATH_SECRET or not hmac.compare_digest(provided, _PATH_SECRET):
@@ -246,54 +295,61 @@ async def _process_inbound(
         _mask(msisdn), name, message_id or "<none>", text[:80],
     )
 
-    # Fire-and-forget acknowledgment so the user sees activity within ~1s.
-    # Tries native WhatsApp typing indicator via APTANA; falls back to a short
-    # interim text. Never blocks the slow generation path below.
-    asyncio.create_task(acknowledge_received(message_id, msisdn))
-
-    # Officer chat-bridge FAST-PATH: if this number is the configured demo
-    # officer with an active case session, route the reply into the Officer
-    # Copilot instead of the citizen AI. Feature-flagged; returns None when
-    # the bridge is off or the sender isn't an officer-in-session.
+    # Deferred acknowledgment: a "still working" bubble that fires ONLY if the
+    # reply runs long, cancelled in `finally` the instant the reply is ready —
+    # so a fast reply (doc-gen, greetings) stays clutter-free (§9) while a slow
+    # Gemini turn gets feedback. Fully decoupled: a flaky ack can never break or
+    # delay the reply. Armed LATER (citizen path only, below) so the citizen-
+    # worded bubble never leaks onto the officer-copilot surface.
+    ack_task = None
     try:
-        from services import officer_bridge
-
-        officer_reply = await officer_bridge.maybe_handle_officer_reply(
-            channel=officer_bridge.CHANNEL_WHATSAPP,
-            channel_id=msisdn,
-            message=text,
-        )
-    except Exception:
-        logger.exception("Officer bridge crashed | user=%s", _mask(msisdn))
-        officer_reply = None
-
-    if officer_reply is not None:
-        delivered = await send_text(recipient_phone=msisdn, body=officer_reply)
-        if not delivered:
-            logger.error("APTANA officer delivery failed | user=%s", _mask(msisdn))
-        return
-
-    try:
-        reply = await generate_ai_response(user_id, text)
-    except Exception:
-        logger.exception("AI generation failed | user=%s", _mask(msisdn))
-        # Send a polite Indonesian apology so the user isn't stranded after the
-        # "Sebentar ya…" acknowledgment. Don't log_to_backend — that path
-        # expects a real reply, not a fallback string.
+        # Officer chat-bridge FAST-PATH: if this number is the configured demo
+        # officer with an active case session, route the reply into the Officer
+        # Copilot instead of the citizen AI. Feature-flagged; returns None when
+        # the bridge is off or the sender isn't an officer-in-session.
         try:
-            await send_text(recipient_phone=msisdn, body=_GEMMA_FAILURE_APOLOGY)
+            from services import officer_bridge
+
+            officer_reply = await officer_bridge.maybe_handle_officer_reply(
+                channel=officer_bridge.CHANNEL_WHATSAPP,
+                channel_id=msisdn,
+                message=text,
+            )
         except Exception:
-            logger.exception("Apology send failed | user=%s", _mask(msisdn))
-        return
+            logger.exception("Officer bridge crashed | user=%s", _mask(msisdn))
+            officer_reply = None
 
-    delivered = await send_text(recipient_phone=msisdn, body=reply)
-    if not delivered:
-        logger.error("APTANA delivery failed | user=%s", _mask(msisdn))
+        if officer_reply is not None:
+            delivered = await send_text(recipient_phone=msisdn, body=officer_reply)
+            if not delivered:
+                logger.error("APTANA officer delivery failed | user=%s", _mask(msisdn))
+            return
 
-    try:
-        await log_to_backend(user_id, text, reply, channel="whatsapp")
-    except Exception:
-        logger.exception("Backend log failed | user=%s", _mask(msisdn))
+        # Citizen path only — arm the deferred ack now (the officer copilot has
+        # its own surface and must not receive the citizen-worded bubble).
+        ack_task = _start_deferred_ack(msisdn)
+        try:
+            reply = await generate_ai_response(user_id, text)
+        except Exception:
+            logger.exception("AI generation failed | user=%s", _mask(msisdn))
+            # Send a polite Indonesian apology so the user isn't stranded. Don't
+            # log_to_backend — that path expects a real reply, not a fallback.
+            try:
+                await send_text(recipient_phone=msisdn, body=_GEMMA_FAILURE_APOLOGY)
+            except Exception:
+                logger.exception("Apology send failed | user=%s", _mask(msisdn))
+            return
+
+        delivered = await send_text(recipient_phone=msisdn, body=reply)
+        if not delivered:
+            logger.error("APTANA delivery failed | user=%s", _mask(msisdn))
+
+        try:
+            await log_to_backend(user_id, text, reply, channel="whatsapp")
+        except Exception:
+            logger.exception("Backend log failed | user=%s", _mask(msisdn))
+    finally:
+        _cancel_ack(ack_task)
 
 
 async def _process_inbound_media(msisdn: str, media, message_id: str | None = None) -> None:
