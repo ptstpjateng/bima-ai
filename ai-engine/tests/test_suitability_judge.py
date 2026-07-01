@@ -123,7 +123,11 @@ class TestCanonicalClass(unittest.TestCase):
             _requirement_implies_class("Surat Domisili Usaha dari Kelurahan"),
             "Surat_Domisili",
         )
-        self.assertIsNone(_requirement_implies_class("Surat permohonan bermaterai"))
+        # "Surat permohonan" now maps to a real PPKP doc class.
+        self.assertEqual(
+            _requirement_implies_class("Surat permohonan bermaterai"), "Surat_Permohonan"
+        )
+        self.assertIsNone(_requirement_implies_class("Pas foto warna 3x4"))
 
 
 # ===========================================================================
@@ -164,11 +168,11 @@ class TestCompleteness(unittest.TestCase):
         # zero and the note must explain "manual review".
         c = _completeness(
             [_doc("1", "KTP")],
-            required=["Surat permohonan bermaterai", "Foto warna"],
+            required=["Pas foto warna 3x4", "Bukti bayar retribusi"],
             registry_note=None,
         )
         self.assertEqual(c.score, 0.0)
-        self.assertEqual(c.required, ["Surat permohonan bermaterai", "Foto warna"])
+        self.assertEqual(c.required, ["Pas foto warna 3x4", "Bukti bayar retribusi"])
         self.assertIsNotNone(c.note)
 
 
@@ -308,6 +312,37 @@ class TestScoreHelpers(unittest.TestCase):
 
     def test_type_avg_empty(self):
         self.assertEqual(_type_avg_score([]), 0.0)
+
+    def test_meterai_missing_on_sign_doc_emits_high_issue(self):
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="pakta.pdf", file_id="1", claimed_type="Pakta_Integritas",
+                detected_type="Pakta_Integritas", confidence=0.9, matches=True,
+                has_meterai=False,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        meterai = [i for i in issues if i.id.startswith("meterai:missing")]
+        self.assertEqual(len(meterai), 1)
+        self.assertEqual(meterai[0].severity, sj.SEVERITY_HIGH)
+
+    def test_meterai_only_flagged_for_sign_docs(self):
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="pakta.pdf", file_id="1", claimed_type="Pakta_Integritas",
+                detected_type="Pakta_Integritas", confidence=0.9, matches=True,
+                has_meterai=True,   # present → no issue
+            ),
+            sj.TypeCorrectnessFinding(
+                file="ktp.jpg", file_id="2", claimed_type="KTP",
+                detected_type="KTP", confidence=0.9, matches=True,
+                has_meterai=False,  # KTP needs no meterai → no issue
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        self.assertEqual([i for i in issues if i.id.startswith("meterai:missing")], [])
 
     def test_suitability_avg(self):
         findings = [

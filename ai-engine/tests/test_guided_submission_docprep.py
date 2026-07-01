@@ -71,6 +71,10 @@ def _run(coro):
 
 class TestDocPrepFlow(unittest.TestCase):
     def setUp(self):
+        # Re-assert the flag each test — another test file toggles it off, and the
+        # leak would otherwise make is_enabled() False here (the module-level set
+        # runs only once at import).
+        os.environ["BIMA_GUIDED_SUBMISSION_ENABLED"] = "true"
         self.sent: list = []
 
         async def fake_send(user_id, link, filename, *, caption=""):

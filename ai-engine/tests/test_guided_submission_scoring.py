@@ -206,7 +206,10 @@ class TestFieldExtraction(unittest.TestCase):
         # No KTP read (vision off) → name/NIK remain missing → required gap.
         self.assertEqual(sess.missing_required_fields(), ["applicant_name", "nik"])
 
-    def test_business_name_from_nib_filename_hint(self):
+    def test_business_name_not_taken_from_filename(self):
+        # A filename is NOT a business name — deriving "Nama usaha" from it showed
+        # the citizen a raw filename. business_name stays unset (falls back to the
+        # person's name at render); a real value comes from typed data / Vision.
         sess = _make_session(with_fields=False)
         sess.documents = [
             gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"\xff\xd8\xff"),
@@ -217,7 +220,7 @@ class TestFieldExtraction(unittest.TestCase):
                    new=AsyncMock(return_value=_KTP)), \
              patch("services.gemini_vision.is_configured", return_value=True):
             _run(gs._extract_fields_from_documents(sess))
-        self.assertEqual(sess.fields.get("business_name"), "nib cv maju jaya")
+        self.assertIsNone(sess.fields.get("business_name"))
 
     def test_vision_failure_leaves_field_missing_not_raises(self):
         sess = _make_session(with_fields=False)
