@@ -90,7 +90,10 @@ def _suitability_result(percent=96, critical=False):
 
 
 def _doc(file_id="doc-1", claimed="ktp"):
-    return gs.SessionDocument(file_id, claimed, f"{claimed}.jpg", "image/jpeg", b"\xff\xd8\xff")
+    # Unique bytes per file_id — real documents differ; identical bytes are
+    # collapsed by the content-dedup in _attach_documents.
+    return gs.SessionDocument(file_id, claimed, f"{claimed}.jpg", "image/jpeg",
+                              b"\xff\xd8\xff" + file_id.encode())
 
 
 # A KTP Vision extraction result (mocked) — name + NIK come from HERE, not Q&A.
