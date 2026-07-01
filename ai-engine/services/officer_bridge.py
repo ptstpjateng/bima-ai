@@ -253,6 +253,12 @@ class OfficerCaseSession:
     validation: Optional[dict[str, Any]] = None
     # In-session document bytes keyed by file_id, for `get_doc_summary`.
     documents: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Compact per-document read digest (Task F) — {filename, detected_type,
+    # has_meterai, confidence, matches, claimed_type} snapshotted from the rich
+    # SuitabilityResult so "what BIMA read per doc" survives a restart even
+    # though the raw result is stripped before Redis. Threaded into the copilot
+    # via the validation dict; PII masked at build time.
+    documents_digest: list[dict[str, Any]] = field(default_factory=list)
     # Rolling copilot history (list of {role, text}) so the conversation has
     # memory across the officer's messages.
     history: list[dict[str, str]] = field(default_factory=list)
@@ -298,6 +304,7 @@ def _encode_officer_session(sess: OfficerCaseSession) -> str:
         "license_name": sess.license_name,
         "validation": sess.validation,
         "documents": docs,
+        "documents_digest": sess.documents_digest,
         "history": sess.history,
         "created_at": sess.created_at,
         "updated_at": sess.updated_at,
@@ -326,6 +333,7 @@ def _decode_officer_session(blob: str) -> OfficerCaseSession:
         license_name=raw.get("license_name"),
         validation=raw.get("validation"),
         documents=docs,
+        documents_digest=list(raw.get("documents_digest") or []),
         history=list(raw.get("history") or []),
         created_at=float(raw.get("created_at", time.time())),
         updated_at=float(raw.get("updated_at", time.time())),
@@ -447,6 +455,48 @@ def _score_to_validation(score: Optional[dict[str, Any]]) -> Optional[dict[str, 
     }
 
 
+def _documents_digest(score: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Derive a COMPACT per-document read digest from the rich SuitabilityResult
+    carried under score["result"] (Task F).
+
+    The full SuitabilityResult (per-doc type_correctness + suitability findings)
+    is stripped before Redis — guided_submission._score_for_redis drops
+    "result", and this bridge otherwise persists only the flattened validation.
+    So a restart loses the granular "what BIMA read per doc" view. We snapshot
+    just the fields the officer needs — {filename, detected_type, has_meterai,
+    confidence, matches, claimed_type} — from `result.type_correctness`, so it
+    survives the Redis round-trip while staying tiny (no Vision evidence text,
+    no bytes).
+
+    PII: filenames/type labels are validator enums or citizen-supplied names;
+    we mask them defensively via services.pii.mask_pii (matching the rule that
+    NIK/phone must never reach the officer in the clear). Returns [] when the
+    rich result is absent (flattened-only score, or no score at all).
+    """
+    if not score or not isinstance(score, dict):
+        return []
+    result = score.get("result")
+    findings = getattr(result, "type_correctness", None)
+    if not findings:
+        return []
+    digest: list[dict[str, Any]] = []
+    for f in findings:
+        confidence = getattr(f, "confidence", None)
+        digest.append({
+            "filename": mask_pii(str(getattr(f, "file", "") or "")),
+            "detected_type": mask_pii(str(getattr(f, "detected_type", "") or "")),
+            "claimed_type": mask_pii(str(getattr(f, "claimed_type", "") or "")),
+            "has_meterai": getattr(f, "has_meterai", None),
+            "confidence": (
+                round(float(confidence), 2)
+                if isinstance(confidence, (int, float))
+                else None
+            ),
+            "matches": getattr(f, "matches", None),
+        })
+    return digest
+
+
 def _documents_for_copilot(documents: list) -> dict[str, dict[str, Any]]:
     """Convert a list of guided_submission.SessionDocument (or anything with
     file_id/filename/mime_type/content/claimed_type attrs) into the dict the
@@ -546,6 +596,14 @@ async def notify_officer_of_submission(
 
     validation = _score_to_validation(score)
     docs_map = _documents_for_copilot(documents or [])
+    # Compact per-doc read digest (Task F) — snapshotted from the rich
+    # SuitabilityResult now, before `score["result"]` is dropped for Redis, so
+    # "what BIMA read per doc" survives a restart. Threaded onto the validation
+    # dict so the copilot's get_validation_summary / get_case_full surface it
+    # (via _validation_context) without a second injection channel.
+    docs_digest = _documents_digest(score)
+    if validation is not None and docs_digest:
+        validation["documents_digest"] = docs_digest
     brief = _render_brief(
         ticket=ticket,
         license_name=license_name,
@@ -605,6 +663,7 @@ async def notify_officer_of_submission(
                 license_name=license_name,
                 validation=validation,
                 documents=dict(docs_map),  # per-officer copy
+                documents_digest=list(docs_digest),
             )
             await _put_session(sess)
             sent = await _send(CHANNEL_WHATSAPP, wa_num, brief)
@@ -643,6 +702,7 @@ async def notify_officer_of_submission(
         license_name=license_name,
         validation=validation,
         documents=docs_map,
+        documents_digest=list(docs_digest),
     )
     await _put_session(sess)
 
@@ -803,11 +863,23 @@ async def maybe_handle_officer_reply(
     tool_calls = result.get("tool_calls") or []
     closed = _case_was_closed(tool_calls)
 
+    # Task G — the officer asked for the real document file(s). The copilot's
+    # `send_document` tool resolved them to file_ids and surfaced them here; we
+    # deliver the actual bytes out-of-band on the officer's own channel. Runs
+    # before the closed/persist branch so a doc requested in the same turn as a
+    # confirm still goes out. Never raises out.
+    docs_to_send = result.get("documents_to_send") or []
+    if docs_to_send:
+        await _deliver_documents(
+            channel=channel, channel_id=channel_id, sess=sess,
+            file_ids=docs_to_send,
+        )
+
     logger.info(
         "officer copilot bridge turn | officer=%s | ticket=%s | "
-        "tool_calls=%d | reply_len=%d | closed=%s",
+        "tool_calls=%d | reply_len=%d | closed=%s | docs_sent=%d",
         _mask(channel_id), sess.ticket,
-        len(tool_calls), len(reply), closed,
+        len(tool_calls), len(reply), closed, len(docs_to_send),
     )
 
     if closed:
@@ -826,6 +898,91 @@ async def maybe_handle_officer_reply(
     sess.touch()
     await _put_session(sess)
     return reply
+
+
+# ===========================================================================
+# Document delivery (Task G) — send the citizen's real file to the officer.
+# ===========================================================================
+
+
+def _public_base_url() -> str:
+    """Public base for the `/dl/{token}` short-lived download links (mirrors
+    guided_submission._public_base_url)."""
+    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://nolongin.com").rstrip("/")
+
+
+async def _deliver_documents(
+    *,
+    channel: str,
+    channel_id: str,
+    sess: OfficerCaseSession,
+    file_ids: list,
+) -> None:
+    """Deliver one or more requested in-session documents to the AUTHORIZED
+    officer on their channel. Never raises.
+
+    SECURITY: the document is the citizen's PII, but it is going to the
+    authorized reviewing officer, who MUST be able to open it — so it is NOT
+    encrypted (unlike the citizen PPKP path). The security is the delivery
+    envelope: `generated_docs.store` hosts the bytes at an unguessable
+    `/dl/{token}` URL with a short TTL that burns after a few fetches. WhatsApp
+    gets a native document message (APTANA fetches the link); Telegram (which
+    has no doc-send helper wired here) gets the link as text. Bytes/PII are
+    never logged — only the masked channel + filename length.
+    """
+    from services import generated_docs
+
+    base = _public_base_url()
+    for fid in file_ids:
+        doc = (sess.documents or {}).get(fid)
+        if not doc:
+            logger.info(
+                "officer doc-send: requested file_id not held | officer=%s | "
+                "ticket=%s",
+                _mask(channel_id), sess.ticket,
+            )
+            continue
+        content = doc.get("content")
+        if not content:
+            continue
+        filename = doc.get("filename") or f"{fid}.pdf"
+        try:
+            token = generated_docs.store(content, filename)
+            url = f"{base}/dl/{token}"
+        except Exception:
+            logger.exception(
+                "officer doc-send: hosting failed | officer=%s | ticket=%s",
+                _mask(channel_id), sess.ticket,
+            )
+            continue
+
+        sent = False
+        try:
+            if channel == CHANNEL_WHATSAPP:
+                from services.whatsapp_sender import send_document as wa_doc
+                sent = await wa_doc(
+                    recipient_phone=channel_id, link=url, filename=filename
+                )
+            else:
+                # Telegram has no document-send helper wired in the bridge —
+                # deliver the link as a text message via the same path replies
+                # use, so the officer can still open the file.
+                sent = await _send(
+                    channel, channel_id,
+                    f"Dokumen: {filename}\n{url}",
+                )
+        except Exception:
+            logger.exception(
+                "officer doc-send failed | channel=%s | officer=%s | ticket=%s",
+                channel, _mask(channel_id), sess.ticket,
+            )
+            continue
+
+        logger.info(
+            "officer doc-send | channel=%s | officer=%s | ticket=%s | "
+            "filename_len=%d | sent=%s",
+            channel, _mask(channel_id), sess.ticket, len(filename), sent,
+        )
 
 
 # ===========================================================================
