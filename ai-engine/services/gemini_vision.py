@@ -274,3 +274,103 @@ async def extract_ktp_fields(
         "nik": nik,
         "gender": gender,
     }
+
+
+# ---------------------------------------------------------------------------
+# Business (NIB / SIUP) field extraction — so "nama usaha" comes from the
+# izin-berusaha document, not a filename or a blind fallback.
+#
+# For a Usaha Perorangan (sole proprietorship) the business name legitimately
+# IS the owner's own name; for a Badan (PT/CV/Koperasi/Firma) it is the entity
+# name. `jenis_usaha` distinguishes the two so the caller can label it. Same
+# defensive contract as extract_ktp_fields — None on any failure, never raises,
+# no bytes logged.
+# ---------------------------------------------------------------------------
+
+_NIB_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "is_nib": {
+            "type": "boolean",
+            "description": (
+                "True only if this is an Indonesian business-licensing document "
+                "(NIB / izin berusaha OSS-RBA, or SIUP)."
+            ),
+        },
+        "nama_usaha": {
+            "type": "string",
+            "description": (
+                "The registered business/company name exactly as printed. For a "
+                "Usaha Perorangan this is usually the owner's own name — return "
+                "it as written. Empty if not legible."
+            ),
+        },
+        "nib": {
+            "type": "string",
+            "description": "The NIB number (Nomor Induk Berusaha), digits only. Empty if absent.",
+        },
+        "jenis_usaha": {
+            "type": "string",
+            "description": (
+                "Business form: 'Perorangan' for a sole proprietorship, or "
+                "'Badan' for PT/CV/Koperasi/Firma. Empty if unclear."
+            ),
+        },
+    },
+    "required": ["is_nib"],
+}
+
+_NIB_PROMPT = (
+    "This is (or claims to be) an Indonesian business-licensing document — a "
+    "NIB (Nomor Induk Berusaha / izin berusaha OSS-RBA) or SIUP. Read it and "
+    "extract: is_nib (true only if it really is one), nama_usaha (the registered "
+    "business name exactly as printed — for a Usaha Perorangan this is usually "
+    "the owner's own name), nib (the NIB number, digits only), and jenis_usaha "
+    "('Perorangan' for a sole proprietorship, or 'Badan' for PT/CV/Koperasi/"
+    "Firma). If a field is not legible, return an empty string. Do not guess or "
+    "invent."
+)
+
+
+async def extract_business_fields(
+    *,
+    image_bytes: bytes,
+    mime_type: str,
+) -> Optional[dict[str, Any]]:
+    """Extract {is_nib, nama_usaha, nib, jenis_usaha} from a NIB/SIUP image/PDF.
+
+    Returns a normalised dict or None when Vision is unconfigured / the call
+    fails / output is unusable. For a Usaha Perorangan, `nama_usaha` is
+    legitimately the owner's name. NEVER raises; bytes never logged.
+    """
+    if not is_configured():
+        logger.info("extract_business_fields: Gemini Vision not configured")
+        return None
+
+    parsed = await extract_structured(
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        prompt=_NIB_PROMPT,
+        response_schema=_NIB_SCHEMA,
+    )
+    if parsed is None:
+        return None
+
+    import re as _re
+
+    nama_usaha = str(parsed.get("nama_usaha", "") or "").strip() or None
+    nib_digits = _re.sub(r"\D", "", str(parsed.get("nib", "") or ""))
+    nib = nib_digits or None
+    jenis_raw = str(parsed.get("jenis_usaha", "") or "").strip().lower()
+    jenis = None
+    if "perorangan" in jenis_raw or "orang" in jenis_raw:
+        jenis = "Perorangan"
+    elif jenis_raw:  # PT / CV / Koperasi / Firma / Badan
+        jenis = "Badan"
+
+    return {
+        "is_nib": bool(parsed.get("is_nib", False)),
+        "nama_usaha": nama_usaha,
+        "nib": nib,
+        "jenis_usaha": jenis,
+    }

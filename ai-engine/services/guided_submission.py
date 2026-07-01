@@ -951,11 +951,40 @@ async def _extract_fields_from_documents(sess: SubmissionSession) -> None:
                 if not need_name and not need_nik:
                     break
 
-    # Business name is NOT derived from filenames — a filename like
-    # "SIUP_CASMO_NEW_2026_Copy(1).pdf" is not a business name, and rendering it
-    # as "Nama usaha" looks broken. It comes from the citizen's typed data
-    # (doc-prep) or a NIB/SIUP Vision extraction (Push 2); otherwise it falls
-    # back to the person's name at render time.
+    # Business name — read from the NIB/SIUP (izin berusaha) via Vision, NOT a
+    # filename. For a Usaha Perorangan the nama usaha is legitimately the owner's
+    # own name; for a Badan (PT/CV) it is the entity name — jenis_usaha labels
+    # which. The filename hint only picks the CANDIDATE; Vision's `is_nib` is the
+    # real gate. If no NIB is present or Vision fails, business_name stays unset
+    # and falls back to the person's name at render (correct for a perorangan).
+    if not sess.fields.get("business_name"):
+        nib_doc = next(
+            (
+                d for d in sess.documents
+                if any(
+                    k in f"{d.claimed_type} {d.filename}".lower()
+                    for k in ("siup", "nib", "izin berusaha", "oss")
+                )
+            ),
+            None,
+        )
+        if nib_doc is not None:
+            try:
+                from services.gemini_vision import extract_business_fields
+                biz = await extract_business_fields(
+                    image_bytes=nib_doc.content, mime_type=nib_doc.mime_type
+                )
+            except Exception:
+                logger.exception(
+                    "Business-doc extraction crashed | user=%s | file_id=%s",
+                    _mask(sess.user_id), nib_doc.file_id,
+                )
+                biz = None
+            if biz and biz.get("is_nib"):
+                if biz.get("nama_usaha"):
+                    sess.fields["business_name"] = biz["nama_usaha"]
+                if biz.get("jenis_usaha"):
+                    sess.fields["jenis_usaha"] = biz["jenis_usaha"]
 
     logger.info(
         "Guided-submission fields extracted | user=%s | name=%s | nik=%s | "
@@ -997,11 +1026,19 @@ def _data_readback_lines(sess: SubmissionSession) -> list[str]:
     nik = sess.fields.get("nik")
     nik_shown = mask_pii(nik) if nik else "-"
     usaha = sess.fields.get("business_name") or sess.fields.get("applicant_name") or "-"
+    # Label the business form so "Nama usaha: CASMO" reads as a legitimate Usaha
+    # Perorangan (owner name = business name), not a bug.
+    jenis = sess.fields.get("jenis_usaha")
+    usaha_line = f"- Nama usaha: {usaha}"
+    if jenis == "Perorangan":
+        usaha_line += " (Usaha Perorangan)"
+    elif jenis == "Badan":
+        usaha_line += " (Badan Usaha)"
     return [
         "Data pemohon yang kami baca:",
         f"- Nama: {name}",
         f"- NIK: {nik_shown}",
-        f"- Nama usaha: {usaha}",
+        usaha_line,
     ]
 
 
