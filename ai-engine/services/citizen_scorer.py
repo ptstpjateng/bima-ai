@@ -161,7 +161,10 @@ def _type_lines(result: SuitabilityResult) -> list[str]:
             elif f.has_meterai is False:
                 meterai = " — *meterai belum terlihat*"
 
-        if f.matches or f.detected_type == "Other":
+        # Clean line when it matches, is unclassified, OR was uploaded unlabeled
+        # (claimed "Other") — BIMA detected it, so there's no label conflict to
+        # show. Only surface "dilabeli X" on a genuine label conflict.
+        if f.matches or f.detected_type == "Other" or f.claimed_type == "Other":
             lines.append(f"- *{label}*{meterai}")
         else:
             lines.append(
