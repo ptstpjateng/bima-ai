@@ -334,16 +334,18 @@ async def _process_inbound_media(msisdn: str, media, message_id: str | None = No
         )
         return
 
-    # No active submission → the upload has no home. Nudge to start the flow.
+    # No active submission → the upload has no home. Nudge to start the flow,
+    # but only ONCE per burst (a multi-file drop must not fire N identical nudges).
     if not await guided_submission.has_active_session(user_id):
-        await send_text(
-            recipient_phone=msisdn,
-            body=(
-                "Saya menerima dokumen Anda, tetapi belum ada pengajuan izin "
-                "yang sedang berjalan. Mulai dulu dengan, mis. _\"saya mau "
-                "ajukan izin ...\"_, lalu kirim dokumennya."
-            ),
-        )
+        if _should_nudge_no_session(msisdn):
+            await send_text(
+                recipient_phone=msisdn,
+                body=(
+                    "Saya menerima dokumen Anda, tetapi belum ada pengajuan izin "
+                    "yang sedang berjalan. Mulai dulu dengan, mis. _\"saya mau "
+                    "ajukan izin ...\"_, lalu kirim dokumennya."
+                ),
+            )
         return
 
     # Acknowledge receipt fast (download + Vision scoring can take several
@@ -440,6 +442,24 @@ def _mark_greeted(msisdn: str) -> None:
 def _was_recently_greeted(msisdn: str, window: float = _GREETING_DEDUP_WINDOW_SECONDS) -> bool:
     ts = _recently_greeted.get(msisdn)
     return ts is not None and (_time.time() - ts) < window
+
+
+_NO_SESSION_NUDGE_WINDOW_SECONDS = 90.0     # dedup the "no active submission" nudge across an upload burst
+_recently_nudged_no_session: dict[str, float] = {}
+
+
+def _should_nudge_no_session(msisdn: str) -> bool:
+    """True at most once per window — so a burst of uploads with no active
+    submission yields ONE nudge, not one per file."""
+    now = _time.time()
+    ts = _recently_nudged_no_session.get(msisdn)
+    if ts is not None and (now - ts) < _NO_SESSION_NUDGE_WINDOW_SECONDS:
+        return False
+    _recently_nudged_no_session[msisdn] = now
+    cutoff = now - _NO_SESSION_NUDGE_WINDOW_SECONDS * 4
+    for k in [k for k, v in list(_recently_nudged_no_session.items()) if v < cutoff]:
+        _recently_nudged_no_session.pop(k, None)
+    return True
 
 
 # A bare greeting ("halo", "hi", "assalamualaikum", "selamat pagi") needs no

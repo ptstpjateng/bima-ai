@@ -122,6 +122,36 @@ class TestDocPrepFlow(unittest.TestCase):
         self.assertEqual(len(self.sent), 0)
         self.assertEqual(sess.stage, Stage.PREPARING_DOCS)
 
+    def test_preparing_docs_counts_as_active_session(self):
+        # Regression: uploads mid-doc-prep must NOT read as "no active session".
+        sess = SubmissionSession(user_id="wa-628444", license_id=459,
+                                 license_name="PPKP", stage=Stage.PREPARING_DOCS)
+        gs._sessions[sess.user_id] = sess
+        self.assertTrue(_run(gs.has_active_session(sess.user_id)))
+
+    def test_upload_during_preparing_docs_switches_to_collecting(self):
+        # A citizen who uploads their OWN documents mid doc-prep skips generation
+        # and drops into the normal collect+score flow (silent attach, no per-file
+        # ack, no "no active session" nudge).
+        sess = SubmissionSession(user_id="wa-628333", license_id=459,
+                                 license_name="PPKP", stage=Stage.PREPARING_DOCS)
+        gs._sessions[sess.user_id] = sess
+
+        async def _noop_arm(uid):
+            return None
+
+        orig_arm = gs._arm_debounce
+        gs._arm_debounce = _noop_arm
+        try:
+            doc = gs.SessionDocument("f1", "ktp", "ktp.jpg", "image/jpeg", b"\xff\xd8\xff")
+            reply = _run(gs.handle_inbound_documents(sess.user_id, [doc]))
+        finally:
+            gs._arm_debounce = orig_arm
+
+        self.assertIsNone(reply)                             # silent attach, no per-file ack
+        self.assertEqual(sess.stage, Stage.COLLECTING_DOCS)  # switched out of doc-prep
+        self.assertEqual(len(sess.documents), 1)             # the upload attached
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
