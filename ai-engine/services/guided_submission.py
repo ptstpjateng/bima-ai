@@ -2008,8 +2008,18 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
     # If a new-intent was previously stashed and the citizen now confirms the
     # switch, re-resolve from the stashed text (a fresh session).
     if sess.pending_new_intent is not None:
-        switch_intent = await submission_intent.classify_confirm_intent(msg)
         pending = sess.pending_new_intent
+        low = (msg or "").strip().lower()
+        # BIMA explicitly told the citizen to reply "ganti" / "lanjutkan" (and
+        # earlier "ya, ganti"), so honour those literal words FIRST — the generic
+        # AFFIRM/DECLINE classifier doesn't map "ganti"/"lanjutkan" and looped the
+        # disambiguation forever ("ya, ganti" -> re-ask -> "ganti" -> re-ask ...).
+        if re.search(r"\bganti\b", low):
+            switch_intent = submission_intent.AFFIRM
+        elif re.search(r"\blanjut", low) or re.search(r"\btetap\b", low):
+            switch_intent = submission_intent.DECLINE
+        else:
+            switch_intent = await submission_intent.classify_confirm_intent(msg)
         if switch_intent == submission_intent.AFFIRM:
             logger.info(
                 "Guided-submission switching to stashed new intent | user=%s",
