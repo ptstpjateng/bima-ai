@@ -117,6 +117,19 @@ class TestCanonicalClass(unittest.TestCase):
         self.assertEqual(_canonical_class("Sertifikat Halal"), "Other")
         self.assertEqual(_canonical_class(""), "Other")
 
+    def test_new_common_classes_resolve(self):
+        # Modest enum expansion — the common Indonesian civil/legal docs.
+        cases = {
+            "Kartu Keluarga": "Kartu_Keluarga",
+            "kartu keluarga": "Kartu_Keluarga",
+            "Surat Pernyataan": "Surat_Pernyataan",
+            "Surat Kuasa Pengurusan": "Surat_Kuasa",
+            "Sertifikat Tanah": "Sertifikat_Tanah",
+            "Sertifikat Hak Milik": "Sertifikat_Tanah",
+        }
+        for label, expected in cases.items():
+            self.assertEqual(_canonical_class(label), expected, label)
+
     def test_requirement_implies_class(self):
         self.assertEqual(_requirement_implies_class("Fotokopi KTP"), "KTP")
         self.assertEqual(
@@ -126,6 +139,16 @@ class TestCanonicalClass(unittest.TestCase):
         # "Surat permohonan" now maps to a real PPKP doc class.
         self.assertEqual(
             _requirement_implies_class("Surat permohonan bermaterai"), "Surat_Permohonan"
+        )
+        # New common classes resolve from requirement free-text too.
+        self.assertEqual(
+            _requirement_implies_class("Fotokopi Kartu Keluarga"), "Kartu_Keluarga"
+        )
+        self.assertEqual(
+            _requirement_implies_class("Surat Kuasa bermaterai"), "Surat_Kuasa"
+        )
+        self.assertEqual(
+            _requirement_implies_class("Salinan Sertifikat Tanah"), "Sertifikat_Tanah"
         )
         self.assertIsNone(_requirement_implies_class("Pas foto warna 3x4"))
 
@@ -398,6 +421,152 @@ class TestScoreHelpers(unittest.TestCase):
 
     def test_suitability_avg_empty(self):
         self.assertEqual(_suitability_avg_score([]), 0.0)
+
+
+# ===========================================================================
+# Legal-validity signals — capture (document_name / has_signature / has_stamp)
+# and the stamp/signature verification issues in _build_issues.
+# ===========================================================================
+
+class TestValiditySignals(unittest.TestCase):
+
+    def test_detect_captures_new_signals(self):
+        # Given a parsed Vision dict carrying the new fields, the finding must
+        # carry them through (bool-guarded; document_name trimmed).
+        with patch("services.agents.suitability_judge.vision_configured",
+                   return_value=True), \
+             patch("services.agents.suitability_judge.extract_structured",
+                   new=AsyncMock(return_value={
+                       "detected_type": "Other",
+                       "document_name": "  Nota Kesepahaman  ",
+                       "confidence": 0.6,
+                       "has_meterai": True,
+                       "has_signature": False,
+                       "has_stamp": True,
+                   })):
+            finding = _run(detect_doc_type(_doc("f1", "Other")))
+        self.assertEqual(finding.detected_type, "Other")
+        self.assertEqual(finding.document_name, "Nota Kesepahaman")  # trimmed
+        self.assertIs(finding.has_meterai, True)
+        self.assertIs(finding.has_signature, False)
+        self.assertIs(finding.has_stamp, True)
+
+    def test_detect_non_bool_signals_become_none(self):
+        # Garbage / missing values must degrade to None (not flagged later).
+        with patch("services.agents.suitability_judge.vision_configured",
+                   return_value=True), \
+             patch("services.agents.suitability_judge.extract_structured",
+                   new=AsyncMock(return_value={
+                       "detected_type": "KTP",
+                       "confidence": 0.9,
+                       "has_signature": "yes",   # not a bool
+                       "document_name": 123,       # not a str
+                   })):
+            finding = _run(detect_doc_type(_doc("f1", "KTP")))
+        self.assertIsNone(finding.has_signature)
+        self.assertIsNone(finding.has_stamp)
+        self.assertIsNone(finding.has_meterai)
+        self.assertIsNone(finding.document_name)
+
+    def test_stamp_missing_on_surat_pesanan_emits_high_issue(self):
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="pesanan.pdf", file_id="1", claimed_type="Surat_Pesanan",
+                detected_type="Surat_Pesanan", confidence=0.9, matches=True,
+                has_stamp=False,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        stamp = [i for i in issues if i.id.startswith("stamp:missing")]
+        self.assertEqual(len(stamp), 1)
+        self.assertEqual(stamp[0].id, "stamp:missing:1")
+        self.assertEqual(stamp[0].severity, sj.SEVERITY_HIGH)
+        self.assertIn("Cap/stempel belum terlihat", stamp[0].title)
+
+    def test_stamp_present_on_surat_pesanan_no_issue(self):
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="pesanan.pdf", file_id="1", claimed_type="Surat_Pesanan",
+                detected_type="Surat_Pesanan", confidence=0.9, matches=True,
+                has_stamp=True,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        self.assertEqual([i for i in issues if i.id.startswith("stamp:missing")], [])
+
+    def test_stamp_none_not_flagged(self):
+        # A Surat Pesanan we couldn't read (has_stamp=None) is never flagged.
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="pesanan.pdf", file_id="1", claimed_type="Surat_Pesanan",
+                detected_type="Surat_Pesanan", confidence=0.9, matches=True,
+                has_stamp=None,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        self.assertEqual([i for i in issues if i.id.startswith("stamp:missing")], [])
+
+    def test_stamp_not_flagged_for_non_stamp_class(self):
+        # A KTP with has_stamp False must not raise a stamp issue.
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="ktp.jpg", file_id="1", claimed_type="KTP",
+                detected_type="KTP", confidence=0.9, matches=True,
+                has_stamp=False,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        self.assertEqual([i for i in issues if i.id.startswith("stamp:missing")], [])
+
+    def test_signature_missing_on_pakta_emits_issue(self):
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="pakta.pdf", file_id="1", claimed_type="Pakta_Integritas",
+                detected_type="Pakta_Integritas", confidence=0.9, matches=True,
+                has_signature=False,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        sig = [i for i in issues if i.id.startswith("signature:missing")]
+        self.assertEqual(len(sig), 1)
+        self.assertEqual(sig[0].id, "signature:missing:1")
+        self.assertEqual(sig[0].severity, sj.SEVERITY_HIGH)
+        self.assertIn("Tanda tangan belum terlihat", sig[0].title)
+
+    def test_signature_not_flagged_for_ktp(self):
+        # A non-sign doc (KTP) missing a signature must not be flagged.
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="ktp.jpg", file_id="1", claimed_type="KTP",
+                detected_type="KTP", confidence=0.9, matches=True,
+                has_signature=False,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        self.assertEqual([i for i in issues if i.id.startswith("signature:missing")], [])
+
+    def test_surat_pesanan_can_miss_signature_and_stamp(self):
+        # A Surat Pesanan missing BOTH signals raises TWO independent issues
+        # (signature + stamp) but never a meterai issue.
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="pesanan.pdf", file_id="9", claimed_type="Surat_Pesanan",
+                detected_type="Surat_Pesanan", confidence=0.9, matches=True,
+                has_signature=False, has_stamp=False, has_meterai=False,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        ids = {i.id for i in issues}
+        self.assertIn("signature:missing:9", ids)
+        self.assertIn("stamp:missing:9", ids)
+        self.assertNotIn("meterai:missing:9", ids)
 
 
 # ===========================================================================

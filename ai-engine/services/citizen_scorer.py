@@ -99,12 +99,21 @@ _CLASS_LABEL: dict[str, str] = {
     "Persetujuan_Nama_Kapal": "Persetujuan Nama Kapal",
     "Desain_Kapal": "Desain Kapal",
     "Spesifikasi_Alat_Tangkap": "Spesifikasi Alat Tangkap",
+    "Kartu_Keluarga": "Kartu Keluarga",
+    "Surat_Pernyataan": "Surat Pernyataan",
+    "Surat_Kuasa": "Surat Kuasa",
+    "Sertifikat_Tanah": "Sertifikat Tanah",
     "Other": "Dokumen lain",
     "Unknown": "Tidak terbaca",
 }
 
-# Sign-required docs — where a visible meterai matters.
+# Sign-required docs — where a visible signature (and, per class, meterai or
+# stamp) matters. Mirrors suitability_judge's verification classes.
 _SIGN_DOC_CLASSES: set[str] = {"Pakta_Integritas", "Surat_Permohonan", "Surat_Pesanan"}
+
+# Sign-docs validated by a company/agency stamp (cap/stempel) rather than a
+# meterai — a Surat Pesanan to the galangan.
+_STAMP_DOC_CLASSES: set[str] = {"Surat_Pesanan"}
 
 
 def _short(name: str, limit: int = 30) -> str:
@@ -141,11 +150,34 @@ def _completeness_line(result: SuitabilityResult) -> str:
     return f"*Kelengkapan dokumen wajib:* {present}/{total} lengkap"
 
 
+def _sign_signal_suffix(f) -> str:
+    """Compact legal-validity indicator for the sign-required docs — meterai,
+    plus a terse tanda-tangan / cap flag only when a required signal is
+    MISSING (present signals stay quiet to keep the line readable). Returns a
+    " — ..." suffix or "" when there is nothing to say.
+    """
+    if f.detected_type not in _SIGN_DOC_CLASSES:
+        return ""
+    parts: list[str] = []
+    if f.has_meterai is True:
+        parts.append("meterai terlihat")
+    elif f.has_meterai is False:
+        parts.append("*meterai belum terlihat*")
+    # Signal a missing signature/stamp; don't clutter the line when present.
+    if f.has_signature is False:
+        parts.append("*tanda tangan belum terlihat*")
+    if f.has_stamp is False and f.detected_type in _STAMP_DOC_CLASSES:
+        parts.append("*cap belum terlihat*")
+    return f" — {', '.join(parts)}" if parts else ""
+
+
 def _type_lines(result: SuitabilityResult) -> list[str]:
-    """One clean line per document — lead with the detected type, add a meterai
-    indicator for the sign-required docs, and only surface the (shortened)
-    filename when there is something to fix. Mismatches/unreadable are still
-    detailed in the issues list; this block is the "what BIMA read" at-a-glance.
+    """One clean line per document — lead with the detected type (or, for an
+    unenumerated doc BIMA could still read, its free-text `document_name`), add
+    a compact legal-validity indicator for the sign-required docs, and only
+    surface the (shortened) filename when there is something to fix.
+    Mismatches/unreadable are still detailed in the issues list; this block is
+    the "what BIMA read" at-a-glance.
     """
     lines: list[str] = []
     for f in result.type_correctness:
@@ -153,22 +185,25 @@ def _type_lines(result: SuitabilityResult) -> list[str]:
             lines.append(f"- _{_short(f.file)}_: tidak terbaca — unggah ulang yang jelas")
             continue
 
-        label = _label(f.detected_type)
-        meterai = ""
-        if f.detected_type in _SIGN_DOC_CLASSES:
-            if f.has_meterai is True:
-                meterai = " — meterai terlihat"
-            elif f.has_meterai is False:
-                meterai = " — *meterai belum terlihat*"
+        # Name ANY document: when BIMA didn't map it to a known class ("Other")
+        # but Vision read a real title, show that free-text title (PII-masked,
+        # shortened) instead of the flat "Dokumen lain". A real enum class keeps
+        # leading with its human label.
+        if f.detected_type == "Other" and f.document_name:
+            label = _short(mask_pii(f.document_name))
+        else:
+            label = _label(f.detected_type)
+
+        signals = _sign_signal_suffix(f)
 
         # Clean line when it matches, is unclassified, OR was uploaded unlabeled
         # (claimed "Other") — BIMA detected it, so there's no label conflict to
         # show. Only surface "dilabeli X" on a genuine label conflict.
         if f.matches or f.detected_type == "Other" or f.claimed_type == "Other":
-            lines.append(f"- *{label}*{meterai}")
+            lines.append(f"- *{label}*{signals}")
         else:
             lines.append(
-                f"- *{label}*{meterai} — _{_short(f.file)}_ dilabeli "
+                f"- *{label}*{signals} — _{_short(f.file)}_ dilabeli "
                 f"{_label(f.claimed_type)}"
             )
     return lines
