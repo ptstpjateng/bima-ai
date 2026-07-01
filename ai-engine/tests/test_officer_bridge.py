@@ -63,6 +63,7 @@ from services.agents.suitability_judge import (  # noqa: E402
     CompletenessSection,
     Issue,
     SuitabilityResult,
+    TypeCorrectnessFinding,
 )
 
 
@@ -79,14 +80,28 @@ class _Doc:
         self.content = content
 
 
-def _score_dict(percent=72, with_result=True):
+def _score_dict(percent=72, with_result=True, with_type_findings=False):
     issues = [
         Issue(id="completeness:missing:NPWP", severity="critical", title="Dokumen wajib belum diunggah: NPWP", detail="d"),
         Issue(id="type:mismatch:doc-1", severity="high", title="Label dokumen tidak cocok: ktp.jpg", detail="d"),
     ]
+    type_correctness = []
+    if with_type_findings:
+        type_correctness = [
+            TypeCorrectnessFinding(
+                file="ktp.jpg", file_id="doc-1", claimed_type="KTP",
+                detected_type="KTP", confidence=0.96, matches=True,
+                has_meterai=None,
+            ),
+            TypeCorrectnessFinding(
+                file="surat_pesanan.pdf", file_id="doc-2",
+                claimed_type="Surat_Pesanan", detected_type="Surat_Pesanan",
+                confidence=0.88, matches=True, has_meterai=True,
+            ),
+        ]
     result = SuitabilityResult(
         completeness=CompletenessSection(score=0.66, missing=["NPWP"], required=["KTP", "NIB", "NPWP"]),
-        type_correctness=[],
+        type_correctness=type_correctness,
         suitability=[],
         compatibility_findings=[],
         overall_suitability_score=percent / 100.0,
@@ -508,6 +523,160 @@ class TestCaseClosedDetector(unittest.TestCase):
             "name": "get_doc_summary", "args": {"confirmed": True},
             "result_preview": '{"executed": true, "ok": true}',
         }]))
+
+
+class TestDocumentsDigest(unittest.TestCase):
+    """Task F — the compact per-doc read digest is derived from the rich
+    SuitabilityResult, threaded onto the validation dict + session, and
+    survives a Redis encode/decode round-trip."""
+
+    def test_digest_derived_from_type_correctness(self):
+        digest = ob._documents_digest(_score_dict(with_type_findings=True))
+        self.assertEqual(len(digest), 2)
+        self.assertEqual(digest[0]["detected_type"], "KTP")
+        self.assertEqual(digest[0]["matches"], True)
+        # meterai visibility is captured per doc.
+        self.assertEqual(digest[1]["has_meterai"], True)
+        self.assertEqual(digest[1]["detected_type"], "Surat_Pesanan")
+        self.assertEqual(digest[1]["confidence"], 0.88)
+
+    def test_digest_empty_without_result(self):
+        self.assertEqual(ob._documents_digest(_score_dict(with_result=False)), [])
+        self.assertEqual(ob._documents_digest(None), [])
+        # rich result but no type_correctness rows → empty.
+        self.assertEqual(ob._documents_digest(_score_dict(with_type_findings=False)), [])
+
+    def test_digest_survives_encode_decode_round_trip(self):
+        sess = ob.OfficerCaseSession(
+            channel_id="628999000111",
+            channel=ob.CHANNEL_WHATSAPP,
+            ticket="000123456",
+            request_id=42,
+            license_name="Izin Penelitian",
+            validation={"score_percent": 72, "status": "minor_issues",
+                        "summary": "s", "issues": []},
+            documents={"doc-1": {"filename": "ktp.jpg",
+                                 "mime_type": "image/jpeg",
+                                 "content": b"bytes", "claimed_type": "KTP"}},
+            documents_digest=ob._documents_digest(_score_dict(with_type_findings=True)),
+        )
+        blob = ob._encode_officer_session(sess)
+        restored = ob._decode_officer_session(blob)
+        self.assertEqual(len(restored.documents_digest), 2)
+        self.assertEqual(restored.documents_digest[0]["detected_type"], "KTP")
+        self.assertEqual(restored.documents_digest[1]["has_meterai"], True)
+        self.assertEqual(restored.documents_digest[1]["detected_type"], "Surat_Pesanan")
+
+    def test_notify_threads_digest_into_validation_and_session(self):
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "628999000111",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        ob._sessions.clear()
+        docs = [_Doc("doc-1", "KTP", "ktp.jpg", "image/jpeg", b"bytes")]
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+                _run(ob.notify_officer_of_submission(
+                    ticket="000123456", request_id=42, license_id=358,
+                    license_name="Izin Penelitian", applicant_name="Budi",
+                    score=_score_dict(percent=72, with_type_findings=True),
+                    documents=docs,
+                ))
+        sess = ob._sessions.get("628999000111")
+        self.assertIsNotNone(sess)
+        # On the session field...
+        self.assertEqual(len(sess.documents_digest), 2)
+        # ...and threaded onto the validation dict the copilot reads.
+        self.assertIn("documents_digest", sess.validation)
+        self.assertEqual(sess.validation["documents_digest"][0]["detected_type"], "KTP")
+
+
+class TestOfficerDocDelivery(unittest.TestCase):
+    """Task G — when the copilot turn surfaces documents_to_send, the bridge
+    hosts the bytes at /dl/{token} and sends the file on the officer's channel."""
+
+    def setUp(self):
+        ob._sessions.clear()
+
+    def _arm_session(self):
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "628999000111",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        docs = [_Doc("doc-1", "KTP", "ktp_budi.jpg", "image/jpeg", b"ktp-bytes")]
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+                _run(ob.notify_officer_of_submission(
+                    ticket="000123456", request_id=42, license_id=358,
+                    license_name="Izin Penelitian", applicant_name="Budi",
+                    score=_score_dict(percent=72), documents=docs,
+                ))
+        return env
+
+    def _drive_reply_with_docs_to_send(self, env, documents_to_send):
+        copilot = type("C", (), {})()
+        copilot.chat = AsyncMock(return_value={
+            "reply": "Baik, saya kirimkan dokumen KTP ke chat ini.",
+            "tool_calls": [{"name": "send_document",
+                            "args": {"doc_ref": "KTP"}, "result_preview": ""}],
+            "documents_to_send": documents_to_send,
+            "history": [{"role": "user", "text": "kirim KTP-nya"},
+                        {"role": "model", "text": "Baik, saya kirimkan dokumen KTP."}],
+        })
+        # Stub generated_docs (imported lazily inside _deliver_documents) and the
+        # WhatsApp document sender.
+        _ensure_stub("services.generated_docs")
+        import services.generated_docs as gd
+        store_mock = lambda content, filename: "TESTTOKEN123"  # noqa: E731
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(oc, "get_copilot", return_value=copilot):
+                with patch.object(gd, "store", side_effect=store_mock, create=True) as store_spy:
+                    with patch("services.whatsapp_sender.send_document",
+                               new=AsyncMock(return_value=True)) as senddoc:
+                        out = _run(ob.maybe_handle_officer_reply(
+                            channel=ob.CHANNEL_WHATSAPP,
+                            channel_id="628999000111",
+                            message="kirim KTP-nya",
+                        ))
+        return out, store_spy, senddoc
+
+    def test_delivers_requested_doc_on_whatsapp(self):
+        env = self._arm_session()
+        out, store_spy, senddoc = self._drive_reply_with_docs_to_send(env, ["doc-1"])
+
+        # The reply is still returned to the officer.
+        self.assertIn("kirimkan", out.lower())
+
+        # generated_docs.store was called with the resolved doc's BYTES + name.
+        store_spy.assert_called_once()
+        s_args, _ = store_spy.call_args
+        self.assertEqual(s_args[0], b"ktp-bytes")
+        self.assertEqual(s_args[1], "ktp_budi.jpg")
+
+        # send_document fired on WhatsApp with the /dl link + filename.
+        senddoc.assert_awaited_once()
+        _, kwargs = senddoc.call_args
+        self.assertEqual(kwargs["recipient_phone"], "628999000111")
+        self.assertEqual(kwargs["filename"], "ktp_budi.jpg")
+        self.assertTrue(kwargs["link"].endswith("/dl/TESTTOKEN123"))
+
+    def test_unknown_file_id_does_not_send(self):
+        env = self._arm_session()
+        out, store_spy, senddoc = self._drive_reply_with_docs_to_send(env, ["doc-nope"])
+        # file_id not held → neither hosting nor sending happens.
+        store_spy.assert_not_called()
+        senddoc.assert_not_awaited()
+        # Reply still returned.
+        self.assertIsNotNone(out)
+
+    def test_no_docs_to_send_is_noop(self):
+        env = self._arm_session()
+        out, store_spy, senddoc = self._drive_reply_with_docs_to_send(env, [])
+        store_spy.assert_not_called()
+        senddoc.assert_not_awaited()
+        self.assertIsNotNone(out)
 
 
 if __name__ == "__main__":

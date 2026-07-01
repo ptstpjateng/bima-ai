@@ -312,6 +312,23 @@ _doc_context: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "officer_copilot_doc_context", default=None
 )
 
+# ---------------------------------------------------------------------------
+# Out-of-band document-send channel (Task G — officer requests the real file).
+#
+# A tool can only return a STRING to the model, but delivering a document is an
+# out-of-band side effect (host the bytes at /dl/{token} + push a WhatsApp
+# document message). So `send_document` does NOT send the file itself — it
+# RESOLVES the requested doc to a file_id and records that id here. `chat()`
+# drains this list after the turn and surfaces it to the caller as
+# `result["documents_to_send"]`; the officer bridge then performs the actual
+# send on the officer's channel. Same ContextVar pattern as `_doc_context`, so
+# it stays a plain module-level tool and remains async-task-safe (each turn
+# gets its own list; a token reset restores the previous value).
+# ---------------------------------------------------------------------------
+_docs_to_send_context: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "officer_copilot_docs_to_send", default=None
+)
+
 # Severity ladder — kept in sync with admin/src/lib/case-types.ts SEVERITY_ORDER
 # and ai-engine/services/agents/validator.py IssueLevel. Lower = worse.
 _SEVERITY_RANK: dict[str, int] = {
@@ -325,6 +342,41 @@ _SEVERITY_RANK: dict[str, int] = {
 # ---------------------------------------------------------------------------
 # Tool implementations.
 # ---------------------------------------------------------------------------
+
+
+def _documents_digest_from_ctx() -> list[dict[str, Any]]:
+    """Return the compact per-document read digest carried on the validation
+    context, if any (Task F).
+
+    The bridge derives a `documents_digest` from the rich SuitabilityResult at
+    officer-case creation — {filename, detected_type, has_meterai, confidence,
+    matches, claimed_type} per doc — and threads it through the same
+    `validation` dict the copilot receives, so "what BIMA read per doc" (type +
+    meterai) survives a Redis round-trip / process restart even though the raw
+    SuitabilityResult is stripped before Redis. We pass it through unchanged;
+    the bridge already masked any PII in the fields when it built the digest.
+    Returns [] when no digest is bound.
+    """
+    ctx = _validation_context.get()
+    if not ctx or not isinstance(ctx, dict):
+        return []
+    digest = ctx.get("documents_digest")
+    if not isinstance(digest, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for d in digest:
+        if not isinstance(d, dict):
+            continue
+        out.append({
+            "filename": d.get("filename", "") or "",
+            "detected_type": d.get("detected_type", "") or "",
+            "claimed_type": d.get("claimed_type", "") or "",
+            "has_meterai": d.get("has_meterai"),
+            "confidence": d.get("confidence"),
+            "matches": d.get("matches"),
+        })
+    return out
+
 
 def get_validation_summary() -> dict:
     """
@@ -344,9 +396,14 @@ def get_validation_summary() -> dict:
         "summary": str,              # one-paragraph Indonesian
         "issue_count": int,
         "issues": [ {severity, field, message, related_docs}, ... ]  # worst-first
+        "documents_read": [ {filename, detected_type, claimed_type,
+                             has_meterai, confidence, matches}, ... ]
       }
-    On miss returns `{"available": False, "note": "..."}` so the model is told
-    to ask the officer to run the validator rather than fabricating a score.
+    `documents_read` is the per-doc digest of what BIMA actually read (type +
+    meterai per document) — present even after a restart, so the officer can
+    always see it. On miss returns `{"available": False, "note": "..."}` so the
+    model is told to ask the officer to run the validator rather than
+    fabricating a score.
     """
     ctx = _validation_context.get()
     if not ctx or not isinstance(ctx, dict):
@@ -386,6 +443,7 @@ def get_validation_summary() -> dict:
         "summary": ctx.get("summary", "") or "",
         "issue_count": len(issues),
         "issues": issues,
+        "documents_read": _documents_digest_from_ctx(),
     }
 
 
@@ -395,15 +453,21 @@ async def get_case_full(ticket: str) -> dict:
     client the WhatsApp fast-path uses, so the auth + timeout story is
     identical.
 
+    Also attaches `documents_read` — the compact per-doc digest of what BIMA
+    read at submission (type + meterai per document, Task F) — from the
+    validation context, so the officer sees it alongside the case record even
+    after a restart. Absent (empty list) when no digest is bound.
+
     Returns the record dict on hit, or `{"found": False, "ticket": ticket}`
     on miss / SIAP unavailable. We do not raise — the model must always
     get a structured tool result so it can phrase the answer correctly.
     """
+    digest = _documents_digest_from_ctx()
     client = get_siap_client()
     record = await client.get_status_by_ticket(ticket)
     if not record:
-        return {"found": False, "ticket": ticket}
-    return {"found": True, **record}
+        return {"found": False, "ticket": ticket, "documents_read": digest}
+    return {"found": True, **record, "documents_read": digest}
 
 
 # Gemini Vision schema for a free-text document summary. JSON-mode (the
@@ -484,6 +548,89 @@ async def get_doc_summary(file_id: str) -> str:
         "(WhatsApp/Telegram) di mana dokumen dikirim langsung ke BIMA, "
         "ringkasan dibuat otomatis dengan Gemini Vision."
     )
+
+
+def _resolve_doc_ref(ctx: dict, doc_ref: str) -> Optional[str]:
+    """Resolve a human `doc_ref` ("KTP", "Surat Pesanan", a filename fragment)
+    OR a literal file_id to a file_id present in the in-session doc context.
+
+    Matching is case-insensitive and tolerant of the label formatting the
+    validator uses (underscores in detected/claimed types, e.g. "Surat_Pesanan"
+    vs the officer's "surat pesanan"). Precedence:
+      1. exact file_id key,
+      2. detected/claimed type label equals the ref (space/underscore-agnostic),
+      3. filename substring, then type-label substring.
+    Returns the file_id on a hit, or None when nothing matches.
+    """
+    if not ctx or not doc_ref:
+        return None
+
+    def _norm(s: Any) -> str:
+        return re.sub(r"[\s_]+", " ", str(s or "")).strip().lower()
+
+    ref = _norm(doc_ref)
+
+    # 1) A literal file_id the officer (or model) passed straight through.
+    if doc_ref in ctx:
+        return doc_ref
+
+    # 2) Exact label match on the claimed type (the citizen's declared kind).
+    #    `_doc_context` carries `claimed_type` per doc; the validator's
+    #    detected_type is not on this context, so claimed_type + filename are
+    #    the labels we can match against.
+    for fid, doc in ctx.items():
+        if _norm(doc.get("claimed_type")) == ref and ref:
+            return fid
+
+    # 3) Substring match — filename first (most specific), then claimed type.
+    for fid, doc in ctx.items():
+        if ref and ref in _norm(doc.get("filename")):
+            return fid
+    for fid, doc in ctx.items():
+        claimed = _norm(doc.get("claimed_type"))
+        if ref and claimed and (ref in claimed or claimed in ref):
+            return fid
+
+    return None
+
+
+def send_document(doc_ref: str) -> str:
+    """Officer asks to RECEIVE/VIEW a specific uploaded document ("kirim
+    KTP-nya", "boleh saya lihat surat pesanannya").
+
+    This tool does NOT send the file — a tool can only return text, and the
+    delivery is an out-of-band side effect. It resolves `doc_ref` (a document
+    label like "KTP"/"Surat Pesanan", OR a file_id) against the in-session
+    documents, records the resolved file_id in `_docs_to_send_context` so the
+    officer bridge can push the real file on the officer's channel, and returns
+    a short confirmation for the model to relay. On no match it records nothing
+    and tells the officer the document isn't on this submission.
+    """
+    ctx = _doc_context.get()
+    if not ctx or not isinstance(ctx, dict):
+        # No in-session bytes bound (admin dashboard path) — nothing to send.
+        return (
+            f"Dokumen '{doc_ref}' tidak dapat dikirim: berkas tidak tersedia "
+            "pada sesi ini."
+        )
+
+    file_id = _resolve_doc_ref(ctx, doc_ref)
+    if file_id is None:
+        return f"Dokumen '{doc_ref}' tidak ditemukan pada pengajuan ini."
+
+    doc = ctx.get(file_id) or {}
+    label = doc.get("filename") or doc.get("claimed_type") or file_id
+
+    queue = _docs_to_send_context.get()
+    if isinstance(queue, list):
+        if file_id not in queue:
+            queue.append(file_id)
+    else:
+        # No queue bound (e.g. tool exercised in isolation) — the resolution
+        # still succeeds; only the out-of-band send is skipped.
+        logger.debug("send_document resolved but no send queue bound | file_id=%s", file_id)
+
+    return f"Baik, saya kirimkan dokumen {label} ke chat ini."
 
 
 def compare_field(doc_a: dict, doc_b: dict, field: str) -> dict:
@@ -1001,6 +1148,32 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "send_document",
+        "description": (
+            "Kirimkan berkas dokumen ASLI yang diunggah ke chat petugas, "
+            "supaya petugas dapat melihat/menerima dokumennya sendiri. "
+            "Gunakan saat petugas meminta melihat atau menerima dokumen "
+            "tertentu, mis. 'kirim KTP-nya', 'boleh saya lihat surat "
+            "pesanannya', atau 'tolong kirimkan proposalnya'. Argumen "
+            "`doc_ref` adalah label/jenis dokumen (mis. 'KTP', 'Surat "
+            "Pesanan', 'proposal') atau file_id. Berbeda dari get_doc_summary "
+            "yang hanya MERINGKAS — tool ini benar-benar MENGIRIM berkasnya."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "doc_ref": {
+                    "type": "string",
+                    "description": (
+                        "Jenis/label dokumen yang diminta (mis. 'KTP', "
+                        "'Surat Pesanan', 'NIB') atau file_id dokumen."
+                    ),
+                },
+            },
+            "required": ["doc_ref"],
+        },
+    },
+    {
         "name": "compare_field",
         "description": (
             "Bandingkan satu field di antara dua dokumen yang sudah "
@@ -1181,6 +1354,7 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "get_validation_summary": get_validation_summary,
     "get_case_full": get_case_full,
     "get_doc_summary": get_doc_summary,
+    "send_document": send_document,
     "compare_field": compare_field,
     "cite_regulation": cite_regulation,
     "get_case_log_notes": get_case_log_notes,
@@ -1205,6 +1379,7 @@ _OFFICER_TOOL_NAMES = frozenset({
     "get_validation_summary",
     "get_case_full",
     "get_doc_summary",
+    "send_document",
     "compare_field",
     "cite_regulation",
     "get_case_log_notes",
@@ -1389,9 +1564,12 @@ class OfficerCopilot:
         # Bind the validation result + any in-session documents for this turn
         # so `get_validation_summary` / `get_doc_summary` can read them. The
         # token resets in `finally` keep concurrent requests isolated — each
-        # asyncio task gets its own ContextVar copy.
+        # asyncio task gets its own ContextVar copy. `_docs_to_send_context`
+        # is a fresh per-turn list `send_document` appends resolved file_ids
+        # to; we drain it into the result so the bridge can push the files.
         ctx_token = _validation_context.set(validation)
         doc_token = _doc_context.set(documents)
+        send_token = _docs_to_send_context.set([])
         logger.info(
             "Copilot turn start | mode=%s | officer_id=%s | ticket=%s | "
             "has_validation=%s | in_session_docs=%d | history_turns=%d",
@@ -1403,7 +1581,7 @@ class OfficerCopilot:
             len(history or []),
         )
         try:
-            return await self._run_chat_loop(
+            result = await self._run_chat_loop(
                 client_message=message,
                 ticket=ticket,
                 history=history,
@@ -1412,9 +1590,17 @@ class OfficerCopilot:
                 system_instruction=system_instruction,
                 mode=mode,
             )
+            # Surface any documents `send_document` resolved this turn so the
+            # bridge can deliver them out-of-band. Always a list (possibly
+            # empty). Only meaningful in officer mode (send_document is not in
+            # the signature tool set), but harmless elsewhere.
+            queued = _docs_to_send_context.get() or []
+            result["documents_to_send"] = list(queued)
+            return result
         finally:
             _validation_context.reset(ctx_token)
             _doc_context.reset(doc_token)
+            _docs_to_send_context.reset(send_token)
 
     async def _run_chat_loop(
         self,
