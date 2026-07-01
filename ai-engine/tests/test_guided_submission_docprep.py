@@ -230,5 +230,90 @@ class TestAttachDedup(unittest.TestCase):
         self.assertEqual({d.file_id for d in sess.documents}, {"id-1", "id-3"})
 
 
+class TestGenerateOnRequest(unittest.TestCase):
+    """The citizen can ask BIMA to draft a missing sign-doc ("buatkan surat
+    permohonannya") from COLLECTING_DOCS / CONFIRM — it must not go silent, and
+    must not be misread as a new-submission switch offer."""
+
+    def setUp(self):
+        os.environ["BIMA_GUIDED_SUBMISSION_ENABLED"] = "true"
+
+    def tearDown(self):
+        gs._sessions.clear()
+
+    def test_matcher_hits_and_misses(self):
+        g = license_guides.get_guide(459)
+        # Genuine requests → generate.
+        self.assertEqual(gs._match_generate_doc_request("buatkan surat permohonannya", g), "surat_permohonan")
+        self.assertEqual(gs._match_generate_doc_request("tolong bikinkan pakta integritas", g), "pakta_integritas")
+        self.assertEqual(gs._match_generate_doc_request("buatkan surat pesanannya", g), "surat_pesanan")
+        # Passive request forms (false-negatives the review found) → generate.
+        self.assertEqual(gs._match_generate_doc_request("minta dibuatkan surat permohonan dong", g), "surat_permohonan")
+        # Plain data / no verb / no doc name / non-curated → None.
+        self.assertIsNone(gs._match_generate_doc_request("KM Mina Jaya, 120 GT, baja", g))
+        self.assertIsNone(gs._match_generate_doc_request("tolong buatkan yang cepat", g))
+        self.assertIsNone(gs._match_generate_doc_request("buatkan surat permohonan", None))
+        # FALSE POSITIVES the adversarial review caught — must NOT generate:
+        self.assertIsNone(gs._match_generate_doc_request("surat permohonan ini buat apa?", g))        # question
+        self.assertIsNone(gs._match_generate_doc_request("saya mau buat permohonan izin baru", g))     # switch
+        self.assertIsNone(gs._match_generate_doc_request("saya sudah buat surat pesanannya sendiri", g))  # already made
+        self.assertIsNone(gs._match_generate_doc_request("surat pesanan sudah dibuatkan galangan", g))    # already made (passive)
+        self.assertIsNone(gs._match_generate_doc_request("kenapa surat permohonan wajib?", g))          # question
+
+    def _route(self, msg):
+        called = []
+
+        async def fake_gen(sess, doc_type):
+            called.append(doc_type)
+            return "GENERATED"
+
+        orig = gs._generate_and_send_one_doc
+        gs._generate_and_send_one_doc = fake_gen
+        try:
+            s = SubmissionSession(user_id="wa-950", license_id=459,
+                                  license_name="PPKP", stage=Stage.CONFIRM)
+            gs._sessions[s.user_id] = s
+            reply = _run(gs.maybe_handle("wa-950", msg))
+        finally:
+            gs._generate_and_send_one_doc = orig
+            gs._sessions.clear()
+        return reply, called
+
+    def test_confirm_stage_routes_to_generate(self):
+        reply, called = self._route("buatkan surat permohonannya")
+        self.assertEqual(reply, "GENERATED")
+        self.assertEqual(called, ["surat_permohonan"])
+
+    def test_tolong_buatkan_not_misread_as_switch(self):
+        # "tolong buatkan..." also trips detect_submission_intent; the generate
+        # interception runs first, so it generates instead of offering a switch.
+        reply, called = self._route("tolong buatkan surat permohonannya")
+        self.assertEqual(reply, "GENERATED")
+        self.assertEqual(called, ["surat_permohonan"])
+
+    def test_generate_one_doc_sends_and_replies(self):
+        sent = []
+
+        async def fake_send(user_id, link, filename, *, caption=""):
+            sent.append(filename)
+            return True
+
+        orig_send = gs._send_doc_to_user
+        gs._send_doc_to_user = fake_send
+        try:
+            s = SubmissionSession(user_id="wa-951", license_id=459,
+                                  license_name="PPKP", stage=Stage.CONFIRM)
+            s.fields["nik"] = "3301234567890001"
+            s.fields["applicant_name"] = "CASMO"
+            gs._sessions[s.user_id] = s
+            reply = _run(gs._generate_and_send_one_doc(s, "surat_permohonan"))
+        finally:
+            gs._send_doc_to_user = orig_send
+            gs._sessions.clear()
+        self.assertEqual(len(sent), 1)             # one draft delivered
+        self.assertIn("unggah kembali", reply)     # asked to sign + upload back
+        self.assertEqual(s.stage, Stage.CONFIRM)   # stage unchanged
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

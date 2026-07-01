@@ -1970,6 +1970,124 @@ async def _generate_and_send_docs(sess: SubmissionSession) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Single-doc generate-on-request ("buatkan surat permohonannya")
+#
+# After the packet is scored, the citizen may ask BIMA to DRAFT one of the
+# sign-required documents it can make (e.g. a missing Surat Permohonan). This
+# recognises "buatkan <doc>", generates that ONE PDF (encrypted with the NIK),
+# delivers it, and asks the citizen to sign + meterai + re-upload. Requires BOTH
+# a generate-verb AND a doc-name so raw data typed during doc-prep never fires.
+# --------------------------------------------------------------------------- #
+
+# Doc-name fragments → doc_type (lowercased substring). Distinctive multi-word
+# phrases only; bare "permohonan"/"pesanan" are dropped — they collide with
+# everyday words ("permohonan maaf", "pesanan makan") and with the licence-object
+# detector. "pakta" is rare enough to keep bare.
+_DOC_NAME_ALIASES: dict[str, tuple[str, ...]] = {
+    "pakta_integritas": ("pakta integritas", "pakta"),
+    "surat_permohonan": ("surat permohonan",),
+    "surat_pesanan": ("surat pesanan", "kontrak galangan", "kontrak dengan galangan"),
+}
+
+# Only IMPERATIVE / explicitly-requested generate verbs — "buatkan/bikinin/
+# dibuatkan" or "tolong|minta|mohon buat". Deliberately NOT bare "buat"/"bikin",
+# which trip on "buat apa" (for what), "mau buat izin" (a new submission), and
+# "sudah buat" (already made).
+_GEN_VERB_RE = re.compile(
+    r"\b(?:di)?(?:buatkan|buatin|bikinkan|bikinin)\b"
+    r"|\b(?:tolong|minta|mohon)\s+(?:di)?(?:buat|bikin)(?:kan|in)?\b"
+    r"|\bgenerate(?:kan)?\b",
+    re.IGNORECASE,
+)
+
+# Cues that a doc mention is NOT a generate request — "sudah/udah/telah [di]buat"
+# (already made), "sendiri" (made it myself), or an interrogative about the doc.
+_NOT_A_REQUEST_RE = re.compile(
+    r"\b(sudah|udah|telah|sendiri|kenapa|mengapa|apa\s+itu|buat\s+apa|untuk\s+apa)\b",
+    re.IGNORECASE,
+)
+
+
+def _match_generate_doc_request(msg: str, guide: Optional[dict[str, Any]]) -> Optional[str]:
+    """If `msg` is a 'buatkan <doc>' request for a doc THIS guide can generate,
+    return that doc_type, else None. Requires an imperative generate-verb AND a
+    doc-name hit, and rejects 'already made / question' cues, so plain data,
+    questions ("surat permohonan buat apa?"), a new-submission switch, and
+    "sudah saya buat sendiri" never trigger. Longest fragment wins; a tie between
+    two different docs bails out (ask to clarify)."""
+    if not guide:
+        return None
+    low = (msg or "").strip().lower()
+    if not low or not _GEN_VERB_RE.search(low):
+        return None
+    if _NOT_A_REQUEST_RE.search(low):
+        return None
+    generatable = {d.get("doc_type") for d in (guide.get("generate_docs") or [])}
+    hits: list[tuple[int, str]] = []
+    for doc_type, aliases in _DOC_NAME_ALIASES.items():
+        if doc_type not in generatable:
+            continue
+        for frag in aliases:
+            if frag in low:
+                hits.append((len(frag), doc_type))
+    if not hits:
+        return None
+    hits.sort(reverse=True)
+    best_len = hits[0][0]
+    top = {d for length, d in hits if length == best_len}
+    return hits[0][1] if len(top) == 1 else None
+
+
+async def _generate_and_send_one_doc(sess: SubmissionSession, doc_type: str) -> str:
+    """Draft ONE sign-required doc on request, deliver it (encrypted with the
+    NIK), and tell the citizen to sign + meterai + upload it back. Mirrors
+    _generate_and_send_docs for a single doc; does NOT change the stage. Missing
+    data keys render as fill-by-hand blanks — never invented."""
+    from services import doc_generator, generated_docs, license_guides
+
+    guide = license_guides.get_guide(sess.license_id) or {}
+    entry = next(
+        (d for d in (guide.get("generate_docs") or []) if d.get("doc_type") == doc_type),
+        None,
+    )
+    if entry is None:  # defensive — the matcher only returns generatable docs
+        names = ", ".join(d["label"] for d in (guide.get("generate_docs") or [])) or "-"
+        return f"Saya bisa membuatkan: {names}. Dokumen mana yang ingin dibuatkan?"
+
+    data = {k: sess.fields.get(k, "") for k in (_DOC_REQUIRED_FIELDS + _DOC_OPTIONAL_FIELDS)}
+    data["license_name"] = sess.license_name or ""
+    # Sensible default: a Usaha Perorangan's signatory is the owner.
+    if not data.get("jabatan") and sess.fields.get("jenis_usaha") == "Perorangan":
+        data["jabatan"] = "Pemilik"
+    nik = (sess.fields.get("nik") or "").strip()
+
+    pdf = doc_generator.generate(doc_type, data, encrypt_password=nik or None)
+    label = entry.get("label") or doc_type.replace("_", " ").title()
+    filename = f"{label.replace(' ', '_').replace('/', '-')}.pdf"
+    token = generated_docs.store(pdf, filename)
+    lock = " (terkunci - buka dengan NIK Anda)" if nik else ""
+    sent = await _send_doc_to_user(
+        sess.user_id, f"{_public_base_url()}/dl/{token}", filename,
+        caption=f"Draf {label}{lock}.",
+    )
+    logger.info(
+        "Single-doc drafted | user=%s | license_id=%s | doc=%s | sent=%s",
+        _mask(sess.user_id), sess.license_id, doc_type, sent,
+    )
+    if not sent:
+        return "Maaf, ada kendala saat mengirim drafnya. Tim kami akan bantu."
+    lock_note = (
+        "_Dokumen terkunci - buka dengan *NIK* Anda (16 digit)._\n\n" if nik else ""
+    )
+    return (
+        f"Selesai - draf *{label}* sudah saya kirim di atas.\n\n{lock_note}"
+        "Silakan periksa/lengkapi bagian yang masih kosong, *tanda tangani + "
+        "bubuhi meterai Rp10.000*, lalu *unggah kembali* ke sini agar berkasnya "
+        "lengkap."
+    )
+
+
 async def _handle_preparing_docs(sess: SubmissionSession, msg: str) -> str:
     """Collect the data the generated docs need; once complete, draft + deliver."""
     text = (msg or "").strip()
@@ -2036,6 +2154,34 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
             "Baik Bapak/Ibu, pengajuan izin dibatalkan. Kapan pun ingin "
             "mengajukan lagi, cukup beri tahu saya."
         )
+
+    # --- Single-doc generate request ("buatkan surat permohonannya") --------
+    # A curated-licence citizen at COLLECTING_DOCS / CONFIRM asking BIMA to DRAFT
+    # a sign-doc it can make. MUST run BEFORE the new-intent intercept below —
+    # "tolong buatkan surat permohonan" also trips detect_submission_intent, so
+    # the intercept would otherwise offer to switch instead of generating. Gated
+    # on no pending switch. The matcher needs BOTH a generate-verb AND a
+    # generatable-doc name, so a genuine "saya mau ajukan izin lain" (no doc
+    # name) falls through to the intercept. Without this the message got NO reply.
+    if sess.pending_new_intent is None and sess.stage in (
+        Stage.COLLECTING_DOCS, Stage.CONFIRM
+    ):
+        from services import license_guides
+        target = _match_generate_doc_request(
+            msg, license_guides.get_guide(sess.license_id)
+        )
+        if target is not None:
+            try:
+                return await _generate_and_send_one_doc(sess, target)
+            except Exception:
+                logger.exception(
+                    "Single-doc generate crashed | user=%s | doc=%s",
+                    _mask(user_id), target,
+                )
+                return (
+                    "Mohon maaf, ada kendala saat membuat dokumennya. Coba lagi "
+                    "sebentar ya, Bapak/Ibu."
+                )
 
     # New-submission intent INTERCEPT while a form is ACTIVE (COLLECTING_DOCS /
     # CONFIRM, NOT RESOLVING_LICENSE): a clear "saya mau ajukan izin ..." must
