@@ -344,6 +344,44 @@ class TestScoreHelpers(unittest.TestCase):
         issues = sj._build_issues(comp, findings, [], [])
         self.assertEqual([i for i in issues if i.id.startswith("meterai:missing")], [])
 
+    def test_surat_pesanan_not_flagged_for_meterai(self):
+        # Surat Pesanan needs a company stamp, not a meterai → never flagged.
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="pesanan.pdf", file_id="1", claimed_type="Surat_Pesanan",
+                detected_type="Surat_Pesanan", confidence=0.9, matches=True,
+                has_meterai=False,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        self.assertEqual([i for i in issues if i.id.startswith("meterai:missing")], [])
+
+    def test_unlabeled_detected_doc_no_mismatch_issue(self):
+        # Claimed "Other" (unlabeled) but detected as a known class → BIMA just
+        # identified it; that is NOT a label conflict.
+        comp = sj.CompletenessSection(score=1.0, missing=[], required=["KTP"])
+        findings = [
+            sj.TypeCorrectnessFinding(
+                file="x.pdf", file_id="1", claimed_type="Other",
+                detected_type="Persetujuan_Nama_Kapal", confidence=0.9, matches=False,
+            ),
+        ]
+        issues = sj._build_issues(comp, findings, [], [])
+        self.assertEqual([i for i in issues if i.id.startswith("type:mismatch")], [])
+
+    def test_completeness_counts_detected_not_just_claimed(self):
+        # An UNLABELED upload (claimed "Other") that BIMA DETECTED as the required
+        # class counts as present — not "belum diunggah".
+        c = sj._completeness(
+            [_doc("1", "Other")],
+            required=["Surat Persetujuan nama kapal"],
+            registry_note=None,
+            detected_classes={"Persetujuan_Nama_Kapal"},
+        )
+        self.assertEqual(c.missing, [])
+        self.assertEqual(c.score, 1.0)
+
     def test_suitability_avg(self):
         findings = [
             sj.SuitabilityFinding(

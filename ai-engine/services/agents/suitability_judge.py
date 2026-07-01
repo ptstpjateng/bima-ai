@@ -91,10 +91,12 @@ DOC_CLASSES: list[str] = [
 
 # Classes that legally require a meterai + signature (BIMA drafts these; the
 # citizen signs + affixes meterai). Used to flag a missing meterai as an issue.
+# NOTE: Surat_Pesanan is intentionally NOT here — a purchase order to the
+# shipyard (galangan) needs a company stamp (cap/stempel), not a Rp10.000
+# meterai.
 _METERAI_REQUIRED_CLASSES: set[str] = {
     "Pakta_Integritas",
     "Surat_Permohonan",
-    "Surat_Pesanan",
 }
 
 
@@ -588,6 +590,7 @@ def _completeness(
     docs: list[UploadedDoc],
     required: list[str],
     registry_note: Optional[str],
+    detected_classes: Optional[set[str]] = None,
 ) -> CompletenessSection:
     """Bucket required requirements that map to a known DOC_CLASS and check
     which classes are represented in the uploaded set."""
@@ -611,8 +614,13 @@ def _completeness(
             needed_classes.append(cls)
             seen_set.add(cls)
 
-    # What did the citizen upload (by claimed type)?
+    # What did the citizen upload? Count a class present if EITHER the citizen's
+    # claimed label OR what BIMA actually DETECTED (Vision) matches it — an
+    # unlabeled upload that BIMA correctly identified must not read as "missing".
     uploaded_classes = {_canonical_class(d.claimed_type) for d in docs}
+    uploaded_classes |= {
+        c for c in (detected_classes or set()) if c and c not in ("Unknown", "Other")
+    }
 
     missing = [c for c in needed_classes if c not in uploaded_classes]
     total = len(needed_classes)
@@ -700,7 +708,14 @@ def _build_issues(
         ))
 
     for f in type_findings:
-        if not f.matches and f.detected_type not in {"Unknown", "Other"}:
+        # Only a genuine LABEL CONFLICT — the citizen labelled it X but BIMA read
+        # it as a different known class. An UNLABELED upload (claimed "Other")
+        # that BIMA identified is not a conflict; don't flag it.
+        if (
+            not f.matches
+            and f.detected_type not in {"Unknown", "Other"}
+            and f.claimed_type != "Other"
+        ):
             issues.append(Issue(
                 id=f"type:mismatch:{f.file_id}",
                 severity=SEVERITY_HIGH,
@@ -833,7 +848,10 @@ async def judge_submission(
             ])
         )
 
-    completeness = _completeness(documents, requirements, registry_note)
+    completeness = _completeness(
+        documents, requirements, registry_note,
+        detected_classes={f.detected_type for f in type_findings},
+    )
     type_score = _type_avg_score(type_findings)
     suit_score = _suitability_avg_score(suit_findings)
 
