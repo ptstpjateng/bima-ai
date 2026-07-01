@@ -157,5 +157,56 @@ class TestDocPrepFlow(unittest.TestCase):
         self.assertEqual(len(sess.documents), 1)             # the upload attached
 
 
+class TestSwitchKeywords(unittest.TestCase):
+    """The mid-form switch offer tells the citizen to reply "ganti"/"lanjutkan";
+    those literal words must resolve, not loop the disambiguation forever."""
+
+    def setUp(self):
+        os.environ["BIMA_GUIDED_SUBMISSION_ENABLED"] = "true"
+        self._orig_start = gs._start_session
+        self._orig_confirm = gs._handle_confirm
+        self.started = []
+
+        async def fake_start(uid, text):
+            self.started.append((uid, text))
+            return "STARTED"
+
+        async def fake_confirm(sess, msg):
+            return "CONFIRM_HANDLED"
+
+        gs._start_session = fake_start
+        gs._handle_confirm = fake_confirm
+
+    def tearDown(self):
+        gs._start_session = self._orig_start
+        gs._handle_confirm = self._orig_confirm
+        gs._sessions.clear()
+
+    def _sess_with_pending(self, uid):
+        s = SubmissionSession(user_id=uid, license_id=459, license_name="PPKP",
+                              stage=Stage.CONFIRM)
+        s.pending_new_intent = "saya mau ajukan izin lain"
+        gs._sessions[uid] = s
+        return s
+
+    def test_ganti_switches(self):
+        self._sess_with_pending("wa-777")
+        reply = _run(gs.maybe_handle("wa-777", "ganti"))
+        self.assertEqual(reply, "STARTED")          # switched to the stashed intent
+        self.assertEqual(len(self.started), 1)
+
+    def test_ya_ganti_switches(self):
+        self._sess_with_pending("wa-779")
+        _run(gs.maybe_handle("wa-779", "ya, ganti"))
+        self.assertEqual(len(self.started), 1)       # BIMA's own suggested phrase works
+
+    def test_lanjutkan_continues_no_switch(self):
+        sess = self._sess_with_pending("wa-778")
+        reply = _run(gs.maybe_handle("wa-778", "lanjutkan"))
+        self.assertEqual(self.started, [])           # did NOT switch
+        self.assertIsNone(sess.pending_new_intent)   # stash cleared
+        self.assertEqual(reply, "CONFIRM_HANDLED")   # fell through to the stage handler
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
