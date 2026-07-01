@@ -939,17 +939,11 @@ async def _extract_fields_from_documents(sess: SubmissionSession) -> None:
                 if not need_name and not need_nik:
                     break
 
-    # Business name — from a NIB/SIUP/Akta filename hint, if any. We don't run a
-    # second Vision pass for this slice; the filename hint is enough to label
-    # the source, and we default to the person's name otherwise (at render).
-    if not sess.fields.get("business_name"):
-        biz_doc = next((d for d in sess.documents if _looks_like_business_doc(d)), None)
-        if biz_doc is not None:
-            label = _claimed_type_from_filename(biz_doc.filename)
-            cleaned = _v_business_name(label)
-            # Only use it if it's a meaningful business label, not just "nib".
-            if cleaned and cleaned.lower() not in _BUSINESS_DOC_HINTS:
-                sess.fields["business_name"] = cleaned
+    # Business name is NOT derived from filenames — a filename like
+    # "SIUP_CASMO_NEW_2026_Copy(1).pdf" is not a business name, and rendering it
+    # as "Nama usaha" looks broken. It comes from the citizen's typed data
+    # (doc-prep) or a NIB/SIUP Vision extraction (Push 2); otherwise it falls
+    # back to the person's name at render time.
 
     logger.info(
         "Guided-submission fields extracted | user=%s | name=%s | nik=%s | "

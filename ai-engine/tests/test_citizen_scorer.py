@@ -143,9 +143,10 @@ class TestRenderScoreMessage(unittest.TestCase):
             ]
         )
         msg = cs.render_score_message(res)
-        self.assertIn("ktp.jpg", msg)
-        self.assertIn("terbaca sebagai", msg)
-        self.assertIn("nib.pdf", msg)
+        self.assertIn("ktp.jpg", msg)      # mismatch still surfaces the file
+        self.assertIn("dilabeli", msg)     # new mismatch phrasing (was "terbaca sebagai")
+        self.assertIn("NPWP", msg)         # detected type shown
+        self.assertIn("NIB", msg)          # the matched doc's detected type
 
     def test_suitability_mismatch_and_partial(self):
         res = _result(

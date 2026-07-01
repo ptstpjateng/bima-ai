@@ -94,9 +94,23 @@ _CLASS_LABEL: dict[str, str] = {
     "SK_Pengangkatan": "SK Pengangkatan",
     "Akta_Pendirian": "Akta Pendirian",
     "IMB_PBG": "IMB/PBG",
+    "Surat_Permohonan": "Surat Permohonan",
+    "Surat_Pesanan": "Surat Pesanan",
+    "Persetujuan_Nama_Kapal": "Persetujuan Nama Kapal",
+    "Desain_Kapal": "Desain Kapal",
+    "Spesifikasi_Alat_Tangkap": "Spesifikasi Alat Tangkap",
     "Other": "Dokumen lain",
     "Unknown": "Tidak terbaca",
 }
+
+# Sign-required docs — where a visible meterai matters.
+_SIGN_DOC_CLASSES: set[str] = {"Pakta_Integritas", "Surat_Permohonan", "Surat_Pesanan"}
+
+
+def _short(name: str, limit: int = 30) -> str:
+    """Trim a long filename for readable display."""
+    name = (name or "").strip()
+    return name if len(name) <= limit else name[: limit - 1] + "…"
 
 # Severity → plain-text prefix for the issues list (no emoji — WhatsApp
 # replies are kept emoji-free, see BIMA persona / Fix B).
@@ -128,23 +142,31 @@ def _completeness_line(result: SuitabilityResult) -> str:
 
 
 def _type_lines(result: SuitabilityResult) -> list[str]:
-    """One line per uploaded document: does its detected type match what the
-    citizen labelled it?"""
+    """One clean line per document — lead with the detected type, add a meterai
+    indicator for the sign-required docs, and only surface the (shortened)
+    filename when there is something to fix. Mismatches/unreadable are still
+    detailed in the issues list; this block is the "what BIMA read" at-a-glance.
+    """
     lines: list[str] = []
     for f in result.type_correctness:
         if f.detected_type in ("Unknown", ""):
-            lines.append(
-                f"- {f.file}: tidak dapat dibaca — pastikan foto/PDF jelas"
-            )
+            lines.append(f"- _{_short(f.file)}_: tidak terbaca — unggah ulang yang jelas")
             continue
-        if f.matches:
-            lines.append(
-                f"- {f.file}: [OK] terbaca sebagai {_label(f.detected_type)}"
-            )
+
+        label = _label(f.detected_type)
+        meterai = ""
+        if f.detected_type in _SIGN_DOC_CLASSES:
+            if f.has_meterai is True:
+                meterai = " — meterai terlihat"
+            elif f.has_meterai is False:
+                meterai = " — *meterai belum terlihat*"
+
+        if f.matches or f.detected_type == "Other":
+            lines.append(f"- *{label}*{meterai}")
         else:
             lines.append(
-                f"- {f.file}: Anda labeli *{_label(f.claimed_type)}* "
-                f"tapi terbaca sebagai *{_label(f.detected_type)}*"
+                f"- *{label}*{meterai} — _{_short(f.file)}_ dilabeli "
+                f"{_label(f.claimed_type)}"
             )
     return lines
 
@@ -214,7 +236,7 @@ def render_score_message(
 
     type_lines = _type_lines(result)
     if type_lines:
-        lines += ["", "*Pemeriksaan jenis dokumen:*", *type_lines]
+        lines += ["", "*Dokumen yang terbaca:*", *type_lines]
 
     suit_lines = _materia_or_suitability_lines(result)
     if suit_lines:

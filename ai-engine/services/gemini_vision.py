@@ -52,9 +52,10 @@ _GEMINI_TOOL_MODEL: str = os.getenv(
     "models/gemini-2.5-flash",
 )
 
-# Hard cap so a runaway image upload can't hang ai-engine. Sane KTP/NIB scans
-# are ~1-3 MB; raise if real submissions need larger.
-_VISION_TIMEOUT_SECONDS: float = float(os.getenv("GEMINI_VISION_TIMEOUT_SECONDS", "30"))
+# Hard cap so a runaway upload can't hang ai-engine. A 1-page KTP scans in a few
+# seconds, but a multi-page PDF (e.g. a 5-page SIUP) needs materially longer to
+# OCR — 30s was too tight and returned "Unknown" on real multi-page docs. 90s.
+_VISION_TIMEOUT_SECONDS: float = float(os.getenv("GEMINI_VISION_TIMEOUT_SECONDS", "90"))
 
 
 def is_configured() -> bool:
@@ -73,7 +74,7 @@ async def extract_structured(
     response_schema: dict[str, Any],
     model_override: Optional[str] = None,
     temperature: float = 0.1,
-    max_tokens: int = 2048,
+    max_tokens: int = 4096,
 ) -> Optional[dict[str, Any]]:
     """
     Send one image + a prompt to Gemini Vision, get back a structured JSON

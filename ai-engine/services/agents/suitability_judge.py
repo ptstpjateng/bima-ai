@@ -80,8 +80,22 @@ DOC_CLASSES: list[str] = [
     "SK_Pengangkatan",
     "Akta_Pendirian",
     "IMB_PBG",
+    # PPKP (Persetujuan Pengadaan Kapal Perikanan) document classes.
+    "Surat_Permohonan",
+    "Surat_Pesanan",
+    "Persetujuan_Nama_Kapal",
+    "Desain_Kapal",
+    "Spesifikasi_Alat_Tangkap",
     "Other",
 ]
+
+# Classes that legally require a meterai + signature (BIMA drafts these; the
+# citizen signs + affixes meterai). Used to flag a missing meterai as an issue.
+_METERAI_REQUIRED_CLASSES: set[str] = {
+    "Pakta_Integritas",
+    "Surat_Permohonan",
+    "Surat_Pesanan",
+}
 
 
 # Severity vocabulary — same labels the v1 validator uses so the admin UI
@@ -128,6 +142,7 @@ class TypeCorrectnessFinding:
     detected_type: str            # one of DOC_CLASSES (or "Unknown" on failure)
     confidence: float             # 0.0-1.0 — Gemini's self-reported score
     matches: bool                 # convenience: claimed_type == detected_type
+    has_meterai: Optional[bool] = None  # Vision: meterai/stamp visible? None = not assessed
     note: Optional[str] = None    # populated on vision failure
 
 
@@ -287,6 +302,27 @@ _DOC_CLASS_ALIASES: dict[str, str] = {
     "imb": "IMB_PBG",
     "pbg": "IMB_PBG",
     "imb_pbg": "IMB_PBG",
+    # PPKP (fisheries) documents.
+    "surat permohonan": "Surat_Permohonan",
+    "surat_permohonan": "Surat_Permohonan",
+    "permohonan": "Surat_Permohonan",
+    "surat pesanan": "Surat_Pesanan",
+    "surat_pesanan": "Surat_Pesanan",
+    "pesanan": "Surat_Pesanan",
+    "kontrak galangan": "Surat_Pesanan",
+    "persetujuan nama kapal": "Persetujuan_Nama_Kapal",
+    "persetujuan_nama_kapal": "Persetujuan_Nama_Kapal",
+    "nama kapal": "Persetujuan_Nama_Kapal",
+    "desain kapal": "Desain_Kapal",
+    "desain_kapal": "Desain_Kapal",
+    "gambar kapal": "Desain_Kapal",
+    "rancang bangun": "Desain_Kapal",
+    "spesifikasi alat": "Spesifikasi_Alat_Tangkap",
+    "spesifikasi_alat_tangkap": "Spesifikasi_Alat_Tangkap",
+    "alat penangkapan ikan": "Spesifikasi_Alat_Tangkap",
+    "alat tangkap": "Spesifikasi_Alat_Tangkap",
+    "siup": "NIB",
+    "siup oss": "NIB",
 }
 
 
@@ -353,18 +389,32 @@ _TYPE_DETECT_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "One short sentence — what visual cue led to the classification.",
         },
+        "has_meterai": {
+            "type": "boolean",
+            "description": (
+                "True if a meterai is visibly affixed — a Rp10.000 e-meterai "
+                "(digital stamp/QR) or a physical meterai tempel sticker; "
+                "false if none is visible."
+            ),
+        },
     },
     "required": ["detected_type", "confidence"],
 }
 
 _TYPE_DETECT_PROMPT = (
-    "What kind of Indonesian government document is this? "
-    "Pick exactly one from: KTP, NIB, NPWP, Surat_Domisili, "
-    "Pakta_Integritas, SK_Pengangkatan, Akta_Pendirian, IMB_PBG, Other. "
-    "Use the visual layout, headers, official logos, and any visible "
-    "issuing-authority text. Provide a 0.0-1.0 confidence score and "
-    "a one-sentence rationale. If the image is unreadable or clearly "
-    "unrelated to Indonesian licensing, return 'Other' with low confidence."
+    "What kind of Indonesian government/licensing document is this? "
+    "Pick exactly one class from: " + ", ".join(DOC_CLASSES) + ". "
+    "Hints for fisheries (PPKP) documents: 'Surat_Pesanan' = a purchase/build "
+    "order or contract with a shipyard (galangan); 'Persetujuan_Nama_Kapal' = "
+    "a vessel-name approval (often Kementerian Perhubungan / Ditjen Hubla); "
+    "'Desain_Kapal' = a ship design / rancang-bangun drawing; "
+    "'Spesifikasi_Alat_Tangkap' = a fishing-gear (alat penangkapan ikan / API) "
+    "specification. Use the visual layout, headers, official logos, and any "
+    "visible issuing-authority text. Also report whether a meterai (Rp10.000 "
+    "e-meterai stamp/QR, or a physical meterai tempel sticker) is visibly "
+    "affixed. Provide a 0.0-1.0 confidence score and a one-sentence rationale. "
+    "If the document is unreadable or clearly unrelated to Indonesian "
+    "licensing, return 'Other' with low confidence."
 )
 
 _SUITABILITY_SCHEMA: dict[str, Any] = {
@@ -452,6 +502,8 @@ async def detect_doc_type(doc: UploadedDoc) -> TypeCorrectnessFinding:
     except (TypeError, ValueError):
         confidence = 0.0
     confidence = max(0.0, min(1.0, confidence))
+    hm = parsed.get("has_meterai")
+    has_meterai = hm if isinstance(hm, bool) else None
 
     return TypeCorrectnessFinding(
         file=doc.filename,
@@ -460,6 +512,7 @@ async def detect_doc_type(doc: UploadedDoc) -> TypeCorrectnessFinding:
         detected_type=detected,
         confidence=confidence,
         matches=(detected == claimed_canonical),
+        has_meterai=has_meterai,
     )
 
 
@@ -662,9 +715,25 @@ def _build_issues(
         elif f.detected_type == "Unknown" and f.note:
             issues.append(Issue(
                 id=f"type:unreadable:{f.file_id}",
-                severity=SEVERITY_LOW,
+                severity=SEVERITY_MEDIUM,
                 title=f"Tidak dapat membaca dokumen: {f.file}",
                 detail=f.note,
+            ))
+
+        # Meterai check — a sign-required document (Pakta Integritas / Surat
+        # Permohonan / Surat Pesanan) that Vision READ but where no meterai is
+        # visible. Guarded on `has_meterai is False` so we never flag a doc we
+        # couldn't actually read (has_meterai stays None then).
+        if f.detected_type in _METERAI_REQUIRED_CLASSES and f.has_meterai is False:
+            issues.append(Issue(
+                id=f"meterai:missing:{f.file_id}",
+                severity=SEVERITY_HIGH,
+                title=f"Meterai belum terlihat: {f.file}",
+                detail=(
+                    f"Dokumen '{f.file}' ({f.detected_type.replace('_', ' ')}) "
+                    "wajib ditandatangani dan dibubuhi meterai Rp10.000 "
+                    "(e-meterai atau meterai tempel) sebelum diajukan."
+                ),
             ))
 
     for f in suit_findings:
