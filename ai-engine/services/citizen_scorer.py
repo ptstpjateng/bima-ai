@@ -171,16 +171,49 @@ def _sign_signal_suffix(f) -> str:
     return f" — {', '.join(parts)}" if parts else ""
 
 
+def _dedup_type_findings(
+    findings: list[TypeCorrectnessFinding],
+) -> list[TypeCorrectnessFinding]:
+    """Collapse findings detected as the SAME document class into one line.
+
+    Re-uploads (a citizen sends KTP twice, or a fixed copy) yield several
+    findings of the same class; the checklist should show that class ONCE.
+    We keep the BEST/LATEST per class: iterating in order, a later finding of
+    the same known class REPLACES the earlier one (last wins → the latest
+    upload), preferring a match over a non-match on ties. "Unknown"/"Other"
+    (and unclassifiable free-text docs) are never collapsed — each may be a
+    genuinely different attachment, so they pass through untouched.
+    """
+    best: "dict[str, TypeCorrectnessFinding]" = {}
+    passthrough: list[TypeCorrectnessFinding] = []
+    order: list[str] = []
+    for f in findings:
+        cls = f.detected_type
+        if cls in ("Unknown", "Other", ""):
+            passthrough.append(f)
+            continue
+        prev = best.get(cls)
+        # Keep the latest; but never let a non-match overwrite an existing match
+        # (a good read shouldn't be hidden by a later bad one of the same class).
+        if prev is None or f.matches or not prev.matches:
+            best[cls] = f
+        if cls not in order:
+            order.append(cls)
+    # Preserve first-seen ordering of collapsed classes, then the passthroughs.
+    return [best[c] for c in order] + passthrough
+
+
 def _type_lines(result: SuitabilityResult) -> list[str]:
     """One clean line per document — lead with the detected type (or, for an
     unenumerated doc BIMA could still read, its free-text `document_name`), add
     a compact legal-validity indicator for the sign-required docs, and only
     surface the (shortened) filename when there is something to fix.
     Mismatches/unreadable are still detailed in the issues list; this block is
-    the "what BIMA read" at-a-glance.
+    the "what BIMA read" at-a-glance. Duplicate uploads of the same document
+    class are collapsed to a single line (best/latest kept).
     """
     lines: list[str] = []
-    for f in result.type_correctness:
+    for f in _dedup_type_findings(result.type_correctness):
         if f.detected_type in ("Unknown", ""):
             lines.append(f"- _{_short(f.file)}_: tidak terbaca — unggah ulang yang jelas")
             continue

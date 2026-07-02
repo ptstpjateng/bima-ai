@@ -210,6 +210,11 @@ _NUMERIC_PICK_RE = re.compile(r"^\s*(\d{1,2})\s*$")
 # working. What changed is HOW they get populated: from the KTP / NIB / msisdn.
 # ===========================================================================
 
+# The standard confirm-to-submit question. Only asked once a packet has ZERO
+# blocking issues (the hard gate has passed). Kept as one constant so the
+# consolidated reply and every CONFIRM re-prompt phrase it identically.
+_CONFIRM_QUESTION = "Apakah Bapak/Ibu yakin ingin saya ajukan sekarang?"
+
 _FIELD_KEYS = ("applicant_name", "nik", "business_name", "phone")
 
 _FIELD_LABEL = {
@@ -905,14 +910,22 @@ async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]
         )
         return None
 
+    from services.agents import suitability_judge
+
     ready = citizen_scorer.is_submission_ready(result)
     percent = int(round(result.overall_suitability_score * 100))
     message = citizen_scorer.render_score_message(result, license_name=sess.license_name)
     issues = [{"severity": i.severity, "message": i.title} for i in result.issues]
+    # HARD-block issues: a missing mandatory doc, a wrong-type doc, or a
+    # sign-doc missing its meterai/ttd/stamp. These are non-overridable — the
+    # flow refuses to offer submission and "ajukan apa adanya" can't bypass
+    # them (soft/content-only shortfalls are NOT included here).
+    blocking = suitability_judge.blocking_issues(result)
+    blocking_msgs = [{"severity": i.severity, "message": i.title} for i in blocking]
     logger.info(
         "Guided-submission content-score | user=%s | license_id=%s | "
-        "percent=%d | ready=%s | issues=%d",
-        _mask(sess.user_id), license_id, percent, ready, len(issues),
+        "percent=%d | ready=%s | issues=%d | blocking=%d",
+        _mask(sess.user_id), license_id, percent, ready, len(issues), len(blocking),
     )
     return {
         "ok": ready,
@@ -921,6 +934,7 @@ async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]
         "summary": message,
         "message": message,
         "issues": issues,
+        "blocking": blocking_msgs,
         "result": result,
     }
 
@@ -1092,20 +1106,126 @@ def _data_readback_lines(sess: SubmissionSession) -> list[str]:
     ]
 
 
-def _fmt_confirm_message(sess: SubmissionSession, score: Optional[dict[str, Any]]) -> str:
-    """The consolidated, warm reply after the upload burst settles: how many
-    docs / completeness / score + the data read back (NIK masked) + a natural
-    confirmation question. The score's own rendered message carries the
-    per-document detail; we add the warm framing + the read-back + the question.
+# ===========================================================================
+# Hard gate — BLOCKING issues must be fixed before BIMA offers submission.
+# ===========================================================================
+
+def _blocking_from_score(score: Optional[dict[str, Any]]) -> list[dict[str, str]]:
+    """Extract the HARD-block issues from a normalised score dict.
+
+    Prefers the rich `result` (a SuitabilityResult) when present; falls back to
+    the JSON-safe `blocking` list that survives a Redis rehydrate. Returns a
+    list of {severity, message} dicts (possibly empty). Never raises.
     """
+    if not isinstance(score, dict):
+        return []
+    result = score.get("result")
+    if result is not None:
+        try:
+            from services.agents import suitability_judge
+            return [
+                {"severity": i.severity, "message": i.title}
+                for i in suitability_judge.blocking_issues(result)
+            ]
+        except Exception:  # pragma: no cover — defensive; fall back to the trim
+            logger.debug("blocking_issues from result failed", exc_info=True)
+    return list(score.get("blocking") or [])
+
+
+def _sla_reminder(sess: SubmissionSession) -> Optional[str]:
+    """Officer-grounded SLA line, sourced from the session's siap_get_requirements
+    fetch. None when the licence has no recorded SLA."""
+    if sess.sla_working_days:
+        return f"Estimasi jangka waktu penerbitan: {sess.sla_working_days} hari kerja."
+    return None
+
+
+def _procedural_reminders(score: Optional[dict[str, Any]]) -> list[str]:
+    """Format/submission reminders derived from the registry's procedural notes
+    (e.g. 'scan asli PDF, maks 250 MB'). Sourced from the rich result when
+    present; empty otherwise. Kept concise + WhatsApp-friendly."""
+    if not isinstance(score, dict):
+        return []
+    result = score.get("result")
+    notes = list(getattr(result, "procedural_notes", None) or []) if result else []
+    if not notes:
+        return []
+    # Distil to ONE friendly reminder rather than echoing raw registry lines.
+    # The canonical PPKP note is the scan-asli-PDF-250MB format rule; if that
+    # shape is present, phrase it warmly, else pass the notes through trimmed.
+    joined = " ".join(notes).lower()
+    if "scan" in joined and ("pdf" in joined or "mb" in joined):
+        return ["Pastikan tiap berkas berupa scan asli PDF, maks 250 MB."]
+    # Fallback: surface the substantive notes (drop bare "Persyaratan :" headers).
+    out: list[str] = []
+    for n in notes:
+        t = n.strip().rstrip(":").strip()
+        low = t.lower()
+        if low in ("persyaratan", "keterangan", "catatan", "ketentuan") or not t:
+            continue
+        out.append(t)
+    return out[:2]
+
+
+def _fmt_blocking_guidance(
+    sess: SubmissionSession, score: Optional[dict[str, Any]], blocking: list[dict[str, str]]
+) -> str:
+    """The BLOCKED reply: list exactly what's missing/wrong + how to fix, plus
+    the SLA + format reminders. NEVER offers submission — ends by inviting the
+    citizen to complete and resend. Stays in COLLECTING_DOCS (the caller sets
+    the stage). Officer-grounded, warm, WhatsApp-friendly, emoji-free.
+    """
+    pct = score.get("score_percent") if isinstance(score, dict) else None
+    lines: list[str] = []
+    head = "Baik Bapak/Ibu, dokumennya sudah kami terima"
+    if pct is not None:
+        head += f", dengan estimasi kelayakan {pct}%"
+    head += ". Namun masih ada yang perlu dilengkapi/diperbaiki sebelum bisa diajukan:"
+    lines.append(head)
+
+    lines.append("")
+    for b in blocking:
+        msg = mask_pii(str(b.get("message", "")).strip())
+        if msg:
+            lines.append(f"- {msg}")
+
+    sla = _sla_reminder(sess)
+    reminders = _procedural_reminders(score)
+    if sla or reminders:
+        lines.append("")
+        if sla:
+            lines.append(sla)
+        for rem in reminders:
+            lines.append(rem)
+
+    lines += ["", "Silakan lengkapi lalu kirim lagi ya."]
+    return "\n".join(lines).rstrip()
+
+
+def _fmt_confirm_message(sess: SubmissionSession, score: Optional[dict[str, Any]]) -> str:
+    """The consolidated, warm reply after the upload burst settles.
+
+    HARD GATE: if there is ANY blocking issue (a missing mandatory document, a
+    wrong-type document, or a sign-doc missing its meterai/ttd/stamp), BIMA does
+    NOT offer submission — it lists what's missing/wrong + how to fix and asks
+    the citizen to complete first. Only a ZERO-blocking packet gets the "apakah
+    ingin saya ajukan sekarang?" offer. A sub-threshold packet with everything
+    present+valid may still be offered as a SOFT warning.
+    """
+    blocking = _blocking_from_score(score)
+    if blocking:
+        # Blocked — no submit offer, no "apa adanya" path. The caller keeps the
+        # session at COLLECTING_DOCS so a re-upload/typed fix continues the flow.
+        return _fmt_blocking_guidance(sess, score, blocking)
+
     pct = score.get("score_percent") if isinstance(score, dict) else None
     complete = bool(score and score.get("ok"))
 
     lines: list[str] = []
     if complete:
         head = (
-            "Baik Bapak/Ibu, dokumen sudah kami terima dan sudah lengkap "
-            "sesuai persyaratan"
+            "Baik Bapak/Ibu, semua dokumen wajib sudah lengkap & sesuai "
+            "persyaratan"
         )
         if pct is not None:
             head += f", dengan estimasi kelayakan {pct}%"
@@ -1125,17 +1245,26 @@ def _fmt_confirm_message(sess: SubmissionSession, score: Optional[dict[str, Any]
 
     lines += [""] + _data_readback_lines(sess)
 
+    # Officer grounding — SLA + format reminders on the confirm path too.
+    sla = _sla_reminder(sess)
+    reminders = _procedural_reminders(score)
+    if sla or reminders:
+        lines.append("")
+        if sla:
+            lines.append(sla)
+        for rem in reminders:
+            lines.append(rem)
+
     if complete:
-        lines += [
-            "",
-            "Apakah Bapak/Ibu yakin untuk mengajukan izin ini sekarang?",
-        ]
+        lines += ["", _CONFIRM_QUESTION]
     else:
+        # No blocking issues, but a soft (content-only) shortfall — submittable
+        # with an explicit confirmation. This is NOT a hard block.
         lines += [
             "",
-            "Jika berkenan, Bapak/Ibu bisa melengkapi atau memperbaiki dokumen "
-            "di atas lalu mengirimnya lagi. Atau jika ingin tetap mengajukan apa "
-            "adanya, beri tahu saya saja.",
+            "Semua dokumen wajib sudah ada. Bapak/Ibu bisa melengkapi/memperbaiki "
+            "dulu lalu kirim lagi, atau jika ingin tetap saya ajukan sekarang, "
+            "beri tahu saya saja.",
         ]
     return "\n".join(lines).rstrip()
 
@@ -1308,6 +1437,23 @@ async def _process_collected_documents(sess: SubmissionSession) -> str:
         )
         return _ask_missing_field(sess, missing)
 
+    # HARD GATE — if a blocking issue exists (missing mandatory doc / wrong
+    # type / sign-doc missing meterai-ttd-stamp), BIMA must NOT offer to submit.
+    # Stay at COLLECTING_DOCS and guide the citizen to complete first; a later
+    # re-upload re-arms the debounce and re-runs this pass.
+    blocking = _blocking_from_score(score)
+    if blocking:
+        sess.stage = Stage.COLLECTING_DOCS
+        # Not an override situation — clear any stale soft-override flag.
+        sess.override_offered = False
+        sess.touch()
+        await _put_session(sess)
+        logger.info(
+            "Guided-submission BLOCKED after scoring | user=%s | blocking=%d",
+            _mask(sess.user_id), len(blocking),
+        )
+        return _fmt_blocking_guidance(sess, score, blocking)
+
     sess.stage = Stage.CONFIRM
     sess.touch()
     await _put_session(sess)
@@ -1339,8 +1485,29 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
         result = score
     else:
         result = {"ok": False, "status": "unverified", "score_percent": 0,
-                  "message": "", "issues": []}
+                  "message": "", "issues": [], "blocking": []}
 
+    # HARD GATE — a blocking issue (missing mandatory doc / wrong-type doc /
+    # sign-doc missing meterai-ttd-stamp) is NON-OVERRIDABLE. Even a forced
+    # AFFIRM ("ajukan apa adanya") cannot bypass it: BIMA lists what's missing
+    # and stays collecting until it's fixed. This is the core verificator gate.
+    blocking = _blocking_from_score(result)
+    if blocking:
+        sess.stage = Stage.COLLECTING_DOCS
+        # Reset any prior soft-override offer — the packet is now hard-blocked,
+        # so a later AFFIRM must not force-submit past it.
+        sess.override_offered = False
+        sess.touch()
+        await _put_session(sess)
+        logger.info(
+            "Guided-submission BLOCKED at submit | user=%s | blocking=%d",
+            _mask(sess.user_id), len(blocking),
+        )
+        return _fmt_blocking_guidance(sess, result, blocking)
+
+    # SOFT shortfall — everything mandatory is present+valid but the content
+    # score is sub-threshold. Offer "ajukan apa adanya" once; the next AFFIRM
+    # force-submits (no submit dead-end).
     if not result.get("ok") and not force:
         sess.stage = Stage.CONFIRM
         sess.override_offered = True
@@ -1351,8 +1518,9 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
         )
         return (
             body
-            + "\n\nKalau Bapak/Ibu ingin tetap mengajukan apa adanya, beri tahu "
-            "saya saja, atau silakan lengkapi dulu dokumennya lalu kirim lagi."
+            + "\n\nSemua dokumen wajib sudah ada. Kalau Bapak/Ibu ingin tetap "
+            "mengajukan apa adanya, beri tahu saya saja, atau silakan lengkapi "
+            "dulu lalu kirim lagi."
         )
 
     # --- Step 2: submit to SIAP ---
@@ -1517,7 +1685,7 @@ async def _handle_confirm(sess: SubmissionSession, message: str) -> str:
         if applied:
             lines = ["Baik, sudah saya perbarui."]
             lines += [""] + _data_readback_lines(sess)
-            lines += ["", "Apakah Bapak/Ibu yakin untuk mengajukan izin ini sekarang?"]
+            lines += ["", _CONFIRM_QUESTION]
             return "\n".join(lines)
         # Couldn't parse a concrete correction — ask what to fix.
         return (
@@ -1528,10 +1696,7 @@ async def _handle_confirm(sess: SubmissionSession, message: str) -> str:
 
     if intent == submission_intent.QUESTION:
         answer = await _answer_confirm_question(sess, message)
-        return (
-            f"{answer}\n\n"
-            "Apakah Bapak/Ibu yakin untuk mengajukan izin ini sekarang?"
-        )
+        return f"{answer}\n\n{_CONFIRM_QUESTION}"
 
     # UNCLEAR → gentle clarifier (re-anchor with a compact score reminder).
     return (

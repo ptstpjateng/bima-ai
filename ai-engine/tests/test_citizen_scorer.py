@@ -303,6 +303,79 @@ class TestNameAnyDocument(unittest.TestCase):
         self.assertIn("cap belum terlihat", msg)
 
 
+class TestDedupChecklist(unittest.TestCase):
+    """Re-uploads of the SAME document class collapse to ONE checklist line —
+    no class appears twice in 'Dokumen yang terbaca'."""
+
+    def test_duplicate_ktp_collapses_to_one_line(self):
+        res = _result(
+            type_correctness=[
+                TypeCorrectnessFinding(
+                    file="ktp1.jpg", file_id="d1", claimed_type="KTP",
+                    detected_type="KTP", confidence=0.9, matches=True,
+                ),
+                TypeCorrectnessFinding(
+                    file="ktp2.jpg", file_id="d2", claimed_type="KTP",
+                    detected_type="KTP", confidence=0.95, matches=True,
+                ),
+                TypeCorrectnessFinding(
+                    file="ktp3.jpg", file_id="d3", claimed_type="KTP",
+                    detected_type="KTP", confidence=0.8, matches=True,
+                ),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        # The type block shows the KTP class exactly once.
+        block = msg.split("*Dokumen yang terbaca:*", 1)[-1]
+        self.assertEqual(block.count("*KTP*"), 1)
+
+    def test_dedup_keeps_match_over_later_nonmatch(self):
+        # A good KTP read followed by a bad one of the same class → the good
+        # (match) read is kept, so the checklist doesn't show a spurious conflict.
+        findings = [
+            TypeCorrectnessFinding(
+                file="ktp_good.jpg", file_id="d1", claimed_type="KTP",
+                detected_type="KTP", confidence=0.95, matches=True,
+            ),
+            TypeCorrectnessFinding(
+                file="ktp_bad.jpg", file_id="d2", claimed_type="Surat_Domisili",
+                detected_type="KTP", confidence=0.6, matches=False,
+            ),
+        ]
+        deduped = cs._dedup_type_findings(findings)
+        self.assertEqual(len(deduped), 1)
+        self.assertTrue(deduped[0].matches)
+
+    def test_dedup_never_collapses_unknown_or_other(self):
+        # Two 'Other' docs and two 'Unknown' docs are distinct attachments —
+        # they must NOT be collapsed together.
+        findings = [
+            TypeCorrectnessFinding(file="a.pdf", file_id="d1", claimed_type="Other",
+                                   detected_type="Other", confidence=0.5, matches=False),
+            TypeCorrectnessFinding(file="b.pdf", file_id="d2", claimed_type="Other",
+                                   detected_type="Other", confidence=0.5, matches=False),
+            TypeCorrectnessFinding(file="c.pdf", file_id="d3", claimed_type="KTP",
+                                   detected_type="Unknown", confidence=0.1, matches=False),
+            TypeCorrectnessFinding(file="d.pdf", file_id="d4", claimed_type="KTP",
+                                   detected_type="Unknown", confidence=0.1, matches=False),
+        ]
+        deduped = cs._dedup_type_findings(findings)
+        self.assertEqual(len(deduped), 4)
+
+    def test_distinct_classes_all_shown(self):
+        res = _result(
+            type_correctness=[
+                TypeCorrectnessFinding(file="ktp.jpg", file_id="d1", claimed_type="KTP",
+                                       detected_type="KTP", confidence=0.9, matches=True),
+                TypeCorrectnessFinding(file="nib.pdf", file_id="d2", claimed_type="NIB",
+                                       detected_type="NIB", confidence=0.9, matches=True),
+            ]
+        )
+        msg = cs.render_score_message(res)
+        self.assertIn("*KTP*", msg)
+        self.assertIn("*NIB*", msg)
+
+
 class TestMaskPiiUnit(unittest.TestCase):
     """Direct unit cover for the reusable `services.pii.mask_pii` helper."""
 

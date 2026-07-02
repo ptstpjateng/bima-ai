@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -153,7 +154,7 @@ class UploadedDoc:
 class CompletenessSection:
     score: float                  # 0.0-1.0 → fraction of required types present
     missing: list[str]            # required doc types absent from the upload set
-    required: list[str]           # full required list from the registry
+    required: list[str]           # DOCUMENT requirements only (procedural notes excluded)
     note: Optional[str] = None    # set when the registry was unavailable
 
 
@@ -198,6 +199,10 @@ class SuitabilityResult:
     compatibility_findings: list[Issue]      # passed through from v1 validator
     overall_suitability_score: float         # 0.0-1.0 unified score
     issues: list[Issue]                      # prioritized merged issue list
+    # Format/submission/SLA guidance lines from the registry — surfaced as
+    # reminders, NEVER content-checked and NEVER counted in completeness.
+    # Additive with a default so every existing caller / test still works.
+    procedural_notes: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +301,80 @@ async def get_license_requirements(license_id: int) -> tuple[list[str], Optional
 def _registry_cache_clear() -> None:
     """Test helper — clear the in-process registry cache."""
     _registry_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Requirement classification — DOCUMENT vs PROCEDURAL NOTE.
+#
+# The SIAP HTML requirements blob mixes two very different kinds of line:
+#
+#   * DOCUMENT requirements — an actual file the citizen must supply
+#     ("KTP Pemilik", "Pakta Integritas", "Gambar rancang bangun kapal").
+#     These are checkable: BIMA can detect their type and judge their content.
+#
+#   * PROCEDURAL NOTES — format/submission/SLA/validity/obligation guidance
+#     that is NOT a document ("Persyaratan :", "Keterangan : Berkas syarat
+#     permohonan merupakan scan ASLI dokumen dalam bentuk soft file (pdf max
+#     250 mb)"). Content-checking these produces gibberish — Gemini is asked
+#     "does this document satisfy 'the files must be a PDF max 250 MB'?" and
+#     answers about the document's own format, which is meaningless.
+#
+# We only ever content-verify DOCUMENT requirements. Procedural notes are
+# surfaced separately (as guidance reminders) but never scored, never a
+# finding, and never counted in the completeness denominator.
+# ---------------------------------------------------------------------------
+
+# Lines that OPEN with one of these words are section headers / free-text
+# notes, not documents (case-insensitive, allows a trailing ":" ).
+_PROCEDURAL_PREFIXES = (
+    "keterangan",
+    "persyaratan",
+    "catatan",
+    "ketentuan",
+)
+
+# Format / submission / SLA / validity / obligation keywords. A requirement
+# line matching any of these describes HOW a berkas is submitted or a rule
+# about it, not a document to check.
+_PROCEDURAL_KEYWORD_RE = re.compile(
+    r"scan|asli|soft\s*file|pdf|ukuran\s+berkas|jangka\s+waktu|hari\s+kerja|"
+    r"masa\s+berlaku|kewajiban|format|\d+\s*mb",
+    re.IGNORECASE,
+)
+
+
+def _is_procedural_note(line: str) -> bool:
+    """True when a registry line is a procedural note / header rather than a
+    document requirement (see the block comment above).
+
+    A line is procedural when it EITHER opens with a header word
+    (Keterangan/Persyaratan/Catatan/Ketentuan) OR contains a
+    format/submission/SLA/validity/obligation keyword. Everything else is a
+    DOCUMENT requirement — the only kind BIMA content-checks.
+    """
+    if not line or not line.strip():
+        return True
+    s = line.strip()
+    low = s.lower()
+    # A leading header word (optionally followed by ":") — e.g. "Persyaratan :"
+    # or "Keterangan : Berkas syarat ...".
+    for prefix in _PROCEDURAL_PREFIXES:
+        if low == prefix or low.startswith(prefix + " ") or low.startswith(prefix + ":"):
+            return True
+    return bool(_PROCEDURAL_KEYWORD_RE.search(low))
+
+
+def split_requirements(requirements: list[str]) -> tuple[list[str], list[str]]:
+    """Split a registry requirement list into (documents, procedural_notes).
+
+    `documents` are the checkable lines (kept in order); `procedural_notes`
+    are the format/submission/SLA guidance lines to surface but never score.
+    """
+    documents: list[str] = []
+    notes: list[str] = []
+    for req in requirements:
+        (notes if _is_procedural_note(req) else documents).append(req)
+    return documents, notes
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +964,38 @@ def _build_issues(
     return issues
 
 
+# Issue-id prefixes that constitute a HARD, non-overridable block on
+# submission: a mandatory document that is missing, a document whose declared
+# vs detected type conflicts (wrong doc filed), or a sign-required document
+# missing its legally-required meterai / signature / company stamp. Everything
+# else (suitability partial/mismatch on content, unreadable-medium, low-info)
+# is a SOFT warning the citizen may still choose to submit past.
+_BLOCKING_ISSUE_PREFIXES = (
+    "completeness:missing:",
+    "type:mismatch:",
+    "meterai:missing:",
+    "signature:missing:",
+    "stamp:missing:",
+)
+
+
+def is_blocking_issue(issue: Issue) -> bool:
+    """True when an issue is a HARD block on submission (see prefixes above)."""
+    return any(issue.id.startswith(p) for p in _BLOCKING_ISSUE_PREFIXES)
+
+
+def blocking_issues(result: SuitabilityResult) -> list[Issue]:
+    """The subset of `result.issues` that HARD-blocks submission.
+
+    A missing mandatory document, a wrong-type document, or a sign-doc missing
+    its meterai/signature/stamp must be fixed before BIMA offers to file —
+    "ajukan apa adanya" may not override these. Content-only shortfalls
+    (suitability partial/mismatch) are left out so a low % with everything
+    present+valid can still be submitted as a soft warning.
+    """
+    return [i for i in result.issues if is_blocking_issue(i)]
+
+
 def _match_doc_for_requirement(
     requirement: str,
     docs: list[UploadedDoc],
@@ -927,7 +1038,13 @@ async def judge_submission(
     compatibility_findings = list(compatibility_findings or [])
 
     # Registry first — needed for both completeness AND suitability.
-    requirements, registry_note = await get_license_requirements(license_id)
+    raw_requirements, registry_note = await get_license_requirements(license_id)
+
+    # Split the registry into checkable DOCUMENT requirements vs PROCEDURAL
+    # NOTES (format/submission/SLA guidance). Only documents are ever scored;
+    # procedural notes are surfaced as reminders but never content-checked —
+    # this is what kills the "scan ASLI…" gibberish and the false KTP finding.
+    requirements, procedural_notes = split_requirements(raw_requirements)
 
     # Type detection per uploaded doc, in parallel.
     type_findings: list[TypeCorrectnessFinding] = []
@@ -937,9 +1054,9 @@ async def judge_submission(
         )
 
     # Suitability — one prompt per (requirement, best-matching-doc) pair.
-    # We only ask Gemini when we can pair a requirement with a doc; un-
-    # paired requirements are surfaced as completeness gaps, not
-    # suitability questions.
+    # We only ask Gemini when we can pair a DOCUMENT requirement with a doc;
+    # un-paired requirements are surfaced as completeness gaps, not
+    # suitability questions. Procedural notes are excluded entirely.
     suitability_tasks: list[tuple[str, UploadedDoc]] = []
     for req in requirements:
         doc = _match_doc_for_requirement(req, documents, type_findings)
@@ -981,11 +1098,12 @@ async def judge_submission(
     issues.sort(key=lambda i: severity_rank.get(i.severity, 99))
 
     logger.info(
-        "judge_submission | license_id=%s docs=%d reqs=%d "
+        "judge_submission | license_id=%s docs=%d reqs=%d notes=%d "
         "complete=%.3f type=%.3f suit=%.3f overall=%.3f issues=%d",
         license_id,
         len(documents),
         len(requirements),
+        len(procedural_notes),
         completeness.score,
         type_score,
         suit_score,
@@ -1000,4 +1118,5 @@ async def judge_submission(
         compatibility_findings=compatibility_findings,
         overall_suitability_score=overall,
         issues=issues,
+        procedural_notes=procedural_notes,
     )

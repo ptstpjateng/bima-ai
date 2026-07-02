@@ -63,11 +63,15 @@ _ensure_stub("httpx")  # gemini_vision imports httpx at module level
 from services.agents import suitability_judge as sj  # noqa: E402
 from services.agents.suitability_judge import (  # noqa: E402
     UploadedDoc,
+    blocking_issues,
     detect_doc_type,
+    is_blocking_issue,
     judge_submission,
     judge_suitability,
+    split_requirements,
     _canonical_class,
     _completeness,
+    _is_procedural_note,
     _requirement_implies_class,
     _suitability_avg_score,
     _type_avg_score,
@@ -151,6 +155,100 @@ class TestCanonicalClass(unittest.TestCase):
             _requirement_implies_class("Salinan Sertifikat Tanah"), "Sertifikat_Tanah"
         )
         self.assertIsNone(_requirement_implies_class("Pas foto warna 3x4"))
+
+
+# ===========================================================================
+# Requirement classification — DOCUMENT vs PROCEDURAL NOTE.
+# The "scan ASLI…" line and the bare "Persyaratan :" header must be NOTES
+# (never content-checked, never a finding, never in the completeness count).
+# ===========================================================================
+
+class TestRequirementClassification(unittest.TestCase):
+
+    # The 10 lines license 459 (PPKP) actually yields from siap_get_requirements.
+    _LICENSE_459_LINES = [
+        "Persyaratan :",
+        "Pakta Integritas",
+        "Permohonan PPKP",
+        "SIUP OSS",
+        "KTP Pemilik / Penanggung Jawab Perusahaan",
+        "Gambar rancang bangun kapal",
+        "Surat pesanan atau kontrak pemilik kapal dengan galangan",
+        "Spesifikasi teknis alat penangkapan ikan",
+        "Surat Persetujuan penggunaan nama kapal",
+        "Keterangan : Berkas syarat permohonan merupakan scan ASLI dokumen "
+        "dalam bentuk soft file (pdf max 250 mb)",
+    ]
+
+    def test_headers_are_procedural(self):
+        for line in ("Persyaratan :", "Keterangan:", "Catatan : harap diperhatikan",
+                     "Ketentuan lain"):
+            self.assertTrue(_is_procedural_note(line), line)
+
+    def test_format_keyword_lines_are_procedural(self):
+        # The exact gibberish-causing line, plus other format/SLA/validity notes.
+        procedural = [
+            "Keterangan : Berkas syarat permohonan merupakan scan ASLI dokumen "
+            "dalam bentuk soft file (pdf max 250 mb)",
+            "Dokumen harus discan asli (soft file PDF max 250 MB)",
+            "Jangka waktu penerbitan 7 hari kerja",
+            "Masa berlaku 5 tahun",
+            "Ukuran berkas maksimal 250 MB",
+        ]
+        for line in procedural:
+            self.assertTrue(_is_procedural_note(line), line)
+
+    def test_real_documents_are_not_procedural(self):
+        documents = [
+            "Pakta Integritas",
+            "KTP Pemilik / Penanggung Jawab Perusahaan",
+            "Gambar rancang bangun kapal",
+            "Surat pesanan atau kontrak pemilik kapal dengan galangan",
+            "Surat Persetujuan penggunaan nama kapal",
+        ]
+        for line in documents:
+            self.assertFalse(_is_procedural_note(line), line)
+
+    def test_license_459_splits_8_documents_2_notes(self):
+        docs, notes = split_requirements(self._LICENSE_459_LINES)
+        self.assertEqual(len(docs), 8, docs)
+        self.assertEqual(len(notes), 2, notes)
+        # The "scan ASLI" line is a NOTE, not a document.
+        self.assertTrue(any("scan ASLI" in n for n in notes))
+        # KTP is a DOCUMENT, not a note.
+        self.assertTrue(any("KTP" in d for d in docs))
+        self.assertFalse(any("KTP" in n for n in notes))
+
+    def test_scan_asli_line_never_content_checked(self):
+        # judge_submission must expose the scan-ASLI note under procedural_notes
+        # and NEVER raise a suitability finding for it. Registry returns the full
+        # 10 lines; only the 8 documents get a completeness denominator.
+        docs = [_doc("u1", "KTP")]
+        with patch(
+            "services.agents.suitability_judge.get_license_requirements",
+            new=AsyncMock(return_value=(self._LICENSE_459_LINES, None)),
+        ), patch(
+            "services.agents.suitability_judge.vision_configured",
+            return_value=True,
+        ), patch(
+            "services.agents.suitability_judge.extract_structured",
+            new=AsyncMock(return_value={"detected_type": "KTP", "confidence": 0.9}),
+        ):
+            result = _run(judge_submission(license_id=459, documents=docs))
+
+        # 8 document requirements → denominator is 8, not 10.
+        self.assertEqual(len(result.completeness.required), 8)
+        # Procedural notes surfaced separately.
+        self.assertEqual(len(result.procedural_notes), 2)
+        self.assertTrue(any("scan ASLI" in n for n in result.procedural_notes))
+        # No suitability finding — and crucially NO issue — mentions the
+        # scan-ASLI note or the bare Persyaratan header.
+        for f in result.suitability:
+            self.assertNotIn("scan ASLI", f.requirement)
+            self.assertNotIn("Persyaratan :", f.requirement)
+        for i in result.issues:
+            self.assertNotIn("scan ASLI", i.title)
+            self.assertNotIn("scan ASLI", i.detail)
 
 
 # ===========================================================================
@@ -567,6 +665,54 @@ class TestValiditySignals(unittest.TestCase):
         self.assertIn("signature:missing:9", ids)
         self.assertIn("stamp:missing:9", ids)
         self.assertNotIn("meterai:missing:9", ids)
+
+
+# ===========================================================================
+# Blocking-issue classification — the hard-gate primitive.
+# ===========================================================================
+
+class TestBlockingIssues(unittest.TestCase):
+
+    def _res(self, issues):
+        return sj.SuitabilityResult(
+            completeness=sj.CompletenessSection(score=1.0, missing=[], required=["KTP"]),
+            type_correctness=[],
+            suitability=[],
+            compatibility_findings=[],
+            overall_suitability_score=0.9,
+            issues=issues,
+        )
+
+    def test_missing_doc_blocks(self):
+        i = sj.Issue(id="completeness:missing:KTP", severity="critical",
+                     title="Dokumen wajib belum diunggah: KTP", detail="d")
+        self.assertTrue(is_blocking_issue(i))
+
+    def test_type_mismatch_blocks(self):
+        i = sj.Issue(id="type:mismatch:1", severity="high", title="x", detail="d")
+        self.assertTrue(is_blocking_issue(i))
+
+    def test_meterai_signature_stamp_block(self):
+        for iid in ("meterai:missing:1", "signature:missing:1", "stamp:missing:1"):
+            self.assertTrue(is_blocking_issue(
+                sj.Issue(id=iid, severity="high", title="x", detail="d")), iid)
+
+    def test_soft_issues_do_not_block(self):
+        # Content-only shortfalls + informational issues are NOT blocking.
+        for iid in ("suitability:partial:1:x", "suitability:mismatch:1:x",
+                    "type:unreadable:1", "compat:name_ktp_vs_nib"):
+            self.assertFalse(is_blocking_issue(
+                sj.Issue(id=iid, severity="high", title="x", detail="d")), iid)
+
+    def test_blocking_issues_filters(self):
+        issues = [
+            sj.Issue(id="completeness:missing:NPWP", severity="critical", title="a", detail="d"),
+            sj.Issue(id="suitability:partial:2:x", severity="medium", title="b", detail="d"),
+            sj.Issue(id="meterai:missing:3", severity="high", title="c", detail="d"),
+        ]
+        blk = blocking_issues(self._res(issues))
+        ids = {i.id for i in blk}
+        self.assertEqual(ids, {"completeness:missing:NPWP", "meterai:missing:3"})
 
 
 # ===========================================================================

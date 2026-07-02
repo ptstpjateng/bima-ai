@@ -316,6 +316,46 @@ class TestGenerateOnRequest(unittest.TestCase):
         self.assertEqual(s.stage, Stage.CONFIRM)   # stage unchanged
 
 
+class TestGuideReconcilesWithSiap(unittest.TestCase):
+    """The curated PPKP guide's 8 requirements must map onto exactly the 8 SIAP
+    DOCUMENT requirements (the 2 procedural notes excluded) — same doc classes.
+    A drift on either side would silently mis-score a real packet."""
+
+    # The 10 lines license 459 yields from siap_get_requirements.
+    _SIAP_459 = [
+        "Persyaratan :",
+        "Pakta Integritas",
+        "Permohonan PPKP",
+        "SIUP OSS",
+        "KTP Pemilik / Penanggung Jawab Perusahaan",
+        "Gambar rancang bangun kapal",
+        "Surat pesanan atau kontrak pemilik kapal dengan galangan",
+        "Spesifikasi teknis alat penangkapan ikan",
+        "Surat Persetujuan penggunaan nama kapal",
+        "Keterangan : Berkas syarat permohonan merupakan scan ASLI dokumen "
+        "dalam bentuk soft file (pdf max 250 mb)",
+    ]
+
+    def test_guide_and_siap_doc_classes_match(self):
+        from services.agents.suitability_judge import (
+            split_requirements, _requirement_implies_class,
+        )
+
+        siap_docs, siap_notes = split_requirements(self._SIAP_459)
+        self.assertEqual(len(siap_docs), 8)
+        self.assertEqual(len(siap_notes), 2)
+
+        siap_classes = {_requirement_implies_class(d) for d in siap_docs}
+        guide = license_guides.get_guide(459)
+        guide_classes = {
+            _requirement_implies_class(r["label"]) for r in guide["requirements"]
+        }
+        self.assertEqual(len(guide["requirements"]), 8)
+        self.assertNotIn(None, siap_classes)
+        self.assertNotIn(None, guide_classes)
+        self.assertEqual(guide_classes, siap_classes)
+
+
 class TestScoringAck(unittest.TestCase):
     """Deferred scoring acknowledgment (guided_submission._start_scoring_ack).
 
