@@ -57,9 +57,15 @@ def _ensure_stub(name: str, attrs: dict | None = None) -> None:
 _ensure_stub("asyncpg")
 _ensure_stub("dotenv", {"load_dotenv": lambda *a, **k: None})
 _ensure_stub("httpx")
-# officer_bridge does a local `from services.agents.officer_copilot import
-# get_copilot`; stub it so importing officer_bridge doesn't pull chromadb.
-_ensure_stub("services.agents.officer_copilot", {"get_copilot": lambda: None})
+# officer_bridge imports `services.agents.officer_copilot.get_copilot` lazily
+# (inside maybe_handle_officer_reply), so this suite never touches it. Rather
+# than stubbing the whole copilot module — which would poison sys.modules for a
+# sibling suite in the same process (test_officer_copilot_docsend needs the real
+# `_doc_context`/`send_document`) — we stub only its heavy leaf deps so the REAL
+# module can import cleanly if any test does reach it. Same set the other
+# officer suites use, so all three stay consistent regardless of run order.
+_ensure_stub("services.rag_service", {"query_regulations": lambda *a, **k: []})
+_ensure_stub("services.agents.validator", {"_normalize_name": lambda s: s})
 
 from services import officer_bridge as ob  # noqa: E402
 from services import siap_db  # noqa: E402
@@ -273,7 +279,7 @@ class TestNotifyFlow(unittest.TestCase):
         }
         with patch.dict("os.environ", env, clear=False):
             with patch.object(
-                ob, "_send", new=AsyncMock(return_value=True)
+                ob, "_send_officer_notify", new=AsyncMock(return_value=True)
             ) as send:
                 with patch(
                     "services.siap_db.resolve_step_officers",
@@ -321,7 +327,7 @@ class TestNotifyFlow(unittest.TestCase):
         ob._officer_cache_loaded = True
         ob._officer_cache_at = _t.monotonic()
         with patch.dict("os.environ", env, clear=False):
-            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+            with patch.object(ob, "_send_officer_notify", new=AsyncMock(return_value=True)):
                 with patch(
                     "services.siap_db.resolve_step_officers",
                     new=AsyncMock(return_value=resolution),
@@ -360,7 +366,7 @@ class TestNotifyFlow(unittest.TestCase):
         ob._officer_cache_loaded = True
         ob._officer_cache_at = _t.monotonic()
         with patch.dict("os.environ", env, clear=False):
-            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+            with patch.object(ob, "_send_officer_notify", new=AsyncMock(return_value=True)):
                 with patch(
                     "services.siap_db.resolve_step_officers",
                     new=AsyncMock(return_value=resolution),
@@ -387,7 +393,7 @@ class TestNotifyFlow(unittest.TestCase):
         }
         with patch.dict("os.environ", env, clear=False):
             with patch.object(
-                ob, "_send", new=AsyncMock(return_value=True)
+                ob, "_send_officer_notify", new=AsyncMock(return_value=True)
             ) as send:
                 with patch(
                     "services.siap_db.resolve_step_officers",
@@ -415,7 +421,7 @@ class TestNotifyFlow(unittest.TestCase):
             "officer_whatsapps": [], "group_id": 99, "sort_order": 0,
         }
         with patch.dict("os.environ", env, clear=False):
-            with patch.object(ob, "_send", new=AsyncMock(return_value=True)) as send:
+            with patch.object(ob, "_send_officer_notify", new=AsyncMock(return_value=True)) as send:
                 with patch(
                     "services.siap_db.resolve_step_officers",
                     new=AsyncMock(return_value=empty),

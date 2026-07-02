@@ -292,6 +292,7 @@ def _encode_officer_session(sess: OfficerCaseSession) -> str:
             "filename": d.get("filename", fid),
             "mime_type": d.get("mime_type", "application/octet-stream"),
             "claimed_type": d.get("claimed_type", ""),
+            "detected_type": d.get("detected_type", ""),
             "content_b64": base64.b64encode(d.get("content") or b"").decode("ascii"),
         }
         for fid, d in (sess.documents or {}).items()
@@ -321,6 +322,7 @@ def _decode_officer_session(blob: str) -> OfficerCaseSession:
             "filename": d.get("filename", fid),
             "mime_type": d.get("mime_type", "application/octet-stream"),
             "claimed_type": d.get("claimed_type", ""),
+            "detected_type": d.get("detected_type", ""),
             "content": base64.b64decode(d["content_b64"]) if d.get("content_b64") else b"",
         }
         for fid, d in (raw.get("documents") or {}).items()
@@ -484,6 +486,11 @@ def _documents_digest(score: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
         confidence = getattr(f, "confidence", None)
         doc_name = getattr(f, "document_name", None)
         digest.append({
+            # file_id is an opaque validator/admin-api handle (not PII) — kept
+            # UNMASKED so the copilot can cross-reference the digest back to the
+            # in-session doc bytes (detected_type → doc context) and so a
+            # bytes-gone summary can still be tied to the right document.
+            "file_id": str(getattr(f, "file_id", "") or ""),
             "filename": mask_pii(str(getattr(f, "file", "") or "")),
             "detected_type": mask_pii(str(getattr(f, "detected_type", "") or "")),
             "document_name": mask_pii(str(doc_name)) if doc_name else None,
@@ -501,10 +508,29 @@ def _documents_digest(score: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
     return digest
 
 
-def _documents_for_copilot(documents: list) -> dict[str, dict[str, Any]]:
+def _documents_for_copilot(
+    documents: list,
+    digest: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, dict[str, Any]]:
     """Convert a list of guided_submission.SessionDocument (or anything with
     file_id/filename/mime_type/content/claimed_type attrs) into the dict the
-    copilot's `_doc_context` expects, keyed by file_id."""
+    copilot's `_doc_context` expects, keyed by file_id.
+
+    When the read `digest` is supplied, each doc is enriched with the
+    `detected_type` BIMA read it as (cross-referenced by file_id), so the
+    copilot's `_resolve_doc_ref` can match the officer's "KTP" even when the
+    citizen mislabelled the upload — detected_type is what BIMA actually saw.
+    detected_type values are validator enums (KTP, NIB, …), not PII.
+    """
+    detected_by_fid: dict[str, str] = {}
+    for entry in digest or []:
+        if not isinstance(entry, dict):
+            continue
+        fid = str(entry.get("file_id") or "")
+        det = str(entry.get("detected_type") or "")
+        if fid and det:
+            detected_by_fid[fid] = det
+
     out: dict[str, dict[str, Any]] = {}
     for d in documents or []:
         fid = getattr(d, "file_id", None)
@@ -516,6 +542,7 @@ def _documents_for_copilot(documents: list) -> dict[str, dict[str, Any]]:
             "mime_type": getattr(d, "mime_type", "application/octet-stream"),
             "content": content,
             "claimed_type": getattr(d, "claimed_type", ""),
+            "detected_type": detected_by_fid.get(fid, ""),
         }
     return out
 
@@ -599,13 +626,14 @@ async def notify_officer_of_submission(
         return False
 
     validation = _score_to_validation(score)
-    docs_map = _documents_for_copilot(documents or [])
     # Compact per-doc read digest (Task F) — snapshotted from the rich
     # SuitabilityResult now, before `score["result"]` is dropped for Redis, so
     # "what BIMA read per doc" survives a restart. Threaded onto the validation
     # dict so the copilot's get_validation_summary / get_case_full surface it
-    # (via _validation_context) without a second injection channel.
+    # (via _validation_context) without a second injection channel. Built BEFORE
+    # docs_map so the map can be enriched with each doc's detected_type.
     docs_digest = _documents_digest(score)
+    docs_map = _documents_for_copilot(documents or [], docs_digest)
     if validation is not None and docs_digest:
         validation["documents_digest"] = docs_digest
     brief = _render_brief(
@@ -670,7 +698,11 @@ async def notify_officer_of_submission(
                 documents_digest=list(docs_digest),
             )
             await _put_session(sess)
-            sent = await _send(CHANNEL_WHATSAPP, wa_num, brief)
+            sent = await _send_officer_notify(
+                CHANNEL_WHATSAPP, wa_num,
+                license_name=license_name, ticket=ticket,
+                validation=validation, brief=brief,
+            )
             any_sent = any_sent or sent
             logger.info(
                 "officer notify (flow) | ticket=%s | officer=%s | sent=%s | "
@@ -710,7 +742,11 @@ async def notify_officer_of_submission(
     )
     await _put_session(sess)
 
-    sent = await _send(channel, channel_id, brief)
+    sent = await _send_officer_notify(
+        channel, channel_id,
+        license_name=license_name, ticket=ticket,
+        validation=validation, brief=brief,
+    )
     logger.info(
         "officer notify (fallback env) | ticket=%s | channel=%s | officer=%s | "
         "sent=%s | has_score=%s | docs=%d",
@@ -1008,3 +1044,50 @@ async def _send(channel: str, channel_id: str, body: str) -> bool:
             channel, _mask(channel_id),
         )
         return False
+
+
+# Approved WhatsApp UTILITY template that alerts an officer OUTSIDE the 24h
+# window. A free-form send to a cold officer number bounces with WhatsApp error
+# 131047 ("re-engagement"); a template is the only way in. Body variables (no
+# PII): {{1}} izin, {{2}} tiket, {{3}} skor. Empty name → fall back to free-form.
+_OFFICER_TEMPLATE_NAME = os.getenv("BIMA_OFFICER_TEMPLATE_NAME", "bima_officer_new_submission").strip()
+_OFFICER_TEMPLATE_LANG = os.getenv("BIMA_OFFICER_TEMPLATE_LANG", "id").strip() or "id"
+
+
+async def _send_officer_notify(
+    channel: str,
+    channel_id: str,
+    *,
+    license_name: Optional[str],
+    ticket: str,
+    validation: Optional[dict[str, Any]],
+    brief: str,
+) -> bool:
+    """Deliver the new-submission alert on the officer's channel.
+
+    WhatsApp uses the approved template (`bima_officer_new_submission`) so it
+    reaches a COLD officer number outside the 24h window; the rich, PII-masked
+    brief then arrives when the officer replies (the copilot renders it on the
+    first inbound). Telegram has no such window, so it gets the brief directly.
+    Never raises.
+    """
+    if channel == CHANNEL_WHATSAPP and _OFFICER_TEMPLATE_NAME:
+        pct = (validation or {}).get("score_percent")
+        score_str = f"{pct}%" if isinstance(pct, int) else "-"
+        try:
+            from services.whatsapp_template import send_template
+
+            return await send_template(
+                recipient_phone=channel_id,
+                template_name=_OFFICER_TEMPLATE_NAME,
+                # Exact arity the template was approved with (izin, tiket, skor).
+                body_params=[license_name or "Perizinan", ticket or "-", score_str],
+                language_code=_OFFICER_TEMPLATE_LANG,
+            )
+        except Exception:
+            logger.exception(
+                "officer template send failed | officer=%s", _mask(channel_id)
+            )
+            return False
+    # Telegram, or template disabled → free-form brief.
+    return await _send(channel, channel_id, brief)

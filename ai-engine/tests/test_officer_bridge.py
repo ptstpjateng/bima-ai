@@ -52,10 +52,18 @@ _ensure_stub("asyncpg")
 _ensure_stub("dotenv", {"load_dotenv": lambda *a, **k: None})
 _ensure_stub("httpx")
 
-# Stub the heavy copilot module so officer_bridge's local
-# `from services.agents.officer_copilot import get_copilot` resolves without
-# pulling chromadb / rag_service. Tests override get_copilot per-case.
-_ensure_stub("services.agents.officer_copilot", {"get_copilot": lambda: None})
+# Stub the REAL officer_copilot module's heavy deps (chromadb via rag_service,
+# SIAP clients) so it imports cleanly — rather than stubbing the whole
+# officer_copilot module. Stubbing the module itself would poison sys.modules
+# for any later test in the same process (e.g. test_officer_copilot_docsend),
+# which needs the real `_doc_context` / `send_document` symbols. These are the
+# same fine-grained stubs test_officer_copilot_docsend installs, so the two
+# suites share one consistent (real) copilot module. Tests override
+# get_copilot per-case, so the real module's networked tools never run.
+_ensure_stub("services.rag_service", {"query_regulations": lambda *a, **k: []})
+_ensure_stub("services.siap_client", {"get_siap_client": lambda: None})
+_ensure_stub("services.siap_tools", {"siap_get_status_timeline": None})
+_ensure_stub("services.siap_write_client", {"get_siap_write_client": lambda: None})
 
 from services import officer_bridge as ob  # noqa: E402
 from services.agents import officer_copilot as oc  # noqa: E402
@@ -272,7 +280,10 @@ class TestNotify(unittest.TestCase):
         }
         docs = [_Doc("doc-1", "ktp", "ktp.jpg", "image/jpeg", b"bytes")]
         with patch.dict("os.environ", env, clear=False):
-            with patch.object(ob, "_send", new=AsyncMock(return_value=True)) as send:
+            # Force the free-form fallback (template off) so we can assert the
+            # brief content + masking here; the template path is its own test.
+            with patch.object(ob, "_OFFICER_TEMPLATE_NAME", ""), \
+                    patch.object(ob, "_send", new=AsyncMock(return_value=True)) as send:
                 sent = _run(ob.notify_officer_of_submission(
                     ticket="000123456", request_id=42, license_id=358,
                     license_name="Izin Penelitian", applicant_name="Budi Santoso",
@@ -296,6 +307,41 @@ class TestNotify(unittest.TestCase):
         self.assertIn("72%", brief)
         # applicant name MASKED in the brief — full name must not appear.
         self.assertNotIn("Budi Santoso", brief)
+
+    def test_wa_notify_uses_approved_template(self):
+        # Default WhatsApp officer-notify goes out as the APPROVED template so it
+        # reaches a COLD officer number (bypassing the 24h window / 131047). Vars
+        # are izin/tiket/skor only — never PII.
+        import types as _types
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "628999000111",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        calls: list = []
+
+        async def _fake_send_template(**kw):
+            calls.append(kw)
+            return True
+
+        fake_wt = _types.ModuleType("services.whatsapp_template")
+        fake_wt.send_template = _fake_send_template
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_OFFICER_TEMPLATE_NAME", "bima_officer_new_submission"):
+                with patch.dict("sys.modules", {"services.whatsapp_template": fake_wt}):
+                    sent = _run(ob.notify_officer_of_submission(
+                        ticket="000123456", request_id=42, license_id=459,
+                        license_name="PKPP", applicant_name="Budi Santoso",
+                        score=_score_dict(percent=92), documents=[],
+                    ))
+        self.assertTrue(sent)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["template_name"], "bima_officer_new_submission")
+        self.assertEqual(list(calls[0]["body_params"]), ["PKPP", "000123456", "92%"])
+        # No PII in template variables.
+        self.assertNotIn("Budi Santoso", " ".join(map(str, calls[0]["body_params"])))
+        # Session still registered so the officer's reply reaches the copilot.
+        self.assertIsNotNone(ob._sessions.get("628999000111"))
 
     def test_telegram_fallback_when_no_wa(self):
         env = {
@@ -566,6 +612,35 @@ class TestDocumentsDigest(unittest.TestCase):
         self.assertEqual(restored.documents_digest[0]["detected_type"], "KTP")
         self.assertEqual(restored.documents_digest[1]["has_meterai"], True)
         self.assertEqual(restored.documents_digest[1]["detected_type"], "Surat_Pesanan")
+
+    def test_digest_carries_file_id_for_cross_reference(self):
+        digest = ob._documents_digest(_score_dict(with_type_findings=True))
+        self.assertEqual(digest[0]["file_id"], "doc-1")
+        self.assertEqual(digest[1]["file_id"], "doc-2")
+
+    def test_doc_context_enriched_with_detected_type(self):
+        # _documents_for_copilot cross-references the digest's detected_type onto
+        # each doc so the copilot can resolve the officer's "KTP" even when the
+        # citizen mislabelled the upload.
+        docs = [_Doc("doc-1", "identitas", "scan.jpg", "image/jpeg", b"bytes")]
+        digest = ob._documents_digest(_score_dict(with_type_findings=True))
+        out = ob._documents_for_copilot(docs, digest)
+        self.assertEqual(out["doc-1"]["claimed_type"], "identitas")
+        self.assertEqual(out["doc-1"]["detected_type"], "KTP")
+
+    def test_doc_context_detected_type_survives_redis_round_trip(self):
+        sess = ob.OfficerCaseSession(
+            channel_id="628999000111",
+            channel=ob.CHANNEL_WHATSAPP,
+            ticket="000123456",
+            documents={"doc-1": {"filename": "scan.jpg",
+                                 "mime_type": "image/jpeg",
+                                 "content": b"bytes", "claimed_type": "identitas",
+                                 "detected_type": "KTP"}},
+        )
+        restored = ob._decode_officer_session(ob._encode_officer_session(sess))
+        self.assertEqual(restored.documents["doc-1"]["detected_type"], "KTP")
+        self.assertEqual(restored.documents["doc-1"]["content"], b"bytes")
 
     def test_notify_threads_digest_into_validation_and_session(self):
         env = {
