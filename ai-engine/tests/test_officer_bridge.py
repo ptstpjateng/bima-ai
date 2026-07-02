@@ -642,6 +642,59 @@ class TestDocumentsDigest(unittest.TestCase):
         self.assertEqual(restored.documents["doc-1"]["detected_type"], "KTP")
         self.assertEqual(restored.documents["doc-1"]["content"], b"bytes")
 
+    def test_small_doc_bytes_survive_redis_round_trip(self):
+        # Edge 3: a normally-sized doc's bytes must survive encode→decode so
+        # send_document works after a restart. (The proof the headline "kirim
+        # KTP" flow is durable.)
+        sess = ob.OfficerCaseSession(
+            channel_id="628999000111",
+            channel=ob.CHANNEL_WHATSAPP,
+            ticket="000123456",
+            documents={
+                "doc-1": {"filename": "ktp.jpg", "mime_type": "image/jpeg",
+                          "content": b"small-ktp-bytes", "claimed_type": "KTP",
+                          "detected_type": "KTP"},
+                "doc-3": {"filename": "surat_permohonan.pdf",
+                          "mime_type": "application/pdf",
+                          "content": b"small-perm-bytes",
+                          "claimed_type": "Surat_Permohonan",
+                          "detected_type": "Surat_Permohonan"},
+            },
+        )
+        restored = ob._decode_officer_session(ob._encode_officer_session(sess))
+        # BOTH docs keep their bytes — not just the first one.
+        self.assertEqual(restored.documents["doc-1"]["content"], b"small-ktp-bytes")
+        self.assertEqual(restored.documents["doc-3"]["content"], b"small-perm-bytes")
+
+    def test_oversize_doc_bytes_dropped_but_metadata_and_others_survive(self):
+        # Edge 3 size guard: an oversize doc's bytes are dropped from the durable
+        # copy (so one huge file can't blow up the whole session's Redis SET and
+        # take EVERY doc's bytes down with it), while its metadata + the digest
+        # survive and OTHER docs keep their bytes intact.
+        big = b"x" * (ob._MAX_REDIS_DOC_BYTES + 1)
+        sess = ob.OfficerCaseSession(
+            channel_id="628999000111",
+            channel=ob.CHANNEL_WHATSAPP,
+            ticket="000123456",
+            documents={
+                "doc-1": {"filename": "ktp.jpg", "mime_type": "image/jpeg",
+                          "content": b"small-ktp", "claimed_type": "KTP",
+                          "detected_type": "KTP"},
+                "doc-big": {"filename": "scan_hires.pdf",
+                            "mime_type": "application/pdf",
+                            "content": big, "claimed_type": "Surat_Permohonan",
+                            "detected_type": "Surat_Permohonan"},
+            },
+        )
+        restored = ob._decode_officer_session(ob._encode_officer_session(sess))
+        # Small doc: bytes intact → still sendable after a restart.
+        self.assertEqual(restored.documents["doc-1"]["content"], b"small-ktp")
+        # Big doc: metadata survives (so it degrades gracefully) but bytes gone.
+        self.assertIn("doc-big", restored.documents)
+        self.assertEqual(restored.documents["doc-big"]["filename"], "scan_hires.pdf")
+        self.assertEqual(restored.documents["doc-big"]["detected_type"], "Surat_Permohonan")
+        self.assertEqual(restored.documents["doc-big"]["content"], b"")
+
     def test_notify_threads_digest_into_validation_and_session(self):
         env = {
             "BIMA_OFFICER_NOTIFY_ENABLED": "true",
@@ -665,6 +718,27 @@ class TestDocumentsDigest(unittest.TestCase):
         # ...and threaded onto the validation dict the copilot reads.
         self.assertIn("documents_digest", sess.validation)
         self.assertEqual(sess.validation["documents_digest"][0]["detected_type"], "KTP")
+
+
+class TestCompareIdentityWired(unittest.TestCase):
+    """Edge 2 — the cross-doc identity comparator is a real, mode-allowed
+    officer tool (so the model can call it instead of dead-ending on 'bandingkan
+    NIK di KTP dengan surat permohonan')."""
+
+    def test_compare_identity_is_a_declared_officer_tool(self):
+        self.assertIn("compare_identity", oc._TOOL_DISPATCH)
+        self.assertIn("compare_identity", oc._OFFICER_TOOL_NAMES)
+        names = {d["name"] for d in oc._FUNCTION_DECLARATIONS}
+        self.assertIn("compare_identity", names)
+        # It is a READ tool — never in the confirmation-gated write set, and NOT
+        # a case-closing tool (comparing identity must not clear the session).
+        self.assertNotIn("compare_identity", oc._REQUIRES_CONFIRMATION)
+        self.assertNotIn("compare_identity", ob._CASE_CLOSING_TOOLS)
+
+    def test_signature_assistant_does_not_expose_compare_identity(self):
+        # The signing assistant is chain-synthesis only; the doc comparator is a
+        # desk-copilot tool. Keep the surfaces distinct.
+        self.assertNotIn("compare_identity", oc._SIGNATURE_TOOL_NAMES)
 
 
 class TestOfficerDocDelivery(unittest.TestCase):

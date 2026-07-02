@@ -172,6 +172,151 @@ class TestSendDocumentTool(unittest.TestCase):
             oc._docs_to_send_context.reset(send_token)
         self.assertEqual(queue, ["doc-1"])
 
+    def test_resolved_doc_with_empty_bytes_reports_gone_not_send(self):
+        # Edge 3: a doc resolves in the context but its bytes were dropped on a
+        # rehydrate (content=b""). send_document must NOT queue a phantom send;
+        # it tells the officer the file is no longer stored (not "tidak
+        # ditemukan", which would falsely deny the doc ever existed).
+        ctx = {
+            "doc-9": {
+                "filename": "surat_permohonan.pdf", "mime_type": "application/pdf",
+                "content": b"", "claimed_type": "Surat_Permohonan",
+                "detected_type": "Surat_Permohonan",
+            }
+        }
+        doc_token = oc._doc_context.set(ctx)
+        queue: list = []
+        send_token = oc._docs_to_send_context.set(queue)
+        try:
+            out = oc.send_document("surat permohonan")
+        finally:
+            oc._doc_context.reset(doc_token)
+            oc._docs_to_send_context.reset(send_token)
+        self.assertEqual(queue, [])                       # nothing queued
+        self.assertNotIn("tidak ditemukan", out.lower())  # not a false denial
+        self.assertIn("tidak lagi tersimpan", out.lower())
+
+    def test_ref_only_in_digest_reports_gone_not_dead_end(self):
+        # The doc isn't in the (bytes-carrying) context at all, but the retained
+        # read-digest remembers it → honest "file gone", never generic not-found.
+        digest = [{
+            "file_id": "doc-3", "filename": "surat_permohonan.pdf",
+            "detected_type": "Surat_Permohonan", "claimed_type": "Lampiran",
+            "has_meterai": True, "confidence": 0.9, "matches": False,
+        }]
+        doc_token = oc._doc_context.set({})  # empty context (bytes gone)
+        val_token = oc._validation_context.set({"documents_digest": digest})
+        queue: list = []
+        send_token = oc._docs_to_send_context.set(queue)
+        try:
+            out = oc.send_document("surat permohonan")
+        finally:
+            oc._doc_context.reset(doc_token)
+            oc._validation_context.reset(val_token)
+            oc._docs_to_send_context.reset(send_token)
+        self.assertEqual(queue, [])
+        self.assertIn("tidak lagi tersimpan", out.lower())
+        self.assertIn("surat_permohonan.pdf", out)
+
+
+class TestCompareIdentityTool(unittest.TestCase):
+    """Edge 2 — compare_identity reads two in-session docs' NIK/name via Vision
+    and compares them. The headline verificator ask; NIK masked, never a
+    dead-end."""
+
+    def _stub_vision(self, by_bytes: dict, *, configured=True):
+        """Install a fake services.gemini_vision whose extract_structured
+        returns the identity dict keyed by the doc's bytes."""
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract_structured(*, image_bytes, mime_type, prompt, response_schema):
+            return by_bytes.get(image_bytes)
+
+        mod.extract_structured = _extract_structured
+        mod.is_configured = lambda: configured
+        sys.modules["services.gemini_vision"] = mod
+        return mod
+
+    def _run_compare(self, doc_a, doc_b, field, *, doc_ctx=None, validation=None):
+        doc_token = oc._doc_context.set(doc_ctx)
+        val_token = oc._validation_context.set(validation)
+        try:
+            return _run(oc.compare_identity(doc_a, doc_b, field))
+        finally:
+            oc._doc_context.reset(doc_token)
+            oc._validation_context.reset(val_token)
+
+    def test_nik_matches_across_ktp_and_surat_permohonan(self):
+        # Both docs carry the SAME NIK → equal, and the NIK is masked in output.
+        nik = "3374012345678901"
+        self._stub_vision({
+            b"ktp-bytes": {"nik": nik, "nama": "Budi Santoso"},
+            b"perm-bytes": {"nik": nik, "nama": "Budi Santoso"},
+        })
+        out = self._run_compare("KTP", "surat permohonan", "NIK", doc_ctx=_doc_ctx())
+        self.assertTrue(out["available"])
+        self.assertTrue(out["equal"])
+        self.assertEqual(out["field"], "nik")
+        # Full NIK never surfaced; masked form present.
+        self.assertNotIn(nik, repr(out))
+        self.assertIn("33", out["value_a"])
+        self.assertIn("COCOK", out["note"])
+
+    def test_nik_mismatch_reported_with_similarity(self):
+        self._stub_vision({
+            b"ktp-bytes": {"nik": "3374012345678901", "nama": "Budi"},
+            b"perm-bytes": {"nik": "3374019999999999", "nama": "Budi"},
+        })
+        out = self._run_compare("KTP", "surat permohonan", "nik", doc_ctx=_doc_ctx())
+        self.assertTrue(out["available"])
+        self.assertFalse(out["equal"])
+        self.assertNotIn("3374012345678901", repr(out))
+        self.assertIn("TIDAK", out["note"].upper())
+
+    def test_name_compare_uses_validator_normalisation(self):
+        # Honorific difference must still compare equal (validator-aligned).
+        # The docsend suite stubs services.agents.validator._normalize_name as
+        # identity, so assert on the tool WIRING (field routing + availability),
+        # not the honorific-stripping itself (covered in the validator suite).
+        self._stub_vision({
+            b"ktp-bytes": {"nik": "", "nama": "BUDI SANTOSO"},
+            b"perm-bytes": {"nik": "", "nama": "BUDI SANTOSO"},
+        })
+        out = self._run_compare("KTP", "surat permohonan", "nama pemohon",
+                                doc_ctx=_doc_ctx())
+        self.assertEqual(out["field"], "nama")
+        self.assertTrue(out["available"])
+        self.assertTrue(out["equal"])
+        # Names are shown to the authorized officer (not masked).
+        self.assertIn("BUDI SANTOSO", out["value_a"])
+
+    def test_unknown_doc_ref_is_not_available_lists_docs(self):
+        self._stub_vision({})
+        out = self._run_compare("KTP", "NPWP", "nik", doc_ctx=_doc_ctx())
+        self.assertFalse(out["available"])
+        # Names the missing ref + lists what IS available (human labels).
+        self.assertIn("NPWP", out["note"])
+        self.assertIn("ktp_budi.jpg", out["note"])
+
+    def test_no_doc_context_degrades_gracefully(self):
+        # Admin-dashboard path — no in-session bytes. Not a crash, not a
+        # dead-end: points the officer at the validation findings.
+        out = self._run_compare("KTP", "surat permohonan", "nik",
+                                doc_ctx=None, validation=None)
+        self.assertFalse(out["available"])
+        self.assertIn("validasi", out["note"].lower())
+
+    def test_vision_unreadable_field_reports_not_dead_end(self):
+        # Vision returns None for one doc (unreadable) → available False with a
+        # clear message, never a raise.
+        self._stub_vision({
+            b"ktp-bytes": {"nik": "3374012345678901", "nama": "Budi"},
+            # perm-bytes deliberately absent → extract returns None
+        })
+        out = self._run_compare("KTP", "surat permohonan", "nik", doc_ctx=_doc_ctx())
+        self.assertFalse(out["available"])
+        self.assertIn("tidak dapat membaca", out["note"].lower())
+
 
 class TestDocumentsDigestSurfacing(unittest.TestCase):
     """Task F — the digest on the validation context appears as

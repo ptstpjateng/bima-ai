@@ -282,21 +282,61 @@ _sessions: "OrderedDict[str, OfficerCaseSession]" = OrderedDict()
 # not the raw SuitabilityResult). The only binary is each document's `content`
 # bytes inside the `documents` map → base64 on encode, bytes on decode. Bytes
 # are NEVER logged (session_store logs only payload lengths).
+#
+# SIZE GUARD (Edge 3): all docs share ONE Redis blob. A single large doc could
+# bloat that blob past Redis's value limit / maxmemory and make the whole SET
+# fail — dropping EVERY doc's bytes, not just the big one, so "lihat KTP" would
+# work but "kirim surat permohonan" wouldn't after a restart. So we cap the
+# bytes carried inline per doc AND in aggregate: docs whose bytes fit are
+# persisted in full (send_document works after a restart); docs over the cap
+# (or once the running total is spent) persist metadata WITHOUT the bytes
+# (content_b64=""). Those degrade gracefully — the read-digest still describes
+# them, get_doc_summary/send_document say "berkas tidak lagi tersimpan" rather
+# than silently failing. Smaller docs (the common KTP/surat-permohonan case)
+# stay inline, so the headline lihat/kirim flow survives the round-trip.
 # ---------------------------------------------------------------------------
+
+# Per-doc + aggregate caps on the RAW bytes persisted inline to Redis. Chosen
+# well under a typical Redis value ceiling with room for the rest of the blob;
+# base64 inflates ~4/3, so ~1.5 MB raw → ~2 MB encoded per doc, ~6 MB total.
+_MAX_REDIS_DOC_BYTES = int(os.getenv("BIMA_OFFICER_REDIS_DOC_MAX_BYTES", str(1_500_000)))
+_MAX_REDIS_DOCS_TOTAL_BYTES = int(
+    os.getenv("BIMA_OFFICER_REDIS_DOCS_TOTAL_BYTES", str(6_000_000))
+)
+
 
 def _encode_officer_session(sess: OfficerCaseSession) -> str:
     import json
 
-    docs = {
-        fid: {
+    docs: dict[str, dict[str, Any]] = {}
+    budget = _MAX_REDIS_DOCS_TOTAL_BYTES
+    dropped = 0
+    for fid, d in (sess.documents or {}).items():
+        content = d.get("content") or b""
+        size = len(content)
+        inline = size <= _MAX_REDIS_DOC_BYTES and size <= budget
+        if inline:
+            budget -= size
+        else:
+            dropped += 1
+        docs[fid] = {
             "filename": d.get("filename", fid),
             "mime_type": d.get("mime_type", "application/octet-stream"),
             "claimed_type": d.get("claimed_type", ""),
             "detected_type": d.get("detected_type", ""),
-            "content_b64": base64.b64encode(d.get("content") or b"").decode("ascii"),
+            # Oversize / over-budget → persist metadata, DROP the bytes. The
+            # in-memory session keeps the real bytes; only the durable copy
+            # degrades. Never log the bytes.
+            "content_b64": (
+                base64.b64encode(content).decode("ascii") if inline else ""
+            ),
         }
-        for fid, d in (sess.documents or {}).items()
-    }
+    if dropped:
+        logger.info(
+            "officer session: %d doc(s) exceeded Redis inline cap — bytes "
+            "dropped from durable copy (digest retained) | key=%s",
+            dropped, _mask(sess.channel_id),
+        )
     payload = {
         "channel_id": sess.channel_id,
         "channel": sess.channel,
