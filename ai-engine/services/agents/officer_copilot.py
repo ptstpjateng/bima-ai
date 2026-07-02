@@ -182,6 +182,38 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "supaya petugas saat ini tahu apa yang dikatakan petugas sebelumnya.\n"
     "5. Jawab ringkas, dalam Bahasa Indonesia formal, dan langsung ke "
     "inti — petugas sedang bekerja cepat di antrean berkas.\n\n"
+    "=== ANDA ADALAH WAKIL PETUGAS: REKOMENDASIKAN LALU EKSEKUSI ===\n"
+    "Setelah menelaah validasi, jangan berhenti pada ringkasan — beri "
+    "REKOMENDASI TINDAKAN yang jelas, seperti petugas senior. Dasarkan "
+    "rekomendasi HANYA pada temuan nyata: skor kelengkapan, isu blocking "
+    "(critical/high), dan hasil cek silang identitas (NIK/nama antar dokumen). "
+    "Contoh: 'Rekomendasi: TERUSKAN ke meja berikutnya — 8/8 dokumen lengkap, "
+    "NIK KTP = surat permohonan, tidak ada temuan kritis.' atau 'Rekomendasi: "
+    "TOLAK — dokumen X tidak sesuai / NIK tidak cocok.' Bila ada temuan "
+    "critical/high yang belum tuntas, condongkan rekomendasi ke TOLAK atau "
+    "minta perbaikan, JANGAN teruskan. Setelah memberi rekomendasi, tawarkan "
+    "untuk menjalankannya dan tunggu jawaban petugas — lalu jalankan lewat "
+    "`forward_case`/`record_decision` mengikuti alur konfirmasi di bawah. "
+    "JANGAN mengarang isi catatan keputusan: ambil dari temuan validasi yang "
+    "nyata (mis. 'NIK KTP tidak cocok dengan surat permohonan').\n\n"
+    "=== ALUR RESMI SIAP (pahami sebelum bertindak) ===\n"
+    "- `forward_case` (forward): MAJU satu meja ke tahap persetujuan "
+    "berikutnya. Catatan OPSIONAL.\n"
+    "- `record_decision` (decision): keputusan final — approved (TERIMA) atau "
+    "rejected (TOLAK). Catatan/alasan WAJIB. TOLAK me-rutekan berkas MUNDUR "
+    "satu meja ke tahap sebelumnya untuk perbaikan.\n"
+    "- Surat Keputusan/Persetujuan (SK) final DITERBITKAN ber-TTE oleh SIAP "
+    "saat berkas disetujui di tahap akhir — BUKAN oleh Anda. Anda hanya "
+    "MENDRAFTKAN SK (lihat draft_sk) dan MEREKOMENDASIKAN; jangan pernah "
+    "mengaku 'menerbitkan' atau 'menandatangani' SK.\n\n"
+    "=== DRAF SK (draft_sk) — DITAWARKAN SETELAH REVIEW POSITIF ===\n"
+    "Ketika validasi positif (skor tinggi, tidak ada temuan critical/high) dan "
+    "petugas condong menyetujui, TAWARKAN untuk mendraftkan SK dari template "
+    "resmi SIAP: mis. 'Berkas layak. Mau saya draftkan SK-nya?'. Saat petugas "
+    "meminta 'draftkan SK' / 'buat surat persetujuan', panggil `draft_sk` "
+    "(tanpa argumen, tanpa konfirmasi — ini hanya draf, bukan tindakan tulis). "
+    "Sampaikan field mana yang terisi otomatis dan mana yang masih kosong "
+    "sesuai hasil tool, agar petugas melengkapinya.\n\n"
     "=== ATURAN MUTLAK — TINDAKAN YANG MENGUBAH DATA (forward & decision) ===\n"
     "Anda memiliki dua tool yang MENGUBAH data di SIAP: `forward_case` "
     "(meneruskan berkas ke meja berikutnya) dan `record_decision` "
@@ -332,6 +364,27 @@ _doc_context: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
 # ---------------------------------------------------------------------------
 _docs_to_send_context: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
     "officer_copilot_docs_to_send", default=None
+)
+
+# ---------------------------------------------------------------------------
+# SK-draft context — the officer deputy path (draft_sk).
+#
+# `draft_sk` renders SIAP's OWN PKPP approval-letter template (stereotype
+# LICENSE-RECOMMEND, keyed by license_id) filled with what the case holds, then
+# hands the editable .docx back to the officer. It needs the licence id (to find
+# the template + parse jenis_pengadaan from the name) and the applicant
+# identity, none of which the model should have to know — so the bridge injects
+# them here per turn, exactly like `_doc_context`. It also reuses `_doc_context`
+# for the ONE Vision pass over the submission docs (vessel/permit fields).
+#
+# Shape: {"license_id": int|None, "ticket": str, "applicant_name": str|None,
+#         "alamat": str|None, "license_name": str|None}
+# None → no SK context bound (admin-dashboard path); draft_sk says so plainly.
+# The applicant fields here go INTO the SK docx (the officer is authorized to
+# see them) but are NEVER logged.
+# ---------------------------------------------------------------------------
+_sk_context: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "officer_copilot_sk_context", default=None
 )
 
 # Severity ladder — kept in sync with admin/src/lib/case-types.ts SEVERITY_ORDER
@@ -800,6 +853,138 @@ def send_document(doc_ref: str) -> str:
         logger.debug("send_document resolved but no send queue bound | file_id=%s", file_id)
 
     return f"Baik, saya kirimkan dokumen {label} ke chat ini."
+
+
+# Human labels for the SK placeholder keys, so the narration reads naturally.
+_SK_FIELD_LABELS: dict[str, str] = {
+    "nama_pemohon": "Nama Pemohon",
+    "alamat": "Alamat",
+    "jenis_pengadaan": "Jenis Pengadaan",
+    "nama_kapal": "Nama Kapal",
+    "gt": "GT",
+    "bahan": "Bahan Kapal",
+    "thn_bangun": "Tahun Bangun",
+    "alat": "Alat Tangkap",
+    "galangan": "Galangan",
+    "no_siup": "No. SIUP",
+    "tgl_siup": "Tgl. SIUP",
+    "tgl_srt_permohonan": "Tgl. Surat Permohonan",
+    "perihal_surat_perm": "Perihal Surat",
+    "tipe": "Tipe Kapal",
+    "no_ppkp": "No. PPKP",
+    "rekom_tgl_penetapan": "Tgl. Penetapan",
+}
+
+# All 16 keys in template order, so we can report filled-vs-blank exhaustively.
+_SK_ALL_KEYS: tuple[str, ...] = (
+    "nama_pemohon", "alamat", "jenis_pengadaan",
+    "nama_kapal", "gt", "bahan", "thn_bangun", "alat", "galangan",
+    "no_siup", "tgl_siup", "tgl_srt_permohonan", "perihal_surat_perm", "tipe",
+    "no_ppkp", "rekom_tgl_penetapan",
+)
+
+
+async def draft_sk() -> str:
+    """DRAFT the PKPP approval letter (Surat Keputusan / Persetujuan) for the
+    case in session, using SIAP's OWN template, and send it to the officer as an
+    editable .docx.
+
+    This is a DRAFTING aid, not a SIAP write — SIAP issues the final SK ber-TTE
+    at approval. So it is NOT confirmation-gated. It fetches the
+    LICENSE-RECOMMEND template for the case's licence, fills the identity fields
+    from the case, runs one best-effort Vision pass over the submission docs for
+    the vessel/permit fields, leaves the rest blank, queues the .docx for
+    out-of-band delivery on the officer's channel, and returns a note listing
+    which fields it filled vs left blank so the officer knows what to complete.
+
+    Degrades gracefully (no license_id / template missing / Vision fails /
+    python-docx absent) to an honest message — never raises, never a dead-end.
+    """
+    sk = _sk_context.get()
+    if not sk or not isinstance(sk, dict):
+        return (
+            "Draf SK belum bisa dibuat di jalur ini: konteks berkas (izin & "
+            "identitas pemohon) tidak tersedia pada sesi. Pada alur chat "
+            "petugas, draf SK dibuat otomatis dari template resmi SIAP."
+        )
+    license_id = sk.get("license_id")
+    if not license_id:
+        return (
+            "Draf SK belum bisa dibuat: ID izin (license_id) tidak diketahui "
+            "untuk berkas ini, sehingga template SK resmi SIAP tidak dapat "
+            "ditemukan. Silakan terbitkan SK langsung di SIAP."
+        )
+
+    try:
+        from services import siap_templates as st
+    except Exception:  # pragma: no cover — module import guard
+        return (
+            "Draf SK belum bisa dibuat: modul template dokumen tidak tersedia "
+            "di server ini."
+        )
+
+    documents = _doc_context.get() or {}
+    try:
+        data = await st.build_sk_data(
+            applicant_name=sk.get("applicant_name"),
+            alamat=sk.get("alamat"),
+            license_name=sk.get("license_name"),
+            documents=documents,
+        )
+        rendered = await st.render_sk_docx(
+            license_id, data, ticket=sk.get("ticket"),
+        )
+    except Exception:
+        logger.exception("draft_sk: render failed | license_id=%s", license_id)
+        return (
+            "Maaf, terjadi kendala saat menyusun draf SK. SK resmi tetap dapat "
+            "diterbitkan langsung di SIAP saat berkas disetujui."
+        )
+
+    if rendered is None:
+        return (
+            "Template SK resmi SIAP untuk izin ini belum tersedia/terunduh, "
+            "jadi draf otomatis belum bisa dibuat. SK final tetap diterbitkan "
+            "ber-TTE oleh SIAP saat berkas disetujui."
+        )
+
+    docx_bytes, filename = rendered
+
+    # Which of the 16 keys we actually filled vs left blank (from the same data
+    # map render used). The officer needs to know what to complete by hand.
+    filled = [k for k in _SK_ALL_KEYS if str(data.get(k) or "").strip()]
+    blank = [k for k in _SK_ALL_KEYS if not str(data.get(k) or "").strip()]
+
+    # Queue the rendered .docx for out-of-band delivery on the officer channel.
+    # Reuse the same send queue as send_document, but carry the bytes inline
+    # (this file is generated here, not one of the in-session upload docs).
+    queue = _docs_to_send_context.get()
+    if isinstance(queue, list):
+        queue.append({
+            "filename": filename,
+            "content": docx_bytes,
+            "mime_type": (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+        })
+    else:  # pragma: no cover — tool exercised without a bound queue
+        logger.debug("draft_sk rendered but no send queue bound")
+
+    filled_labels = ", ".join(_SK_FIELD_LABELS.get(k, k) for k in filled) or "(tidak ada)"
+    blank_labels = ", ".join(_SK_FIELD_LABELS.get(k, k) for k in blank) or "(tidak ada)"
+    logger.info(
+        "draft_sk | license_id=%s | filled=%d blank=%d",
+        license_id, len(filled), len(blank),
+    )
+    return (
+        f"Draf SK sudah saya siapkan dari template resmi SIAP dan saya kirim "
+        f"sebagai berkas .docx yang bisa diedit ({filename}). "
+        f"Terisi otomatis: {filled_labels}. "
+        f"Masih kosong (mohon dilengkapi petugas): {blank_labels}. "
+        "Catatan: SK final diterbitkan ber-TTE oleh SIAP saat berkas disetujui "
+        "— ini draf bantu untuk Anda lengkapi."
+    )
 
 
 def compare_field(doc_a: dict, doc_b: dict, field: str) -> dict:
@@ -1542,6 +1727,24 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "draft_sk",
+        "description": (
+            "Buatkan DRAF Surat Keputusan / Surat Persetujuan (SK) izin dari "
+            "template RESMI SIAP, terisi otomatis dari data berkas, lalu kirim "
+            "ke petugas sebagai berkas .docx yang bisa diedit. Gunakan saat "
+            "petugas meminta 'draftkan SK', 'buat surat persetujuan', "
+            "'siapkan surat keputusan', atau setelah hasil validasi positif "
+            "dan petugas siap menyetujui. BUKAN tindakan menulis ke SIAP — ini "
+            "hanya draf bantu; SK final tetap diterbitkan ber-TTE oleh SIAP "
+            "saat berkas disetujui, jadi TIDAK perlu konfirmasi. Tidak butuh "
+            "argumen — konteks izin & pemohon sudah terikat ke sesi."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "compare_field",
         "description": (
             "Bandingkan satu field di antara dua dokumen yang sudah "
@@ -1760,6 +1963,7 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "get_case_full": get_case_full,
     "get_doc_summary": get_doc_summary,
     "send_document": send_document,
+    "draft_sk": draft_sk,
     "compare_field": compare_field,
     "compare_identity": compare_identity,
     "cite_regulation": cite_regulation,
@@ -1786,6 +1990,7 @@ _OFFICER_TOOL_NAMES = frozenset({
     "get_case_full",
     "get_doc_summary",
     "send_document",
+    "draft_sk",
     "compare_field",
     "compare_identity",
     "cite_regulation",
@@ -1905,6 +2110,7 @@ class OfficerCopilot:
         validation: dict | None = None,
         mode: str = _MODE_OFFICER,
         documents: dict | None = None,
+        sk_context: dict | None = None,
     ) -> dict:
         """
         Run one user-message turn. Returns:
@@ -1937,6 +2143,12 @@ class OfficerCopilot:
             straight into BIMA. Lets `get_doc_summary` answer with real Gemini
             Vision instead of the canned placeholder. None on the admin
             dashboard path (SIAP file-download not wired). Bytes never logged.
+          sk_context: optional SK-draft context for `draft_sk` — {"license_id",
+            "ticket", "applicant_name", "alamat", "license_name"}. Supplied by
+            the chat bridge so the officer deputy can render SIAP's PKPP
+            approval-letter template. None on the admin path (draft_sk then says
+            so plainly). Applicant fields go into the SK docx (authorized
+            officer) but are never logged.
         """
         mode = mode if mode in _VALID_MODES else _MODE_OFFICER
 
@@ -1977,6 +2189,7 @@ class OfficerCopilot:
         ctx_token = _validation_context.set(validation)
         doc_token = _doc_context.set(documents)
         send_token = _docs_to_send_context.set([])
+        sk_token = _sk_context.set(sk_context)
         logger.info(
             "Copilot turn start | mode=%s | officer_id=%s | ticket=%s | "
             "has_validation=%s | in_session_docs=%d | history_turns=%d",
@@ -2008,6 +2221,7 @@ class OfficerCopilot:
             _validation_context.reset(ctx_token)
             _doc_context.reset(doc_token)
             _docs_to_send_context.reset(send_token)
+            _sk_context.reset(sk_token)
 
     async def _run_chat_loop(
         self,

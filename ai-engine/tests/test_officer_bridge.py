@@ -828,5 +828,182 @@ class TestOfficerDocDelivery(unittest.TestCase):
         self.assertIsNotNone(out)
 
 
+class TestSkContextThreading(unittest.TestCase):
+    """Officer deputy — the session now carries license_id + applicant identity,
+    survives the Redis round-trip, and the bridge threads an sk_context into the
+    copilot so draft_sk can render SIAP's PKPP approval-letter template."""
+
+    def setUp(self):
+        ob._sessions.clear()
+
+    def test_session_carries_license_id_and_identity(self):
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "628999000111",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+                _run(ob.notify_officer_of_submission(
+                    ticket="000123456", request_id=42, license_id=459,
+                    license_name="Pengadaan Kapal (Pembangunan)",
+                    applicant_name="Budi Santoso",
+                    applicant_alamat="Jl. Laut No. 1, Tegal",
+                    score=_score_dict(percent=92), documents=[],
+                ))
+        sess = ob._sessions.get("628999000111")
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess.license_id, 459)
+        self.assertEqual(sess.applicant_name, "Budi Santoso")
+        self.assertEqual(sess.alamat, "Jl. Laut No. 1, Tegal")
+
+    def test_license_id_and_identity_survive_redis_round_trip(self):
+        sess = ob.OfficerCaseSession(
+            channel_id="628999000111",
+            channel=ob.CHANNEL_WHATSAPP,
+            ticket="000123456",
+            request_id=42,
+            license_id=459,
+            license_name="Pengadaan Kapal (Pembangunan)",
+            applicant_name="Budi Santoso",
+            alamat="Jl. Laut No. 1",
+        )
+        restored = ob._decode_officer_session(ob._encode_officer_session(sess))
+        self.assertEqual(restored.license_id, 459)
+        self.assertEqual(restored.applicant_name, "Budi Santoso")
+        self.assertEqual(restored.alamat, "Jl. Laut No. 1")
+
+    def test_reply_threads_sk_context_into_copilot(self):
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "628999000111",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+                _run(ob.notify_officer_of_submission(
+                    ticket="000123456", request_id=42, license_id=459,
+                    license_name="Pengadaan Kapal (Pembangunan)",
+                    applicant_name="Budi", applicant_alamat="Jl. X",
+                    score=_score_dict(percent=92), documents=[],
+                ))
+        copilot = type("C", (), {})()
+        copilot.chat = AsyncMock(return_value={
+            "reply": "ok", "tool_calls": [],
+            "history": [{"role": "user", "text": "draftkan SK"},
+                        {"role": "model", "text": "ok"}],
+        })
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(oc, "get_copilot", return_value=copilot):
+                _run(ob.maybe_handle_officer_reply(
+                    channel=ob.CHANNEL_WHATSAPP,
+                    channel_id="628999000111",
+                    message="draftkan SK",
+                ))
+        _, kwargs = copilot.chat.call_args
+        sk = kwargs["sk_context"]
+        self.assertEqual(sk["license_id"], 459)
+        self.assertEqual(sk["ticket"], "000123456")
+        self.assertEqual(sk["applicant_name"], "Budi")
+        self.assertEqual(sk["alamat"], "Jl. X")
+        self.assertEqual(sk["license_name"], "Pengadaan Kapal (Pembangunan)")
+
+
+class TestSkDraftDelivery(unittest.TestCase):
+    """When draft_sk queues an INLINE-dict doc (generated SK bytes, not an
+    in-session file_id), the bridge hosts + sends it on the officer channel."""
+
+    def setUp(self):
+        ob._sessions.clear()
+
+    def _arm_session(self):
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "628999000111",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(ob, "_send", new=AsyncMock(return_value=True)):
+                _run(ob.notify_officer_of_submission(
+                    ticket="000123456", request_id=42, license_id=459,
+                    license_name="Pengadaan Kapal (Pembangunan)",
+                    applicant_name="Budi", applicant_alamat="Jl X",
+                    score=_score_dict(percent=92), documents=[],
+                ))
+        return env
+
+    def test_inline_generated_docx_is_delivered(self):
+        env = self._arm_session()
+        copilot = type("C", (), {})()
+        copilot.chat = AsyncMock(return_value={
+            "reply": "Draf SK sudah saya siapkan.",
+            "tool_calls": [{"name": "draft_sk", "args": {}, "result_preview": ""}],
+            "documents_to_send": [{
+                "filename": "SK_PPKP_000123456.docx",
+                "content": b"PKdocxbytes",
+                "mime_type": ("application/vnd.openxmlformats-officedocument."
+                              "wordprocessingml.document"),
+            }],
+            "history": [{"role": "user", "text": "draftkan SK"},
+                        {"role": "model", "text": "Draf SK sudah saya siapkan."}],
+        })
+        _ensure_stub("services.generated_docs")
+        import services.generated_docs as gd
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(oc, "get_copilot", return_value=copilot):
+                with patch.object(gd, "store",
+                                  side_effect=lambda c, f: "SKTOKEN", create=True) as store_spy:
+                    with patch("services.whatsapp_sender.send_document",
+                               new=AsyncMock(return_value=True)) as senddoc:
+                        out = _run(ob.maybe_handle_officer_reply(
+                            channel=ob.CHANNEL_WHATSAPP,
+                            channel_id="628999000111",
+                            message="draftkan SK",
+                        ))
+        self.assertIn("Draf SK", out)
+        # The GENERATED bytes (not an upload doc) were hosted + sent.
+        store_spy.assert_called_once()
+        s_args, _ = store_spy.call_args
+        self.assertEqual(s_args[0], b"PKdocxbytes")
+        self.assertEqual(s_args[1], "SK_PPKP_000123456.docx")
+        senddoc.assert_awaited_once()
+        _, kwargs = senddoc.call_args
+        self.assertEqual(kwargs["filename"], "SK_PPKP_000123456.docx")
+        self.assertTrue(kwargs["link"].endswith("/dl/SKTOKEN"))
+
+
+class TestDeputyPromptGrounding(unittest.TestCase):
+    """The officer system prompt steers the recommend-then-execute deputy:
+    recommend grounded in the validation, execute on YA via the existing
+    confirm-gated writes, and offer draft_sk after a positive review — without
+    inventing decision notes."""
+
+    _P = oc._SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_directs_grounded_recommendation(self):
+        self.assertIn("Rekomendasi", self._P)
+        # Grounded in real signals, not invented.
+        self.assertIn("TERUSKAN", self._P)
+        self.assertIn("TOLAK", self._P)
+        # Must not fabricate decision notes.
+        self.assertIn("mengarang", self._P.lower())
+
+    def test_prompt_describes_real_siap_workflow(self):
+        # forward = advance a desk (note optional); decision approved/rejected
+        # (note required); reject routes back one desk; SK issued ber-TTE by SIAP.
+        low = self._P.lower()
+        self.assertIn("forward", low)
+        self.assertIn("opsional", low)          # forward note optional
+        self.assertIn("wajib", low)             # decision note required
+        self.assertIn("mundur", low)            # reject routes back one desk
+        self.assertIn("tte", low)               # SK issued ber-TTE by SIAP
+
+    def test_prompt_offers_draft_sk_after_positive_review(self):
+        self.assertIn("draft_sk", self._P)
+        # And never claims BIMA issues/signs the SK.
+        low = self._P.lower()
+        self.assertIn("bukan oleh anda", low)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

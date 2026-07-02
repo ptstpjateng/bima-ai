@@ -193,6 +193,100 @@ def fill_docx_identity(docx_bytes: bytes, fields: dict[str, Any]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Placeholder-token fill — the OFFICER-facing SK / Persetujuan output template.
+#
+# Unlike the citizen forms ("Label : <blank>"), SIAP's LICENSE-RECOMMEND output
+# template (e.g. "Surat PKPP V2.docx") fills via literal `[data.KEY]` tokens
+# embedded in the prose. Word almost always SPLITS such a token across several
+# runs inside a paragraph (spell-check / formatting boundaries) — in the real
+# PKPP template only 2 of 16 tokens survive intact in a single run; the other 14
+# are shattered (e.g. "[", "data.no_siup", "]"). A naive per-run replace would
+# never see them. So we operate on the JOINED paragraph/cell text, substitute
+# every token, and rewrite the paragraph in place — collapsing its runs into one
+# so the replacement is whole. Formatting of the paragraph's first run is
+# preserved; intra-paragraph run styling is intentionally flattened (these are
+# body-copy fill lines, not styled tables).
+#
+# Unmapped or empty keys are replaced with a blank fill line "………………" (never the
+# raw "[data.KEY]", which reads as broken to the officer) so the officer can
+# complete them by hand.
+# ---------------------------------------------------------------------------
+
+# The literal fill token. Keys are [A-Za-z_]+ (the 16 PKPP keys are all snake).
+_PLACEHOLDER_RE = re.compile(r"\[data\.([A-Za-z_]+)\]")
+
+# What an unmapped/blank field becomes — a visible fill line, not a broken token.
+_BLANK_FILL = "…" * 12
+
+
+def _fill_placeholders_in_text(text: str, data: dict[str, Any]) -> tuple[str, list[str], list[str]]:
+    """Replace every `[data.KEY]` in `text`. Returns (new_text, filled_keys,
+    blank_keys). A key present in `data` with a non-empty value fills; anything
+    else (unknown key OR empty value) becomes the blank fill line."""
+    filled: list[str] = []
+    blanks: list[str] = []
+
+    def _sub(m: "re.Match[str]") -> str:
+        key = m.group(1)
+        raw = data.get(key)
+        val = "" if raw is None else str(raw).strip()
+        if val:
+            filled.append(key)
+            return val
+        blanks.append(key)
+        return _BLANK_FILL
+
+    return _PLACEHOLDER_RE.sub(_sub, text), filled, blanks
+
+
+def _rewrite_paragraph_text(paragraph, new_text: str) -> None:
+    """Set a paragraph's full text to `new_text`, preserving the first run's
+    formatting and dropping the rest. python-docx has no whole-paragraph setter
+    that keeps styling, so we write into run[0] and blank the tail runs (leaving
+    them in place keeps the paragraph's XML valid)."""
+    runs = paragraph.runs
+    if not runs:
+        paragraph.add_run(new_text)
+        return
+    runs[0].text = new_text
+    for r in runs[1:]:
+        r.text = ""
+
+
+def fill_docx_placeholders(docx_bytes: bytes, data: dict[str, Any]) -> bytes:
+    """Fill an SIAP LICENSE-RECOMMEND output template that uses `[data.KEY]`
+    tokens, returning the edited .docx bytes.
+
+    Run-aware: a token split across runs is still matched because we join the
+    paragraph/cell text before substituting (test: a "[" / "data.x" / "]" run
+    split fills correctly). Unmapped/empty keys become a blank fill line so the
+    officer completes them; the raw token is never left behind.
+    """
+    from docx import Document  # lazy: only needed when actually filling
+
+    doc = Document(io.BytesIO(docx_bytes))
+    all_filled: list[str] = []
+    all_blank: list[str] = []
+    for paragraph in _iter_block_paragraphs(doc):
+        text = paragraph.text
+        if "[data." not in text:
+            continue
+        new_text, filled, blanks = _fill_placeholders_in_text(text, data)
+        if new_text != text:
+            _rewrite_paragraph_text(paragraph, new_text)
+            all_filled.extend(filled)
+            all_blank.extend(blanks)
+
+    logger.info(
+        "SIAP output template filled | fields=%d blank=%d",
+        len(set(all_filled)), len(set(all_blank)),
+    )
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Hand-built DOCX for the legacy .doc Surat Permohonan PPKP (SIAP stores it as
 # .doc, which python-docx cannot open and we refuse to ship LibreOffice for).
 # Layout mirrors the official template `SURAT PERMOHONAN PPKP.doc` verbatim.
@@ -341,3 +435,199 @@ async def render_official_docx(
 
     # 3) Nothing usable → fall back to fpdf2.
     return None
+
+
+# ===========================================================================
+# SK / Surat Persetujuan draft — the OFFICER deputy path.
+#
+# When the officer says "draftkan SK" / "buat surat persetujuan", BIMA fetches
+# SIAP's own LICENSE-RECOMMEND output template (the Surat PKPP), fills the
+# `[data.KEY]` placeholders it can, and hands back the editable .docx for the
+# officer to finish + upload. This is a DRAFT aid, not a SIAP write — SIAP
+# issues the SK ber-TTE at final approval. Best-effort throughout: any miss
+# (no license_id, template 404, Vision fails, python-docx absent) → None, so
+# the caller degrades to an honest message instead of a dead-end.
+#
+# The 16 PKPP keys, and where each comes from:
+#   identity  (deterministic, from the case session):
+#     nama_pemohon ← applicant name · alamat ← KTP address ·
+#     jenis_pengadaan ← parsed from the licence name (Pembangunan/Modifikasi)
+#   vessel/permit (ONE best-effort Gemini Vision pass over the submission docs):
+#     nama_kapal, gt, bahan, thn_bangun, alat, galangan, no_siup, tgl_siup,
+#     tgl_srt_permohonan, tipe, perihal_surat_perm
+#   assigned by SIAP/officer (always left blank):
+#     no_ppkp, rekom_tgl_penetapan
+# ===========================================================================
+
+# The 16 placeholder keys the PKPP template fills, split by provenance.
+_SK_IDENTITY_KEYS = ("nama_pemohon", "alamat", "jenis_pengadaan")
+_SK_VESSEL_KEYS = (
+    "nama_kapal", "gt", "bahan", "thn_bangun", "alat", "galangan",
+    "no_siup", "tgl_siup", "tgl_srt_permohonan", "tipe", "perihal_surat_perm",
+)
+_SK_OFFICIAL_KEYS = ("no_ppkp", "rekom_tgl_penetapan")  # SIAP/officer assign
+
+# Gemini Vision schema for the vessel/permit fields — pulled from the citizen's
+# submission documents (surat permohonan, SIUP, spec sheet). Every field is a
+# string; empty when not visible (the officer completes the blanks).
+_SK_VESSEL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "nama_kapal": {"type": "string", "description": "Nama kapal perikanan."},
+        "gt": {"type": "string", "description": "Ukuran/tonase kapal (Gross Tonnage), angka saja bila ada."},
+        "bahan": {"type": "string", "description": "Bahan kasko kapal (Kayu/Fiberglass/Besi/Baja)."},
+        "thn_bangun": {"type": "string", "description": "Tahun pembuatan/pembangunan kapal."},
+        "alat": {"type": "string", "description": "Alat penangkap ikan yang digunakan."},
+        "galangan": {"type": "string", "description": "Nama/alamat galangan atau tukang pembuat kapal."},
+        "no_siup": {"type": "string", "description": "Nomor SIUP (Surat Izin Usaha Perikanan)."},
+        "tgl_siup": {"type": "string", "description": "Tanggal terbit SIUP."},
+        "tgl_srt_permohonan": {"type": "string", "description": "Tanggal surat permohonan pemohon."},
+        "tipe": {"type": "string", "description": "Tipe/jenis kapal."},
+        "perihal_surat_perm": {"type": "string", "description": "Perihal surat permohonan."},
+    },
+    "required": [],
+}
+
+_SK_VESSEL_PROMPT = (
+    "Anda asisten petugas perizinan kelautan. Dari dokumen permohonan PPKP "
+    "terlampir (surat permohonan, SIUP, spesifikasi kapal), ambil data kapal "
+    "dan surat yang benar-benar TERTULIS. Untuk setiap field yang tidak "
+    "terlihat, kembalikan string kosong. JANGAN mengarang — hanya yang terbaca."
+)
+
+
+def _jenis_pengadaan_from_license(license_name: Optional[str]) -> str:
+    """Parse Pembangunan / Modifikasi from the licence name. Returns '' when
+    neither word is present (officer fills the blank)."""
+    low = (license_name or "").lower()
+    if "modifikasi" in low:
+        return "Modifikasi"
+    if "pembangunan" in low or "pembuatan" in low:
+        return "Pembangunan"
+    return ""
+
+
+async def _extract_vessel_fields(documents: Optional[dict]) -> dict[str, str]:
+    """Run ONE best-effort Gemini Vision pass over the submission docs to pull
+    the vessel/permit fields. Prefers the surat-permohonan/SIUP doc when it can
+    identify one; otherwise reads the first doc that carries bytes. Returns a
+    {key: value} dict (only non-empty values), or {} when Vision is
+    unconfigured / fails / there are no bytes. NEVER raises. Bytes never logged.
+
+    `documents` is the copilot `_doc_context` shape:
+      {file_id: {"filename", "mime_type", "content" (bytes), "claimed_type",
+                 "detected_type"}}
+    """
+    if not documents or not isinstance(documents, dict):
+        return {}
+    try:
+        from services.gemini_vision import extract_structured, is_configured
+    except Exception:  # pragma: no cover — vision module import guard
+        return {}
+    if not is_configured():
+        logger.info("SK vessel extract: Gemini Vision not configured")
+        return {}
+
+    # Pick the most permit-bearing doc: prefer one read/claimed as a
+    # surat-permohonan or SIUP, else the first doc with bytes.
+    def _label(d: dict) -> str:
+        return " ".join(
+            str(d.get(k) or "") for k in ("detected_type", "claimed_type", "filename")
+        ).lower()
+
+    docs_with_bytes = [d for d in documents.values() if d.get("content")]
+    if not docs_with_bytes:
+        return {}
+    preferred = next(
+        (d for d in docs_with_bytes
+         if any(w in _label(d) for w in ("permohonan", "siup", "kapal", "izin usaha"))),
+        docs_with_bytes[0],
+    )
+
+    try:
+        parsed = await extract_structured(
+            image_bytes=preferred["content"],
+            mime_type=preferred.get("mime_type", "application/octet-stream"),
+            prompt=_SK_VESSEL_PROMPT,
+            response_schema=_SK_VESSEL_SCHEMA,
+        )
+    except Exception:  # pragma: no cover — extract_structured already guards
+        logger.exception("SK vessel extract raised (degrading to blanks)")
+        return {}
+    if not parsed or not isinstance(parsed, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in _SK_VESSEL_KEYS:
+        val = str(parsed.get(key) or "").strip()
+        if val:
+            out[key] = val
+    logger.info("SK vessel extract | fields=%d", len(out))
+    return out
+
+
+async def build_sk_data(
+    *,
+    applicant_name: Optional[str],
+    alamat: Optional[str],
+    license_name: Optional[str],
+    documents: Optional[dict] = None,
+) -> dict[str, str]:
+    """Assemble the `[data.KEY]` fill map for the PKPP SK from what the case
+    session holds. Identity fields fill deterministically; vessel/permit fields
+    come from ONE best-effort Vision pass; the SIAP/officer-assigned fields are
+    left blank. Never raises — a Vision miss just yields more blanks."""
+    data: dict[str, str] = {
+        "nama_pemohon": (applicant_name or "").strip(),
+        "alamat": (alamat or "").strip(),
+        "jenis_pengadaan": _jenis_pengadaan_from_license(license_name),
+    }
+    vessel = await _extract_vessel_fields(documents)
+    data.update(vessel)
+    # no_ppkp / rekom_tgl_penetapan intentionally absent → rendered as blanks.
+    return data
+
+
+async def render_sk_docx(
+    license_id: Optional[int],
+    data: dict[str, Any],
+    *,
+    ticket: Optional[str] = None,
+) -> Optional[tuple[bytes, str]]:
+    """Render the PKPP approval letter (SK) from SIAP's LICENSE-RECOMMEND
+    template, filled with `data`. Returns (docx_bytes, "SK_PPKP_<ticket>.docx")
+    or None on ANY miss (disabled, no license_id, no template, 404, fill error,
+    python-docx absent) so the caller degrades gracefully. Never raises.
+    """
+    if not _ENABLED or license_id is None:
+        return None
+
+    try:
+        from services.siap_tools import siap_get_output_template
+        info = await siap_get_output_template(int(license_id))
+    except Exception:
+        logger.exception("siap_get_output_template lookup failed | license=%s", license_id)
+        return None
+
+    if not info.get("found"):
+        logger.info("SK render: no output template | license=%s", license_id)
+        return None
+    internal = info.get("internal_filename")
+    if not internal or not str(internal).lower().endswith(".docx"):
+        logger.info(
+            "SK render: template not a .docx | license=%s file=%s",
+            license_id, info.get("file_name"),
+        )
+        return None
+
+    raw = await fetch_template_bytes(internal)
+    if not raw:
+        return None
+
+    try:
+        filled = fill_docx_placeholders(raw, data)
+    except Exception:
+        logger.exception("SK render: fill failed | license=%s", license_id)
+        return None
+
+    safe_ticket = re.sub(r"\W", "", str(ticket or "")) or "draft"
+    return filled, f"SK_PPKP_{safe_ticket}.docx"
