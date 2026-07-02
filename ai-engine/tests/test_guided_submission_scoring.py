@@ -67,12 +67,29 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _suitability_result(percent=90, critical=False):
+def _suitability_result(percent=90, critical=False, blocking=False):
+    """Build a SuitabilityResult fixture.
+
+    critical → a critical issue whose id is NOT a blocking prefix (a soft
+               critical; won't trip the hard gate).
+    blocking → a missing-mandatory-doc issue whose id IS a blocking prefix
+               (a real HARD block: no submit offer, non-overridable).
+    """
     issues = []
+    missing = []
+    required = ["KTP"]
     if critical:
-        issues = [Issue(id="c", severity="critical", title="Dokumen wajib hilang", detail="d")]
+        issues.append(Issue(id="c", severity="critical", title="Dokumen wajib hilang", detail="d"))
+    if blocking:
+        required = ["KTP", "NPWP"]
+        missing = ["NPWP"]
+        issues.append(Issue(
+            id="completeness:missing:NPWP", severity="critical",
+            title="Dokumen wajib belum diunggah: NPWP", detail="Mohon lengkapi.",
+        ))
     return SuitabilityResult(
-        completeness=CompletenessSection(score=1.0, missing=[], required=["KTP"]),
+        completeness=CompletenessSection(score=1.0 if not missing else 0.5,
+                                         missing=missing, required=required),
         type_correctness=[],
         suitability=[],
         compatibility_findings=[],
@@ -296,6 +313,120 @@ class TestProcessCollectedDocuments(unittest.TestCase):
             reply = _run(gs._process_collected_documents(sess))
         self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
         self.assertIn("belum menerima", reply.lower())
+
+
+class TestHardGate(unittest.TestCase):
+    """BIMA-as-verificator: a BLOCKING issue (missing mandatory doc / wrong
+    type / sign-doc missing meterai-ttd-stamp) must BLOCK submission — no
+    'ajukan sekarang?' offer, non-overridable, stays COLLECTING_DOCS."""
+
+    def setUp(self):
+        gs._sessions.clear()
+
+    def _sla_session(self):
+        sess = _make_session(gs.Stage.COLLECTING_DOCS, with_fields=False)
+        sess.license_id = 459
+        sess.license_name = "PPKP"
+        sess.sla_working_days = 7
+        sess.documents = [gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"\xff\xd8\xff")]
+        return sess
+
+    def test_missing_mandatory_doc_blocks_and_guides_no_offer(self):
+        sess = self._sla_session()
+        _run(gs._put_session(sess))
+        blocked = _suitability_result(60, blocking=True)
+        with patch("services.citizen_scorer.score_session_documents",
+                   new=AsyncMock(return_value=blocked)), \
+             patch("services.gemini_vision.extract_ktp_fields",
+                   new=AsyncMock(return_value=_KTP)), \
+             patch("services.gemini_vision.is_configured", return_value=True):
+            reply = _run(gs._process_collected_documents(sess))
+        # Stays collecting — NOT confirm.
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+        # No submit offer of any kind.
+        self.assertNotIn("ajukan sekarang", reply.lower())
+        self.assertNotIn("apa adanya", reply.lower())
+        # Lists what's wrong + how to fix + the closing "complete then resend".
+        self.assertIn("NPWP", reply)
+        self.assertIn("Silakan lengkapi lalu kirim lagi ya.", reply)
+        # Officer grounding — the SLA is surfaced.
+        self.assertIn("7 hari kerja", reply)
+
+    def test_clean_packet_offers_submission(self):
+        sess = self._sla_session()
+        _run(gs._put_session(sess))
+        clean = _suitability_result(90)  # 1/1 complete, no issues
+        with patch("services.citizen_scorer.score_session_documents",
+                   new=AsyncMock(return_value=clean)), \
+             patch("services.gemini_vision.extract_ktp_fields",
+                   new=AsyncMock(return_value=_KTP)), \
+             patch("services.gemini_vision.is_configured", return_value=True):
+            reply = _run(gs._process_collected_documents(sess))
+        self.assertEqual(sess.stage, gs.Stage.CONFIRM)
+        self.assertIn("ajukan sekarang", reply.lower())
+        self.assertIn("7 hari kerja", reply)  # officer grounding on confirm too
+
+    def test_submit_force_cannot_override_blocking(self):
+        # Even a forced AFFIRM ("ajukan apa adanya") must NOT submit past a
+        # blocking issue. The submission client must never be reached.
+        sess = _make_session(gs.Stage.CONFIRM)
+        sess.license_id = 459
+        sess.license_name = "PPKP"
+        sess.sla_working_days = 7
+        sess.documents = [gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
+        sess.override_offered = True  # a prior soft-override was offered
+        sess.last_score = {
+            "ok": False, "status": "needs_fix", "score_percent": 60,
+            "summary": "s", "message": "m", "issues": [],
+            "result": _suitability_result(60, blocking=True),
+        }
+        _run(gs._put_session(sess))
+
+        client_probe = {"configured": 0}
+
+        def _is_configured():
+            client_probe["configured"] += 1
+            return True
+
+        fake_client = types.SimpleNamespace(
+            is_configured=_is_configured,
+            create_request=AsyncMock(return_value={"ok": True, "ticket": "X"}),
+        )
+        with patch.dict(os.environ, {"GUIDED_SUBMISSION_PROFILE_ID": "12345"}, clear=False):
+            with patch("services.siap_submission_client.get_siap_submission_client",
+                       return_value=fake_client):
+                reply = _run(gs._submit(sess, force=True))
+        # Blocked before any SIAP call — client never consulted.
+        self.assertEqual(client_probe["configured"], 0)
+        fake_client.create_request.assert_not_awaited()
+        # Dropped back to collecting; override flag reset; guidance returned.
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+        self.assertFalse(sess.override_offered)
+        self.assertIn("NPWP", reply)
+        self.assertIn("Silakan lengkapi lalu kirim lagi ya.", reply)
+
+    def test_soft_shortfall_is_submittable_not_blocked(self):
+        # A sub-threshold packet with everything mandatory present+valid is a
+        # SOFT warning — offered "apa adanya", not hard-blocked.
+        sess = _make_session(gs.Stage.CONFIRM)
+        sess.license_id = 459
+        sess.license_name = "PPKP"
+        sess.documents = [gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
+        sess.last_score = {
+            "ok": False, "status": "needs_fix", "score_percent": 70,
+            "summary": "s", "message": "m", "issues": [],
+            "result": _suitability_result(70),  # no blocking issue
+        }
+        _run(gs._put_session(sess))
+        unconfigured = types.SimpleNamespace(is_configured=lambda: False)
+        with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
+            with patch("services.siap_submission_client.get_siap_submission_client",
+                       return_value=unconfigured):
+                reply = _run(gs._submit(sess, force=False))
+        # Soft-override offer (not the hard-block guidance), stays CONFIRM.
+        self.assertEqual(sess.stage, gs.Stage.CONFIRM)
+        self.assertTrue(sess.override_offered)
+        self.assertIn("apa adanya", reply.lower())
 
 
 class TestHandleInboundDocumentsSilent(unittest.TestCase):
