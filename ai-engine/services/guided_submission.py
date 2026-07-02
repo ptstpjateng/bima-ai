@@ -1622,6 +1622,7 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
                 license_id=sess.license_id,
                 license_name=sess.license_name,
                 applicant_name=sess.fields.get("applicant_name"),
+                applicant_alamat=sess.fields.get("alamat"),
                 score=sess.last_score,
                 documents=list(sess.documents),
             )

@@ -399,6 +399,95 @@ async def siap_get_templates(license_id: int) -> dict:
 
 
 # ===========================================================================
+# Tool 1c — siap_get_output_template  (the OFFICER-facing SK/Persetujuan template)
+#
+# SIAP hosts the DECISION-OUTPUT template (the Surat PKPP / approval letter the
+# officer drafts, distinct from the citizen-facing PUBLIC-DOWNLOAD forms) as a
+# file in `ptsp.files` marked `stereotype='LICENSE-RECOMMEND'` and keyed to the
+# licence by `owner_id`. For PPKP (license 459) it is file_id=1533,
+# "Surat PKPP V2.docx". It fills via literal `[data.KEY]` placeholder tokens
+# (see services/siap_templates.fill_docx_placeholders), NOT the citizen forms'
+# "Label : <blank>" layout. Read-only; the blank template is non-PII.
+# ===========================================================================
+
+_SQL_OUTPUT_TEMPLATE_BY_LICENSE = """
+    SELECT file_id,
+           file_name,
+           file_type,
+           internal_filename
+      FROM ptsp.files
+     WHERE stereotype = 'LICENSE-RECOMMEND'
+       AND owner_id = $1
+     ORDER BY file_id
+     LIMIT 1
+"""
+
+
+async def siap_get_output_template(license_id: int) -> dict:
+    """Return the SIAP LICENSE-RECOMMEND output template for a licence — the
+    Surat Keputusan/Persetujuan (SK) draft the officer issues, filled via
+    `[data.KEY]` placeholders.
+
+    Mirrors `siap_get_templates` but targets the officer-facing DECISION output
+    (stereotype 'LICENSE-RECOMMEND') rather than the citizen download forms
+    (stereotype 'PUBLIC-DOWNLOAD'). One licence has one such template; we take
+    the first (lowest file_id) if SIAP ever holds more than one.
+
+    Args:
+      license_id: the resolved SIAP licence id (e.g. 459 for PPKP).
+
+    Returns:
+      {
+        "found": bool,
+        "license_id": int,
+        "file_id": int | None,
+        "file_name": str | None,
+        "file_type": str | None,
+        "internal_filename": str | None,   # storage key, master/{ULID}.docx
+      }
+    On miss / not configured / error: found=False with a `note`. Never raises.
+    """
+    if not is_siap_db_configured():
+        return {"found": False, "note": "Integrasi basis data SIAP belum dikonfigurasi."}
+    if license_id is None:
+        return {"found": False, "note": "Wajib mengisi license_id."}
+
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_OUTPUT_TEMPLATE_BY_LICENSE, int(license_id))
+        if row is None:
+            logger.info(
+                "siap_get_output_template | license_id=%s | no LICENSE-RECOMMEND file",
+                license_id,
+            )
+            return {
+                "found": False,
+                "license_id": int(license_id),
+                "note": (
+                    "Tidak ada template output (LICENSE-RECOMMEND) untuk izin ini "
+                    "di SIAP."
+                ),
+            }
+        logger.info(
+            "siap_get_output_template | license_id=%s | file_id=%s",
+            license_id, row["file_id"],
+        )
+        return {
+            "found": True,
+            "license_id": int(license_id),
+            "file_id": row["file_id"],
+            "file_name": row["file_name"],
+            "file_type": row["file_type"],
+            "internal_filename": row["internal_filename"],
+        }
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.exception("siap_get_output_template failed | license_id=%s", license_id)
+        return {"found": False, "license_id": license_id,
+                "note": f"Gagal membaca template output dari basis data SIAP: {exc}"}
+
+
+# ===========================================================================
 # Tool 2 — siap_get_status
 #
 # Per-ticket live status. The inventory backs this with the REST endpoint;
