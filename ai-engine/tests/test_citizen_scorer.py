@@ -576,5 +576,77 @@ class TestIsSubmissionReady(unittest.TestCase):
         self.assertFalse(cs.is_submission_ready(res))
 
 
+class TestSignSignalsPerDocType(unittest.TestCase):
+    """Each sign-doc shows ONLY the legal signal it actually requires:
+    meterai for Pakta/Permohonan, cap/stempel for Surat Pesanan."""
+
+    def _finding(self, detected_type, **kw):
+        return TypeCorrectnessFinding(
+            file="d.pdf", file_id="d1", claimed_type=detected_type,
+            detected_type=detected_type, confidence=0.9, matches=True, **kw,
+        )
+
+    def test_surat_pesanan_shows_cap_not_meterai(self):
+        # Regression: a Surat Pesanan needs a cap/stempel, NOT a meterai — so it
+        # must not say "meterai belum terlihat" (the rehearsal bug).
+        res = _result(type_correctness=[
+            self._finding("Surat_Pesanan", has_stamp=True, has_meterai=False, has_signature=True)
+        ])
+        msg = cs.render_score_message(res)
+        self.assertIn("cap terlihat", msg)
+        self.assertNotIn("meterai belum terlihat", msg)
+        self.assertNotIn("meterai terlihat", msg)
+
+    def test_surat_pesanan_missing_stamp_flags_cap(self):
+        res = _result(type_correctness=[
+            self._finding("Surat_Pesanan", has_stamp=False, has_meterai=False, has_signature=True)
+        ])
+        msg = cs.render_score_message(res)
+        self.assertIn("cap belum terlihat", msg)
+        self.assertNotIn("meterai", msg)
+
+    def test_pakta_flags_missing_meterai(self):
+        res = _result(type_correctness=[
+            self._finding("Pakta_Integritas", has_meterai=False, has_signature=True)
+        ])
+        msg = cs.render_score_message(res)
+        self.assertIn("meterai belum terlihat", msg)
+
+
+class TestSelfExplainingScore(unittest.TestCase):
+    """When nothing mandatory is missing but the % is < 100, say the gap is
+    readability/content quality — not a missing berkas."""
+
+    _NOTE = "Sisa persentase"
+
+    def test_note_shown_when_complete_below_100(self):
+        res = _result(
+            overall=0.91,
+            completeness=CompletenessSection(score=1.0, missing=[], required=["KTP", "NIB"]),
+        )
+        self.assertIn(self._NOTE, cs.render_score_message(res))
+
+    def test_note_absent_when_docs_missing(self):
+        res = _result(
+            overall=0.8,
+            completeness=CompletenessSection(score=0.6, missing=["NPWP"], required=["KTP", "NIB", "NPWP"]),
+        )
+        self.assertNotIn(self._NOTE, cs.render_score_message(res))
+
+    def test_note_absent_at_100(self):
+        res = _result(
+            overall=1.0,
+            completeness=CompletenessSection(score=1.0, missing=[], required=["KTP", "NIB"]),
+        )
+        self.assertNotIn(self._NOTE, cs.render_score_message(res))
+
+    def test_note_absent_when_registry_unavailable(self):
+        res = _result(
+            overall=0.91,
+            completeness=CompletenessSection(score=0.0, missing=[], required=[], note="x"),
+        )
+        self.assertNotIn(self._NOTE, cs.render_score_message(res))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
