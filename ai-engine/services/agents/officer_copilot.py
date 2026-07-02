@@ -108,6 +108,7 @@ import httpx
 from dotenv import load_dotenv
 
 from services.agents.validator import _normalize_name
+from services.pii import mask_nik
 from services.rag_service import query_regulations
 from services.siap_client import get_siap_client
 from services.siap_tools import siap_get_status_timeline
@@ -169,9 +170,13 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "atau referensi peraturan — selalu kutip dari hasil tool. Jika tool "
     "tidak mengembalikan data, katakan terus terang.\n"
     "3. Setelah menjelaskan sebuah masalah, tawarkan langkah konkret: "
-    "menelusuri dokumen tertentu, membandingkan field (mis. NIK di KTP vs "
-    "NIB lewat `compare_field`), atau mencari dasar hukum lewat "
-    "`cite_regulation`.\n"
+    "menelusuri dokumen tertentu atau mencari dasar hukum lewat "
+    "`cite_regulation`. Untuk mencocokkan IDENTITAS lintas dokumen (mis. "
+    "'bandingkan NIK di KTP dengan surat permohonan', 'cocokkan nama di KTP "
+    "dan surat permohonan'), panggil `compare_identity` — tool itu membaca "
+    "sendiri kedua berkas dan langsung membandingkan; JANGAN menyerah atau "
+    "menjawab tidak bisa. `compare_field` hanya untuk dua dict field yang "
+    "sudah diekstrak.\n"
     "4. Saat petugas membuka kasus, panggil `get_case_log_notes` untuk "
     "membaca catatan dari meja/tahap sebelumnya. Sampaikan catatan itu "
     "supaya petugas saat ini tahu apa yang dikatakan petugas sebelumnya.\n"
@@ -699,6 +704,38 @@ def _resolve_doc_ref(ctx: dict, doc_ref: str) -> Optional[str]:
     return None
 
 
+def _bytes_gone_message_for_ref(doc_ref: str) -> Optional[str]:
+    """When a send/view ref doesn't resolve in the (bytes-carrying) doc context
+    but DOES match the retained read-digest, return an honest "we read it, the
+    file is gone" message. Returns None when the digest doesn't know the ref
+    either (a genuine not-found). Mirrors `_digest_summary_for_ref`'s matching
+    so send + summary agree on what documents exist."""
+    digest = _documents_digest_from_ctx()
+    if not digest:
+        return None
+    ref = _norm_ref(doc_ref)
+    if not ref:
+        return None
+    for entry in digest:
+        labels = (
+            _norm_ref(entry.get("detected_type")),
+            _norm_ref(entry.get("claimed_type")),
+            _norm_ref(entry.get("filename")),
+        )
+        if any(lbl and (ref == lbl or ref in lbl or lbl in ref) for lbl in labels):
+            label = (
+                str(entry.get("filename") or "").strip()
+                or str(entry.get("detected_type") or "").strip()
+                or doc_ref
+            )
+            return (
+                f"Dokumen {label} tercatat pada pengajuan ini, tetapi berkas "
+                "aslinya tidak lagi tersimpan di sesi (mis. setelah proses "
+                "dimulai ulang), jadi belum bisa saya kirimkan."
+            )
+    return None
+
+
 def send_document(doc_ref: str) -> str:
     """Officer asks to RECEIVE/VIEW a specific uploaded document ("kirim
     KTP-nya", "boleh saya lihat surat pesanannya").
@@ -713,7 +750,14 @@ def send_document(doc_ref: str) -> str:
     """
     ctx = _doc_context.get()
     if not ctx or not isinstance(ctx, dict):
-        # No in-session bytes bound (admin dashboard path) — nothing to send.
+        # No in-session bytes bound. It may still be a doc BIMA read whose bytes
+        # were dropped on a rehydrate — the retained digest remembers it; give
+        # the truthful "read it, file gone" line rather than a blanket "not
+        # available on this session". Falls back to the blanket line when even
+        # the digest doesn't know the ref (genuine admin-dashboard path).
+        degraded = _bytes_gone_message_for_ref(doc_ref)
+        if degraded:
+            return degraded
         return (
             f"Dokumen '{doc_ref}' tidak dapat dikirim: berkas tidak tersedia "
             "pada sesi ini."
@@ -721,10 +765,30 @@ def send_document(doc_ref: str) -> str:
 
     file_id = _resolve_doc_ref(ctx, doc_ref)
     if file_id is None:
+        # Not in the (bytes-carrying) doc context. It may still be a document
+        # BIMA read whose bytes were dropped on a Redis rehydrate — the digest
+        # remembers it. Distinguish "we never had it" from "we had it, bytes
+        # gone" so the officer gets a truthful, non-dead-end answer.
+        degraded = _bytes_gone_message_for_ref(doc_ref)
+        if degraded:
+            return degraded
         return f"Dokumen '{doc_ref}' tidak ditemukan pada pengajuan ini."
 
     doc = ctx.get(file_id) or {}
     label = doc.get("filename") or doc.get("claimed_type") or file_id
+
+    # The doc resolved but its bytes are gone (empty content after a rehydrate
+    # that dropped the payload — e.g. an oversize doc not persisted to Redis).
+    # A tool can only return text, and _deliver_documents would silently skip an
+    # empty doc; tell the officer plainly instead of confirming a send that
+    # never happens.
+    if not doc.get("content"):
+        return (
+            f"Dokumen {label} tercatat pada pengajuan ini, tetapi berkas "
+            "aslinya tidak lagi tersimpan di sesi (mis. setelah proses "
+            "dimulai ulang), jadi belum bisa saya kirimkan. Ringkasannya "
+            "masih bisa saya sampaikan dari catatan pemeriksaan."
+        )
 
     queue = _docs_to_send_context.get()
     if isinstance(queue, list):
@@ -787,6 +851,196 @@ def compare_field(doc_a: dict, doc_b: dict, field: str) -> dict:
         "equal": equal,
         "similarity": round(similarity, 4),
         "note": note,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-document identity comparison — the headline verificator feature
+# ([[Decisions]] §22). The officer asks "bandingkan NIK di KTP dengan surat
+# permohonan" / "cocokkan nama di KTP dan surat permohonan". `compare_field`
+# is a PURE comparator that needs two already-extracted field dicts, but the
+# copilot has no tool that READS the per-doc identity fields out of the raw
+# uploads. So the model would call get_doc_summary (prose only) and dead-end.
+#
+# This tool closes that gap: it resolves two doc refs against the in-session
+# bytes, runs one lightweight Gemini Vision identity-extraction per doc (NIK +
+# nama), and compares with the SAME validator-aligned normalisation
+# `compare_field` uses. Degrades cleanly when a field can't be read or a doc's
+# bytes are gone. NIK is masked in the officer-facing result (the officer-brief
+# policy) and NEVER logged.
+# ---------------------------------------------------------------------------
+
+_IDENTITY_EXTRACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "nik": {
+            "type": "string",
+            "description": (
+                "The 16-digit NIK (Nomor Induk Kependudukan) printed on the "
+                "document, digits only. Empty string if none is visible."
+            ),
+        },
+        "nama": {
+            "type": "string",
+            "description": (
+                "The person's full name as printed on the document (the "
+                "applicant / pemohon / cardholder). Empty string if none is "
+                "visible."
+            ),
+        },
+    },
+    "required": ["nik", "nama"],
+}
+
+_IDENTITY_EXTRACT_PROMPT = (
+    "Anda asisten petugas perizinan. Dari dokumen terlampir, ambil identitas "
+    "pemohon: 'nik' (Nomor Induk Kependudukan, 16 digit, angka saja) dan "
+    "'nama' (nama lengkap orang yang tercantum). Jika sebuah field tidak "
+    "terlihat, kembalikan string kosong. Jangan mengarang — hanya yang benar-"
+    "benar terbaca di dokumen."
+)
+
+# Which identity field the officer's free-text `field` refers to.
+_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "nik": ("nik", "nomor induk", "no ktp", "nomor ktp", "no. ktp"),
+    "nama": ("nama", "name", "pemilik", "pemohon", "atas nama"),
+}
+
+
+def _canonical_identity_field(field: str) -> str:
+    """Map the officer's free-text field ('NIK', 'nama pemohon') onto one of
+    the identity keys we extract ('nik' | 'nama'). Defaults to 'nik' — the most
+    common verificator ask — when nothing matches."""
+    f = _norm_ref(field)
+    for key, aliases in _FIELD_ALIASES.items():
+        if any(a in f for a in aliases):
+            return key
+    return "nik"
+
+
+async def _extract_identity(doc: dict) -> Optional[dict[str, str]]:
+    """Run one Gemini Vision identity extraction over an in-session doc's bytes.
+    Returns {'nik','nama'} (values may be '') or None when Vision is
+    unconfigured / fails / the bytes are absent. Bytes are never logged."""
+    content = doc.get("content") if isinstance(doc, dict) else None
+    if not content:
+        return None
+    from services.gemini_vision import extract_structured, is_configured
+
+    if not is_configured():
+        return None
+    parsed = await extract_structured(
+        image_bytes=content,
+        mime_type=doc.get("mime_type", "application/octet-stream"),
+        prompt=_IDENTITY_EXTRACT_PROMPT,
+        response_schema=_IDENTITY_EXTRACT_SCHEMA,
+    )
+    if not parsed or not isinstance(parsed, dict):
+        return None
+    return {
+        "nik": re.sub(r"\D", "", str(parsed.get("nik") or "")),
+        "nama": str(parsed.get("nama") or "").strip(),
+    }
+
+
+async def compare_identity(doc_a: str, doc_b: str, field: str = "nik") -> dict:
+    """
+    Compare an IDENTITY field (NIK or name) between two uploaded documents —
+    the headline verificator ask, e.g. "bandingkan NIK di KTP dengan surat
+    permohonan" or "cocokkan nama di KTP dan surat permohonan".
+
+    `doc_a`/`doc_b` are document REFS the officer speaks (a type/label like
+    "KTP" / "surat permohonan", or a file_id). `field` is the field to compare
+    ('nik' or 'nama'; free text like "NIK"/"nama pemohon" is accepted).
+
+    The tool resolves both refs against the in-session document bytes, extracts
+    the requested field from each via Gemini Vision, and compares with the same
+    normalisation the validator uses (honorific-tolerant for names, digits-only
+    for NIK). Returns a structured, officer-narratable result — never raises.
+
+    On the admin-dashboard path (no in-session bytes) it says so plainly so the
+    model can direct the officer to the case page's validation instead of
+    dead-ending. NIK is MASKED in the returned strings (officer-brief policy);
+    the raw digits are compared internally but never surfaced or logged.
+    """
+    ctx = _doc_context.get()
+    key = _canonical_identity_field(field)
+    if not ctx or not isinstance(ctx, dict):
+        return {
+            "available": False,
+            "note": (
+                "Perbandingan lintas-dokumen butuh berkas asli yang dikirim di "
+                "sesi ini. Pada halaman kasus, gunakan hasil validasi (temuan "
+                "konsistensi) untuk kecocokan NIK/nama antar dokumen."
+            ),
+        }
+
+    fid_a = _resolve_doc_ref(ctx, doc_a)
+    fid_b = _resolve_doc_ref(ctx, doc_b)
+    missing = [
+        ref for ref, fid in ((doc_a, fid_a), (doc_b, fid_b)) if fid is None
+    ]
+    if missing:
+        labels = sorted(
+            (d.get("filename") or d.get("detected_type")
+             or d.get("claimed_type") or fid)
+            for fid, d in ctx.items()
+        )
+        return {
+            "available": False,
+            "note": (
+                f"Dokumen tidak ditemukan di sesi ini: {', '.join(missing)}. "
+                f"Dokumen tersedia: {', '.join(labels) or '(tidak ada)'}."
+            ),
+        }
+
+    id_a = await _extract_identity(ctx.get(fid_a) or {})
+    id_b = await _extract_identity(ctx.get(fid_b) or {})
+    label_a = (ctx.get(fid_a) or {}).get("filename") or doc_a
+    label_b = (ctx.get(fid_b) or {}).get("filename") or doc_b
+
+    if id_a is None or id_b is None:
+        return {
+            "available": False,
+            "field": key,
+            "note": (
+                f"Tidak dapat membaca {key.upper()} dari salah satu dokumen "
+                f"({label_a} / {label_b}) — berkas mungkin tidak lagi tersimpan "
+                "atau tidak terbaca jelas."
+            ),
+        }
+
+    val_a = id_a.get(key, "")
+    val_b = id_b.get(key, "")
+
+    # Reuse the pure comparator so normalisation matches the validator exactly.
+    cmp = compare_field({key: val_a}, {key: val_b}, key)
+
+    # Officer-facing display: mask NIK (brief policy); names shown in the clear
+    # to the authorized officer, matching how the validator's name-consistency
+    # finding already surfaces both names. Nothing here is logged.
+    def _display(v: str) -> str:
+        if not v:
+            return "(tidak terbaca)"
+        return mask_nik(v) if key == "nik" else v
+
+    return {
+        "available": True,
+        "field": key,
+        "doc_a": label_a,
+        "doc_b": label_b,
+        "value_a": _display(val_a),
+        "value_b": _display(val_b),
+        "equal": cmp["equal"],
+        "similarity": cmp["similarity"],
+        "note": (
+            f"{key.upper()} pada {label_a}: {_display(val_a)}; pada {label_b}: "
+            f"{_display(val_b)}. "
+            + (
+                "KEDUANYA COCOK." if cmp["equal"]
+                else f"TIDAK identik (kemiripan {int(cmp['similarity'] * 100)}%)."
+            )
+        ),
     }
 
 
@@ -1317,6 +1571,43 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "compare_identity",
+        "description": (
+            "Bandingkan field IDENTITAS (NIK atau nama) antara DUA dokumen yang "
+            "diunggah — fitur andalan verifikasi. Gunakan saat petugas minta "
+            "mencocokkan NIK/nama antar berkas, mis. 'bandingkan NIK di KTP "
+            "dengan surat permohonan', 'cocokkan nama di KTP dan surat "
+            "permohonan'. Tool ini MEMBACA sendiri kedua dokumen (Gemini "
+            "Vision) lalu membandingkan — jadi TIDAK perlu memanggil "
+            "get_doc_summary atau compare_field lebih dulu. `doc_a`/`doc_b` "
+            "adalah jenis/label dokumen (mis. 'KTP', 'surat permohonan') atau "
+            "file_id; `field` = 'nik' atau 'nama'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "doc_a": {
+                    "type": "string",
+                    "description": (
+                        "Dokumen pertama — jenis/label (mis. 'KTP') atau file_id."
+                    ),
+                },
+                "doc_b": {
+                    "type": "string",
+                    "description": (
+                        "Dokumen kedua — jenis/label (mis. 'surat permohonan') "
+                        "atau file_id."
+                    ),
+                },
+                "field": {
+                    "type": "string",
+                    "description": "Field identitas: 'nik' atau 'nama'.",
+                },
+            },
+            "required": ["doc_a", "doc_b", "field"],
+        },
+    },
+    {
         "name": "cite_regulation",
         "description": (
             "Cari kutipan peraturan OSS-RBA dari ChromaDB. Mengembalikan "
@@ -1470,6 +1761,7 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "get_doc_summary": get_doc_summary,
     "send_document": send_document,
     "compare_field": compare_field,
+    "compare_identity": compare_identity,
     "cite_regulation": cite_regulation,
     "get_case_log_notes": get_case_log_notes,
     "get_siap_signing_link": get_siap_signing_link,
@@ -1495,6 +1787,7 @@ _OFFICER_TOOL_NAMES = frozenset({
     "get_doc_summary",
     "send_document",
     "compare_field",
+    "compare_identity",
     "cite_regulation",
     "get_case_log_notes",
     "forward_case",

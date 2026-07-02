@@ -769,6 +769,84 @@ class TestOfficerMediaShortCircuit(unittest.TestCase):
         self.assertIn("pdf", kw["body"].lower())
 
 
+class TestOfficerNeverGetsCitizenGreeting(unittest.TestCase):
+    """Edge 1: a recognized officer must NEVER receive the citizen welcome or
+    the citizen AI reply. Both entry points are guarded:
+      * the inbound TEXT path (greeting-dedup + bare-greeting branches), and
+      * the first-contact greeting endpoint (_send_greeting).
+    A live rehearsal showed an officer's 'bandingkan NIK ...' getting the
+    'Halo! Saya BIMA, asisten AI perizinan UMKM ...' script."""
+
+    def setUp(self):
+        _reset_all()
+        from services import officer_bridge as ob
+        ob._sessions.clear()
+        ob._reset_officer_cache()
+
+    _OFFICER_ENV = {
+        "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+        "BIMA_OFFICER_WA_PHONE": "628999000111",
+        "BIMA_OFFICER_TG_CHAT": "",
+    }
+
+    def test_officer_text_routes_to_officer_bridge_not_citizen(self):
+        # An officer's real message ("bandingkan NIK ...") must be scheduled on
+        # _process_inbound (officer fast-path), flagged officer=True — and NOT
+        # trigger the bare-greeting/citizen branches.
+        bg = _FakeBackground()
+        payload = {"phoneNumber": "628999000111", "name": "Petugas",
+                   "payload": {"messages": [{"type": "text",
+                               "text": {"body": "bandingkan NIK di ktp dengan surat permohonan"}}]}}
+        with patch.dict(os.environ, self._OFFICER_ENV, clear=False):
+            with patch.object(aptana, "_PATH_SECRET", "s3cret"):
+                res = _run(aptana.aptana_inbound("s3cret", _FakeRequest(payload), bg))
+        self.assertTrue(res.get("officer"))
+        self.assertEqual(len(bg.tasks), 1)
+        self.assertIs(bg.tasks[0][0], aptana._process_inbound)
+
+    def test_officer_bare_hello_does_not_get_short_greeting(self):
+        # Even a bare "halo" from an officer must route to the officer bridge,
+        # NOT the citizen _SHORT_GREETING.
+        bg = _FakeBackground()
+        payload = {"phoneNumber": "628999000111", "name": "Petugas",
+                   "payload": {"messages": [{"type": "text", "text": {"body": "halo"}}]}}
+        with patch.dict(os.environ, self._OFFICER_ENV, clear=False):
+            with patch.object(aptana, "_PATH_SECRET", "s3cret"):
+                res = _run(aptana.aptana_inbound("s3cret", _FakeRequest(payload), bg))
+        self.assertTrue(res.get("officer"))
+        # No send_text(short greeting) scheduled; only the officer fast-path.
+        self.assertEqual(len(bg.tasks), 1)
+        self.assertIs(bg.tasks[0][0], aptana._process_inbound)
+
+    def test_citizen_bare_hello_still_gets_short_greeting(self):
+        # Guard the guard: a NON-officer bare hello keeps the citizen behaviour.
+        bg = _FakeBackground()
+        payload = {"phoneNumber": "628000111222", "name": "Warga",
+                   "payload": {"messages": [{"type": "text", "text": {"body": "halo"}}]}}
+        with patch.dict(os.environ, self._OFFICER_ENV, clear=False):
+            with patch.object(aptana, "_PATH_SECRET", "s3cret"):
+                res = _run(aptana.aptana_inbound("s3cret", _FakeRequest(payload), bg))
+        self.assertEqual(res.get("skipped"), "bare_greeting")
+        self.assertEqual(len(bg.tasks), 1)
+        fn, _a, kw = bg.tasks[0]
+        self.assertIs(fn, aptana.send_text)
+        self.assertIn("BIMA", kw["body"])
+
+    def test_greeting_endpoint_suppresses_welcome_for_officer(self):
+        # The first-contact greeting endpoint must send NOTHING to an officer.
+        with patch.dict(os.environ, self._OFFICER_ENV, clear=False):
+            with _capture_sends():
+                _run(aptana._send_greeting(msisdn="628999000111", name="Petugas"))
+        self.assertEqual(_SENT, [])
+
+    def test_greeting_endpoint_still_welcomes_citizen(self):
+        with patch.dict(os.environ, self._OFFICER_ENV, clear=False):
+            with _capture_sends():
+                _run(aptana._send_greeting(msisdn="628000111222", name="Warga"))
+        self.assertEqual(len(_SENT), 1)
+        self.assertIn("asisten AI perizinan UMKM", _SENT[0]["body"])
+
+
 # ===========================================================================
 # (1) session_store round-trip through the PUBLIC async API + in-memory
 #     fallback when Redis is unavailable.

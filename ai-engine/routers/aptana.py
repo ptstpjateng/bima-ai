@@ -253,6 +253,23 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
 
     record_engagement(msisdn)
 
+    # Officer guard — a recognized officer (active case session OR any petugas
+    # in the officer directory) must NEVER receive the CITIZEN greeting/short-
+    # hello script. Their inbound is routed into the officer copilot fast-path
+    # in _process_inbound instead. Checked BEFORE the greeting-dedup and the
+    # bare-greeting branch: a live rehearsal showed an officer's first message
+    # ("bandingkan NIK ...") getting the citizen welcome because the greeting
+    # endpoint fired, and a bare officer "halo" would otherwise hit _SHORT_GREETING.
+    # Never raises — a bridge hiccup must not strand the message; we degrade to
+    # the normal citizen path (the officer fast-path in _process_inbound is the
+    # real guard downstream). Bare "stop"/opt-out is handled above and applies
+    # to everyone, so it is intentionally left before this check.
+    if _is_recognized_officer(msisdn):
+        background.add_task(
+            _process_inbound, msisdn=msisdn, text=sanitized, name=name, message_id=message_id
+        )
+        return {"ok": True, "officer": True}
+
     # Greeting dedup — WhatsApp fires BOTH ReceiveGreetingRequest AND
     # ReceiveMessageMeta for a user's very first message. The APTANA Greeting
     # worker forwards the greeting event here AND the Inbound worker forwards
@@ -281,6 +298,23 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
         _process_inbound, msisdn=msisdn, text=sanitized, name=name, message_id=message_id
     )
     return {"ok": True}
+
+
+def _is_recognized_officer(msisdn: str) -> bool:
+    """True when this sender is a REGISTERED officer (directory / active case /
+    env fallback) AND the officer bridge is enabled — i.e. their inbound must
+    stay on the officer surface and never see the citizen greeting/RAG.
+
+    Thin sync wrapper over officer_bridge.is_officer_channel_id (itself sync,
+    non-blocking — reads a warm cache). Never raises: a bridge import/lookup
+    failure degrades to False so the citizen path still runs (the officer
+    fast-path in _process_inbound is the downstream guard either way)."""
+    try:
+        from services import officer_bridge
+        return officer_bridge.is_officer_channel_id(msisdn)
+    except Exception:
+        logger.exception("officer recognition check failed | user=%s", _mask(msisdn))
+        return False
 
 
 async def _process_inbound(
@@ -576,6 +610,15 @@ async def aptana_greeting(path_secret: str, request: Request, background: Backgr
 
 async def _send_greeting(msisdn: str, name: str | None = None) -> None:
     """Send the static welcome message; never raises."""
+    # Officer guard — a recognized officer must never receive the CITIZEN
+    # welcome bubble (the "asisten AI perizinan UMKM" script). WhatsApp fires a
+    # first-contact greeting event for the officer's number too; suppress the
+    # citizen welcome for officers. The officer's own new-submission brief is
+    # delivered by the officer bridge, not this endpoint.
+    if _is_recognized_officer(msisdn):
+        logger.info("APTANA greeting suppressed for officer | user=%s", _mask(msisdn))
+        return
+
     body = _GREETING_BODY
 
     # Personalise if APTANA provided a real display name.
