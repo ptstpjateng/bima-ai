@@ -29,3 +29,7 @@ fpdf2>=2.7.8,<3
 # AES-128 encryption of the generated PDFs (doc_generator) needs `cryptography`.
 # Already pulled by python-jose[cryptography] above, so the container has it and
 # uses AES; doc_generator falls back to RC4 only if it is ever absent.
+# python-docx: fill the OFFICIAL SIAP .docx templates + rebuild the legacy .doc
+# Surat Permohonan as an editable DOCX (services/siap_templates.py). Pure-Python,
+# no system libs — so no LibreOffice/soffice in the image.
+python-docx>=1.1,<2

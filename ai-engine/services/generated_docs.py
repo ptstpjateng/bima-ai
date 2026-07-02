@@ -29,34 +29,41 @@ def _sweep(now: float) -> None:
 
 
 def store(pdf: bytes, filename: str, ttl: int = _TTL_SECONDS,
-          max_fetches: int = _MAX_FETCHES) -> str:
-    """Stash a PDF; return the unguessable token to put in the /dl/{token} URL.
+          max_fetches: int = _MAX_FETCHES, *, mime: str | None = None) -> str:
+    """Stash a file; return the unguessable token to put in the /dl/{token} URL.
+
+    `mime` defaults to a guess from the filename extension (so PDF callers stay
+    unchanged, DOCX callers get the right Content-Type) — APTANA infers the
+    WhatsApp document type from what /dl serves, so the mime must be correct.
 
     Short TTL + a fetch cap mean the link dies seconds after APTANA collects the
     file (which it re-hosts on Meta's CDN), shrinking the leak window to near
-    zero — defence-in-depth on top of the per-document AES encryption.
+    zero — defence-in-depth on top of the per-document AES encryption (PDFs).
     """
+    if mime is None:
+        import mimetypes
+        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     token = secrets.token_urlsafe(24)
     now = time.time()
     with _lock:
         _sweep(now)
-        _store[token] = [pdf, filename, now + ttl, max(1, max_fetches)]
+        _store[token] = [pdf, filename, now + ttl, max(1, max_fetches), mime]
     return token
 
 
-def fetch(token: str) -> tuple[bytes, str] | None:
-    """Return (pdf_bytes, filename) for a live token, else None. Consumes one of
-    the token's allowed fetches and burns it once exhausted or expired."""
+def fetch(token: str) -> tuple[bytes, str, str] | None:
+    """Return (bytes, filename, mime) for a live token, else None. Consumes one
+    of the token's allowed fetches and burns it once exhausted or expired."""
     now = time.time()
     with _lock:
         item = _store.get(token)
         if item is None:
             return None
-        pdf, name, exp, left = item
+        pdf, name, exp, left, mime = item
         if exp < now or left <= 0:
             _store.pop(token, None)
             return None
         item[3] = left - 1
         if item[3] <= 0:
             _store.pop(token, None)  # burn after the last allowed fetch
-        return pdf, name
+        return pdf, name, mime
