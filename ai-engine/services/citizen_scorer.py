@@ -115,6 +115,11 @@ _SIGN_DOC_CLASSES: set[str] = {"Pakta_Integritas", "Surat_Permohonan", "Surat_Pe
 # meterai — a Surat Pesanan to the galangan.
 _STAMP_DOC_CLASSES: set[str] = {"Surat_Pesanan"}
 
+# Sign-docs that legally need a meterai (Rp10.000). NOT every sign-doc: a Surat
+# Pesanan needs a cap/stempel, not a meterai — so we must not flag "meterai
+# belum terlihat" on it. Mirrors suitability_judge._METERAI_REQUIRED_CLASSES.
+_METERAI_DOC_CLASSES: set[str] = {"Pakta_Integritas", "Surat_Permohonan"}
+
 
 def _short(name: str, limit: int = 30) -> str:
     """Trim a long filename for readable display."""
@@ -151,23 +156,30 @@ def _completeness_line(result: SuitabilityResult) -> str:
 
 
 def _sign_signal_suffix(f) -> str:
-    """Compact legal-validity indicator for the sign-required docs — meterai,
-    plus a terse tanda-tangan / cap flag only when a required signal is
-    MISSING (present signals stay quiet to keep the line readable). Returns a
-    " — ..." suffix or "" when there is nothing to say.
+    """Compact legal-validity indicator — showing ONLY the signal each doc
+    actually requires: meterai for meterai-docs (Pakta, Surat Permohonan), a
+    cap/stempel for stamp-docs (Surat Pesanan), and a signature on every
+    sign-doc. This is why a Surat Pesanan no longer shows "meterai belum
+    terlihat" — it needs a cap, not a meterai. Returns a " — ..." suffix or "".
     """
     if f.detected_type not in _SIGN_DOC_CLASSES:
         return ""
     parts: list[str] = []
-    if f.has_meterai is True:
-        parts.append("meterai terlihat")
-    elif f.has_meterai is False:
-        parts.append("*meterai belum terlihat*")
-    # Signal a missing signature/stamp; don't clutter the line when present.
+    # Meterai — only for docs that legally need one.
+    if f.detected_type in _METERAI_DOC_CLASSES:
+        if f.has_meterai is True:
+            parts.append("meterai terlihat")
+        elif f.has_meterai is False:
+            parts.append("*meterai belum terlihat*")
+    # Cap/stempel — only for stamp-docs (e.g. Surat Pesanan).
+    if f.detected_type in _STAMP_DOC_CLASSES:
+        if f.has_stamp is True:
+            parts.append("cap terlihat")
+        elif f.has_stamp is False:
+            parts.append("*cap belum terlihat*")
+    # Signature — required on every sign-doc; flag only when missing.
     if f.has_signature is False:
         parts.append("*tanda tangan belum terlihat*")
-    if f.has_stamp is False and f.detected_type in _STAMP_DOC_CLASSES:
-        parts.append("*cap belum terlihat*")
     return f" — {', '.join(parts)}" if parts else ""
 
 
@@ -304,6 +316,17 @@ def render_score_message(
         f"*Skor kelayakan: {percent}%* ({band})",
         _completeness_line(result),
     ]
+
+    # Self-explaining score: when nothing mandatory is missing but the % is
+    # below 100, the gap is the AI's read of document TYPE + CONTENT quality,
+    # not a missing berkas — say so, so the citizen doesn't hunt for a phantom
+    # gap. Only when the registry was actually loaded (required non-empty).
+    if percent < 100 and result.completeness.required and not result.completeness.missing:
+        lines.append(
+            "_Sisa persentase adalah faktor keterbacaan & kesesuaian isi dokumen "
+            "(penilaian awal AI), bukan berkas yang kurang — petugas yang "
+            "memverifikasi final._"
+        )
 
     type_lines = _type_lines(result)
     if type_lines:
