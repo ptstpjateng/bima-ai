@@ -494,60 +494,160 @@ _DOC_SUMMARY_PROMPT = (
 )
 
 
-async def get_doc_summary(file_id: str) -> str:
+def _digest_summary_for_ref(doc_ref: str) -> Optional[str]:
+    """Best-effort summary of a document from the RETAINED read-digest text
+    when its bytes are gone (post-restart / Redis rehydrate stripped them).
+
+    The digest (Task F) survives a Redis round-trip while the raw bytes may not,
+    so "what BIMA read" (detected type, meterai, confidence) is still available
+    even when a Vision re-pass is impossible. We match `doc_ref` against the
+    digest's detected/claimed type + filename (same tolerance as
+    `_resolve_doc_ref`) and phrase a short factual line from it — never a
+    dead-end. Returns None when no digest entry matches.
     """
-    Return a short Indonesian summary of one supporting document.
+    digest = _documents_digest_from_ctx()
+    if not digest:
+        return None
+
+    ref = _norm_ref(doc_ref)
+    match: Optional[dict[str, Any]] = None
+    if ref:
+        for entry in digest:
+            labels = (
+                _norm_ref(entry.get("detected_type")),
+                _norm_ref(entry.get("claimed_type")),
+                _norm_ref(entry.get("filename")),
+            )
+            if any(lbl and (ref == lbl or ref in lbl or lbl in ref) for lbl in labels):
+                match = entry
+                break
+    # A single-document submission: honour a summary request even without a
+    # crisp label match, so the officer still gets what BIMA read.
+    if match is None and len(digest) == 1:
+        match = digest[0]
+    if match is None:
+        return None
+
+    detected = str(match.get("detected_type") or "").strip()
+    filename = str(match.get("filename") or "").strip()
+    label = filename or detected or doc_ref
+    bits: list[str] = []
+    if detected:
+        bits.append(f"BIMA membacanya sebagai *{detected}*")
+    conf = match.get("confidence")
+    if isinstance(conf, (int, float)):
+        bits.append(f"keyakinan {int(round(float(conf) * 100))}%")
+    if match.get("has_meterai") is True:
+        bits.append("materai terdeteksi")
+    elif match.get("has_meterai") is False:
+        bits.append("materai tidak terdeteksi")
+    if match.get("matches") is True:
+        bits.append("jenis sesuai dengan yang dinyatakan pemohon")
+    elif match.get("matches") is False:
+        bits.append("jenis TIDAK cocok dengan label pemohon")
+    detail = "; ".join(bits) if bits else "hanya metadata dasar yang tersimpan"
+    return (
+        f"📄 {label}: berkas aslinya tidak lagi tersedia di sesi ini, jadi "
+        f"saya belum bisa membaca ulang isinya. Dari catatan pemeriksaan: "
+        f"{detail}."
+    )
+
+
+async def get_doc_summary(doc_ref: str = "", file_id: str = "") -> str:
+    """
+    Return a short Indonesian summary of one supporting document. `doc_ref`
+    may be a document TYPE/NAME ("KTP", "surat permohonan", "proposal") OR a
+    literal file_id — the officer speaks in plain names, not ids. `file_id` is
+    accepted as an alias for backward-compat (the tool's earlier signature) so
+    a model that still emits `file_id` keeps working.
 
     DEMO PATH (chat bridge): when the citizen sent the document into the
     WhatsApp/Telegram session, BIMA holds the raw bytes and the officer bridge
-    injects them via `_doc_context`. In that case we run Gemini Vision over
-    the in-session bytes and return a real summary — a genuine answer to
-    "apa isi proposalnya?".
+    injects them via `_doc_context`. We resolve the ref to a file_id, run
+    Gemini Vision over the in-session bytes, and return a real summary — a
+    genuine answer to "apa isi proposalnya?".
 
-    FALLBACK (admin dashboard): when no in-session bytes are bound (SIAP has
-    no file-download endpoint), we return the canned placeholder. The contract
-    (file_id → str) is unchanged so neither the tool schema nor the front-end
-    needs to change.
+    GRACEFUL DEGRADE: if the bytes are genuinely gone (post-restart rehydrate
+    dropped them) but BIMA still holds the compact read-digest, we summarise
+    from that digest text and SAY the original can't be re-read — never a
+    dead-end on "tidak memiliki ID file".
+
+    FALLBACK (admin dashboard): when neither bytes nor digest are bound (SIAP
+    has no file-download endpoint), we return the canned placeholder.
     """
+    doc_ref = (doc_ref or file_id or "").strip()
     ctx = _doc_context.get()
     if ctx and isinstance(ctx, dict):
-        doc = ctx.get(file_id)
-        if doc is None:
-            # The officer named a file_id we don't hold — list what we do have
-            # so the model can re-ask with a valid id.
-            available = ", ".join(sorted(ctx.keys())) or "(tidak ada)"
-            return (
-                f"Dokumen dengan id '{file_id}' tidak tersedia di sesi ini. "
-                f"Dokumen yang ada: {available}."
-            )
-        from services.gemini_vision import extract_structured, is_configured
+        file_id = _resolve_doc_ref(ctx, doc_ref)
+        doc = ctx.get(file_id) if file_id else None
+        content = doc.get("content") if doc else None
+        if doc is not None and content:
+            from services.gemini_vision import extract_structured, is_configured
 
-        if not is_configured():
-            return (
-                f"Ringkasan dokumen {doc.get('filename', file_id)} belum dapat "
-                "dibuat — Gemini Vision belum dikonfigurasi di server."
+            if not is_configured():
+                return (
+                    f"Ringkasan dokumen {doc.get('filename', file_id)} belum "
+                    "dapat dibuat — Gemini Vision belum dikonfigurasi di server."
+                )
+            parsed = await extract_structured(
+                image_bytes=content,
+                mime_type=doc.get("mime_type", "application/octet-stream"),
+                prompt=_DOC_SUMMARY_PROMPT,
+                response_schema=_DOC_SUMMARY_SCHEMA,
             )
-        parsed = await extract_structured(
-            image_bytes=doc["content"],
-            mime_type=doc.get("mime_type", "application/octet-stream"),
-            prompt=_DOC_SUMMARY_PROMPT,
-            response_schema=_DOC_SUMMARY_SCHEMA,
+            if parsed and isinstance(parsed, dict) and parsed.get("summary"):
+                label = doc.get("filename", file_id)
+                return f"📄 {label}: {str(parsed['summary']).strip()}"
+            # Vision failed on real bytes — try the digest before giving up.
+            degraded = _digest_summary_for_ref(doc_ref)
+            if degraded:
+                return degraded
+            return (
+                f"Tidak dapat membaca dokumen {doc.get('filename', file_id)} — "
+                "pastikan berkas jelas (foto/PDF tidak buram)."
+            )
+
+        # Resolved to a doc whose bytes are gone (or didn't resolve at all):
+        # degrade to the retained digest rather than dead-ending on "no id".
+        degraded = _digest_summary_for_ref(doc_ref)
+        if degraded:
+            return degraded
+
+        # Nothing to summarise from — tell the model what IS available so it can
+        # re-ask, listing human labels (not opaque ids) where we have them.
+        labels = sorted(
+            (
+                d.get("filename")
+                or d.get("detected_type")
+                or d.get("claimed_type")
+                or fid
+            )
+            for fid, d in ctx.items()
         )
-        if parsed and isinstance(parsed, dict) and parsed.get("summary"):
-            label = doc.get("filename", file_id)
-            return f"📄 {label}: {str(parsed['summary']).strip()}"
+        available = ", ".join(labels) or "(tidak ada)"
         return (
-            f"Tidak dapat membaca dokumen {doc.get('filename', file_id)} — "
-            "pastikan berkas jelas (foto/PDF tidak buram)."
+            f"Dokumen '{doc_ref}' tidak ditemukan di sesi ini. "
+            f"Dokumen yang tersedia: {available}."
         )
 
-    # No in-session bytes — admin dashboard path; SIAP file fetch not wired.
+    # No in-session bytes bound — try the retained digest (survives a restart
+    # even when the doc context does not), then the canned placeholder.
+    degraded = _digest_summary_for_ref(doc_ref)
+    if degraded:
+        return degraded
     return (
-        f"[Ringkasan dokumen file_id={file_id} belum tersedia di jalur ini]. "
+        f"[Ringkasan dokumen '{doc_ref}' belum tersedia di jalur ini]. "
         "Endpoint pengunduhan dokumen SIAP belum diaktifkan. Pada alur chat "
         "(WhatsApp/Telegram) di mana dokumen dikirim langsung ke BIMA, "
         "ringkasan dibuat otomatis dengan Gemini Vision."
     )
+
+
+def _norm_ref(s: Any) -> str:
+    """Space/underscore-agnostic, case-insensitive label normaliser. Shared by
+    the doc-ref resolver and the digest fallback so "surat pesanan",
+    "Surat_Pesanan", and "SURAT  PESANAN" all collapse to one form."""
+    return re.sub(r"[\s_]+", " ", str(s or "")).strip().lower()
 
 
 def _resolve_doc_ref(ctx: dict, doc_ref: str) -> Optional[str]:
@@ -556,40 +656,45 @@ def _resolve_doc_ref(ctx: dict, doc_ref: str) -> Optional[str]:
 
     Matching is case-insensitive and tolerant of the label formatting the
     validator uses (underscores in detected/claimed types, e.g. "Surat_Pesanan"
-    vs the officer's "surat pesanan"). Precedence:
+    vs the officer's "surat pesanan"). Precedence (most specific → least):
       1. exact file_id key,
-      2. detected/claimed type label equals the ref (space/underscore-agnostic),
-      3. filename substring, then type-label substring.
+      2. exact type-label equality — detected_type (what BIMA READ the doc to
+         be) OR claimed_type (what the citizen DECLARED) equals the ref. Detected
+         is tried first: "KTP" must resolve even when the citizen mislabelled the
+         upload, which is exactly a case the officer is reviewing.
+      3. filename substring, then type-label substring (detected then claimed).
     Returns the file_id on a hit, or None when nothing matches.
+
+    `detected_type` is present when the bridge cross-referenced the read digest
+    onto the doc context; it may be absent on the admin-dashboard path — the
+    resolver simply skips empty labels, so it degrades to claimed_type+filename.
     """
     if not ctx or not doc_ref:
         return None
 
-    def _norm(s: Any) -> str:
-        return re.sub(r"[\s_]+", " ", str(s or "")).strip().lower()
-
-    ref = _norm(doc_ref)
+    ref = _norm_ref(doc_ref)
 
     # 1) A literal file_id the officer (or model) passed straight through.
     if doc_ref in ctx:
         return doc_ref
+    if not ref:
+        return None
 
-    # 2) Exact label match on the claimed type (the citizen's declared kind).
-    #    `_doc_context` carries `claimed_type` per doc; the validator's
-    #    detected_type is not on this context, so claimed_type + filename are
-    #    the labels we can match against.
-    for fid, doc in ctx.items():
-        if _norm(doc.get("claimed_type")) == ref and ref:
-            return fid
+    # 2) Exact type-label equality — detected first (BIMA's read), then claimed.
+    for label_key in ("detected_type", "claimed_type"):
+        for fid, doc in ctx.items():
+            if _norm_ref(doc.get(label_key)) == ref:
+                return fid
 
-    # 3) Substring match — filename first (most specific), then claimed type.
+    # 3) Substring match — filename first (most specific), then type labels.
     for fid, doc in ctx.items():
-        if ref and ref in _norm(doc.get("filename")):
+        if ref in _norm_ref(doc.get("filename")):
             return fid
-    for fid, doc in ctx.items():
-        claimed = _norm(doc.get("claimed_type"))
-        if ref and claimed and (ref in claimed or claimed in ref):
-            return fid
+    for label_key in ("detected_type", "claimed_type"):
+        for fid, doc in ctx.items():
+            label = _norm_ref(doc.get(label_key))
+            if label and (ref in label or label in ref):
+                return fid
 
     return None
 
@@ -1132,19 +1237,28 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
     {
         "name": "get_doc_summary",
         "description": (
-            "Ringkasan satu dokumen pendukung (KTP, NIB, NPWP, dll). "
-            "Phase 2 mengembalikan placeholder; Phase 3 akan menggunakan "
-            "Gemini Vision OCR atas berkas yang diambil dari SIAP."
+            "Ringkas isi satu dokumen pendukung yang diunggah (KTP, surat "
+            "permohonan, proposal, pakta integritas, spesifikasi alat "
+            "tangkap, dll). Gunakan saat petugas minta ringkasan/isi dokumen, "
+            "mis. 'apa isi proposalnya', 'ringkas KTP-nya'. Argumen `doc_ref` "
+            "adalah JENIS/NAMA dokumen (mis. 'KTP', 'surat permohonan', "
+            "'proposal') ATAU file_id — sebutkan sesuai kata petugas; tidak "
+            "perlu tahu id file. Pada alur chat, ringkasan dibuat dengan "
+            "Gemini Vision atas berkas asli; bila berkas sudah tidak tersimpan, "
+            "tool tetap memberi ringkasan dari catatan pemeriksaan."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "file_id": {
+                "doc_ref": {
                     "type": "string",
-                    "description": "ID file dokumen pendukung di SIAP.",
+                    "description": (
+                        "Jenis/nama dokumen yang diminta (mis. 'KTP', 'surat "
+                        "permohonan', 'proposal') atau file_id."
+                    ),
                 },
             },
-            "required": ["file_id"],
+            "required": ["doc_ref"],
         },
     },
     {

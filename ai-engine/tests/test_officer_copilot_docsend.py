@@ -44,12 +44,19 @@ def _ensure_stub(name: str, attrs: dict | None = None) -> None:
     sys.modules[name] = mod
 
 
+# Stub only the leaf deps the copilot module can't pull in a test process
+# (chromadb via rag_service, the DB driver, the name-normaliser's Vision dep).
+# We do NOT stub services.siap_tools / siap_client / siap_write_client: their
+# real modules import cleanly once `asyncpg` is stubbed, and stubbing them thin
+# would poison sys.modules for a sibling suite in the same process (e.g.
+# test_officer_bridge, which imports the real suitability_judge → real
+# siap_tools). Sharing the real SIAP modules keeps the two suites consistent
+# regardless of run order; the copilot's networked tools are never invoked
+# here (the tests exercise the pure ContextVar-reading functions directly).
+_ensure_stub("asyncpg")
 _ensure_stub("dotenv", {"load_dotenv": lambda *a, **k: None})
 _ensure_stub("httpx")
 _ensure_stub("services.rag_service", {"query_regulations": lambda *a, **k: []})
-_ensure_stub("services.siap_client", {"get_siap_client": lambda: None})
-_ensure_stub("services.siap_tools", {"siap_get_status_timeline": None})
-_ensure_stub("services.siap_write_client", {"get_siap_write_client": lambda: None})
 _ensure_stub("services.agents.validator", {"_normalize_name": lambda s: s})
 
 from services.agents import officer_copilot as oc  # noqa: E402
@@ -60,19 +67,33 @@ def _run(coro):
 
 
 def _doc_ctx():
-    """A representative in-session doc context (as officer_bridge injects it)."""
+    """A representative in-session doc context (as officer_bridge injects it).
+
+    doc-3 is deliberately MISLABELLED by the citizen (claimed 'Lampiran') but
+    read by BIMA as 'Surat_Permohonan' — so the detected_type match is what the
+    officer's "surat permohonan" must hit.
+    """
     return {
         "doc-1": {
             "filename": "ktp_budi.jpg",
             "mime_type": "image/jpeg",
             "content": b"ktp-bytes",
             "claimed_type": "KTP",
+            "detected_type": "KTP",
         },
         "doc-2": {
             "filename": "surat_pesanan.pdf",
             "mime_type": "application/pdf",
             "content": b"sp-bytes",
             "claimed_type": "Surat_Pesanan",
+            "detected_type": "Surat_Pesanan",
+        },
+        "doc-3": {
+            "filename": "scan001.pdf",
+            "mime_type": "application/pdf",
+            "content": b"perm-bytes",
+            "claimed_type": "Lampiran",
+            "detected_type": "Surat_Permohonan",
         },
     }
 
@@ -113,6 +134,12 @@ class TestSendDocumentTool(unittest.TestCase):
     def test_resolve_by_literal_file_id(self):
         out, queue = self._with_ctx(lambda: oc.send_document("doc-2"))
         self.assertEqual(queue, ["doc-2"])
+
+    def test_resolve_by_detected_type_when_citizen_mislabelled(self):
+        # doc-3 is claimed 'Lampiran' but BIMA READ it as 'Surat_Permohonan'.
+        # The officer says "surat permohonan" — the detected_type match wins.
+        out, queue = self._with_ctx(lambda: oc.send_document("surat permohonan"))
+        self.assertEqual(queue, ["doc-3"])
 
     def test_unknown_ref_records_nothing(self):
         out, queue = self._with_ctx(lambda: oc.send_document("NPWP"))
@@ -233,6 +260,156 @@ class TestDocumentsDigestSurfacing(unittest.TestCase):
         self.assertTrue(out["found"])
         self.assertEqual(out["status"], "VERIFIKASI")
         self.assertEqual(len(out["documents_read"]), 2)
+
+
+class TestGetDocSummary(unittest.TestCase):
+    """get_doc_summary hardening — resolve by name/type/file_id, summarise from
+    real bytes when present, and DEGRADE to the retained read-digest (never the
+    'tidak memiliki ID file' dead-end) when the bytes are gone."""
+
+    _DIGEST = [
+        {
+            "file_id": "doc-1",
+            "filename": "ktp_budi.jpg",
+            "detected_type": "KTP",
+            "claimed_type": "KTP",
+            "has_meterai": None,
+            "confidence": 0.97,
+            "matches": True,
+        },
+        {
+            "file_id": "doc-3",
+            "filename": "scan001.pdf",
+            "detected_type": "Surat_Permohonan",
+            "claimed_type": "Lampiran",
+            "has_meterai": True,
+            "confidence": 0.9,
+            "matches": False,
+        },
+    ]
+
+    def _stub_vision(self, *, summary="ISI DOKUMEN RINGKAS", configured=True):
+        """Install a fake services.gemini_vision (imported lazily in the tool).
+        Returns the module so the test can inspect calls."""
+        mod = types.ModuleType("services.gemini_vision")
+        calls: list = []
+
+        async def _extract_structured(*, image_bytes, mime_type, prompt, response_schema):
+            calls.append({"bytes": image_bytes, "mime_type": mime_type})
+            return {"summary": summary} if summary is not None else None
+
+        mod.extract_structured = _extract_structured
+        mod.is_configured = lambda: configured
+        mod._calls = calls
+        sys.modules["services.gemini_vision"] = mod
+        return mod
+
+    def _run_summary(self, doc_ref, *, doc_ctx=None, validation=None):
+        doc_token = oc._doc_context.set(doc_ctx)
+        val_token = oc._validation_context.set(validation)
+        try:
+            return _run(oc.get_doc_summary(doc_ref))
+        finally:
+            oc._doc_context.reset(doc_token)
+            oc._validation_context.reset(val_token)
+
+    # --- summarise from real bytes, resolving the officer's plain name -------
+
+    def test_summarises_bytes_resolved_by_type_name(self):
+        vision = self._stub_vision(summary="KTP atas nama pemohon, lengkap.")
+        out = self._run_summary("KTP", doc_ctx=_doc_ctx())
+        self.assertIn("ktp_budi.jpg", out)
+        self.assertIn("lengkap", out.lower())
+        # The KTP bytes (not another doc) went to Vision.
+        self.assertEqual(vision._calls[0]["bytes"], b"ktp-bytes")
+
+    def test_summarises_bytes_resolved_by_detected_type(self):
+        # Officer says "surat permohonan"; citizen mislabelled it 'Lampiran'.
+        vision = self._stub_vision(summary="Surat permohonan izin, bertanda tangan.")
+        out = self._run_summary("surat permohonan", doc_ctx=_doc_ctx())
+        self.assertIn("scan001.pdf", out)
+        self.assertEqual(vision._calls[0]["bytes"], b"perm-bytes")
+
+    def test_summarises_bytes_resolved_by_literal_file_id(self):
+        vision = self._stub_vision(summary="ok")
+        out = self._run_summary("doc-2", doc_ctx=_doc_ctx())
+        self.assertEqual(vision._calls[0]["bytes"], b"sp-bytes")
+
+    # --- graceful degrade: bytes gone, digest retained ----------------------
+
+    def test_degrades_to_digest_when_bytes_absent(self):
+        # THE live symptom: officer has the digest but not the bytes/file id.
+        self._stub_vision()  # would be used if bytes were present — they aren't
+        validation = {"documents_digest": self._DIGEST}
+        out = self._run_summary("KTP", doc_ctx=None, validation=validation)
+        # Never the dead-end message.
+        self.assertNotIn("tidak memiliki ID file", out)
+        # It surfaces what BIMA read from the digest instead.
+        self.assertIn("KTP", out)
+        self.assertIn("97%", out)  # confidence from the digest
+        self.assertIn("ktp_budi.jpg", out)
+
+    def test_degrades_to_digest_when_doc_ctx_has_no_bytes(self):
+        # Doc context resolves the ref but the doc's bytes are empty (rehydrate
+        # dropped them) → still summarise from the digest, not a dead-end.
+        ctx = {
+            "doc-3": {
+                "filename": "scan001.pdf", "mime_type": "application/pdf",
+                "content": b"", "claimed_type": "Lampiran",
+                "detected_type": "Surat_Permohonan",
+            }
+        }
+        validation = {"documents_digest": self._DIGEST}
+        out = self._run_summary("surat permohonan", doc_ctx=ctx, validation=validation)
+        self.assertNotIn("tidak memiliki ID file", out)
+        self.assertIn("Surat_Permohonan", out)
+        self.assertIn("materai terdeteksi", out)
+
+    def test_degrades_via_validation_context_with_no_doc_ctx(self):
+        # No doc context at all (admin path) but a digest is bound → degrade.
+        validation = {"documents_digest": self._DIGEST}
+        out = self._run_summary("surat permohonan", doc_ctx=None, validation=validation)
+        self.assertIn("Surat_Permohonan", out)
+        self.assertNotIn("belum tersedia di jalur ini", out)
+
+    def test_single_doc_digest_matches_loose_ref(self):
+        # A one-doc submission: even a vague ref should yield the digest summary.
+        one = [self._DIGEST[0]]
+        out = self._run_summary("dokumennya", doc_ctx=None,
+                                validation={"documents_digest": one})
+        self.assertIn("ktp_budi.jpg", out)
+
+    # --- honest not-found (still no dead-end wording) ------------------------
+
+    def test_unknown_ref_lists_available_docs_not_dead_end(self):
+        vision = self._stub_vision()
+        out = self._run_summary("NPWP", doc_ctx=_doc_ctx())
+        self.assertNotIn("tidak memiliki ID file", out)
+        self.assertIn("tidak ditemukan", out.lower())
+        # Lists human labels (filenames), not opaque ids.
+        self.assertIn("ktp_budi.jpg", out)
+        # No Vision call for an unresolved ref.
+        self.assertEqual(vision._calls, [])
+
+    def test_no_context_and_no_digest_returns_placeholder(self):
+        out = self._run_summary("KTP", doc_ctx=None, validation=None)
+        self.assertIn("belum tersedia di jalur ini", out)
+
+    def test_file_id_kwarg_alias_still_resolves(self):
+        # Backward-compat: a model emitting the old `file_id` param must work.
+        vision = self._stub_vision(summary="ok")
+        doc_token = oc._doc_context.set(_doc_ctx())
+        try:
+            out = _run(oc.get_doc_summary(file_id="doc-1"))
+        finally:
+            oc._doc_context.reset(doc_token)
+        self.assertEqual(vision._calls[0]["bytes"], b"ktp-bytes")
+
+    def test_empty_ref_does_not_crash(self):
+        self._stub_vision()
+        out = self._run_summary("", doc_ctx=_doc_ctx())
+        self.assertIsInstance(out, str)
+        self.assertNotIn("tidak memiliki ID file", out)
 
 
 class _unittest_patch:
