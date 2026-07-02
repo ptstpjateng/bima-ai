@@ -297,6 +297,108 @@ async def siap_get_requirements(
 
 
 # ===========================================================================
+# Tool 1b — siap_get_templates  (official downloadable sign-doc templates)
+#
+# SIAP stores the citizen-facing document templates (Surat Permohonan, Pakta
+# Integritas, Surat Pesanan, plus reference PDFs) as files in `ptsp.files`,
+# keyed to a licence by `owner_id`. `stereotype='PUBLIC-DOWNLOAD'` marks the
+# ones meant for applicants. `internal_filename` is the storage key
+# (`master/{ULID}.{ext}`), served publicly at
+# `{SIAP_STORAGE_BASE}/storage/{internal_filename}`.
+#
+# BIMA's doc-prep co-pilot uses this to fill + deliver the REAL SIAP template
+# instead of an invented layout. Read-only; non-PII (these are blank forms).
+# ===========================================================================
+
+_SQL_TEMPLATES_BY_LICENSE = """
+    SELECT file_id,
+           file_name,
+           file_type,
+           internal_filename
+      FROM ptsp.files
+     WHERE stereotype = 'PUBLIC-DOWNLOAD'
+       AND owner_id = $1
+     ORDER BY file_id
+"""
+
+# Map an SIAP template file_name to the BIMA doc_type it satisfies. Keyword
+# match on the lowercased name; first hit wins. Names that match nothing are
+# returned as doc_type=None (reference attachments, e.g. the spec PDFs).
+_TEMPLATE_NAME_TO_DOCTYPE = (
+    ("pakta", "pakta_integritas"),
+    ("permohonan", "surat_permohonan"),
+    ("pesanan", "surat_pesanan"),
+)
+
+
+def _doctype_for_template(file_name: str) -> Optional[str]:
+    low = (file_name or "").lower()
+    for needle, doc_type in _TEMPLATE_NAME_TO_DOCTYPE:
+        if needle in low:
+            return doc_type
+    return None
+
+
+async def siap_get_templates(license_id: int) -> dict:
+    """Return the official PUBLIC-DOWNLOAD template files SIAP hosts for a licence.
+
+    Args:
+      license_id: the resolved SIAP licence id (e.g. 459 for PPKP).
+
+    Returns:
+      {
+        "found": bool,
+        "license_id": int,
+        "templates": [
+          {"file_id": int, "file_name": str, "file_type": str,
+           "internal_filename": str, "doc_type": str | None}
+        ],
+        "by_doctype": {doc_type: internal_filename, ...},  # only mapped ones
+      }
+    On miss / not configured / error: found=False with a `note`. Never raises.
+    """
+    if not is_siap_db_configured():
+        return {"found": False, "note": "Integrasi basis data SIAP belum dikonfigurasi."}
+    if license_id is None:
+        return {"found": False, "note": "Wajib mengisi license_id."}
+
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_TEMPLATES_BY_LICENSE, int(license_id))
+
+        templates = []
+        by_doctype: dict[str, str] = {}
+        for r in rows:
+            doc_type = _doctype_for_template(r["file_name"])
+            templates.append({
+                "file_id": r["file_id"],
+                "file_name": r["file_name"],
+                "file_type": r["file_type"],
+                "internal_filename": r["internal_filename"],
+                "doc_type": doc_type,
+            })
+            # First mapped hit per doc_type wins (ORDER BY file_id above).
+            if doc_type and doc_type not in by_doctype:
+                by_doctype[doc_type] = r["internal_filename"]
+
+        logger.info(
+            "siap_get_templates | license_id=%s | files=%d mapped=%d",
+            license_id, len(templates), len(by_doctype),
+        )
+        return {
+            "found": bool(templates),
+            "license_id": int(license_id),
+            "templates": templates,
+            "by_doctype": by_doctype,
+        }
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.exception("siap_get_templates failed | license_id=%s", license_id)
+        return {"found": False, "license_id": license_id,
+                "note": f"Gagal membaca template dari basis data SIAP: {exc}"}
+
+
+# ===========================================================================
 # Tool 2 — siap_get_status
 #
 # Per-ticket live status. The inventory backs this with the REST endpoint;

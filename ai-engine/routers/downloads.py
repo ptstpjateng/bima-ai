@@ -23,12 +23,15 @@ async def download(token: str):
     if item is None:
         logger.info("Download miss (expired/unknown token)")
         return JSONResponse({"error": "not_found_or_expired"}, status_code=404)
-    pdf, filename = item
+    content, filename, mime = item
+    # PDFs render inline; editable docs (DOCX) download as attachments. Either
+    # way APTANA fetches by the served Content-Type to deliver the WA document.
+    disposition = "inline" if mime == "application/pdf" else "attachment"
     return Response(
-        content=pdf,
-        media_type="application/pdf",
+        content=content,
+        media_type=mime,
         headers={
-            "Content-Disposition": f'inline; filename="{filename}"',
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
             # Keep the PII-bearing PDF out of caches, search indexes, and referers.
             "Cache-Control": "no-store, no-cache, must-revalidate, private",
             "Pragma": "no-cache",

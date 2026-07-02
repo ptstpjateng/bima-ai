@@ -214,6 +214,12 @@ _KTP_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "Gender as printed: 'LAKI-LAKI' or 'PEREMPUAN'. Empty if not legible.",
         },
+        "alamat": {
+            "type": "string",
+            "description": "The address (Alamat) on the KTP — the Alamat line plus "
+                           "RT/RW, Kel/Desa and Kecamatan if present, joined into one "
+                           "line. Empty if not legible.",
+        },
     },
     "required": ["is_ktp"],
 }
@@ -222,8 +228,10 @@ _KTP_PROMPT = (
     "This is (or claims to be) an Indonesian KTP (Kartu Tanda Penduduk). "
     "Read it carefully and extract: is_ktp (true only if it really is a KTP), "
     "the full name (Nama), the 16-digit NIK (digits only, no spaces or dots), "
-    "and the gender (Jenis Kelamin: LAKI-LAKI or PEREMPUAN). If a field is not "
-    "legible, return an empty string for it. Do not guess or invent digits."
+    "the gender (Jenis Kelamin: LAKI-LAKI or PEREMPUAN), and the address "
+    "(Alamat, including RT/RW, Kel/Desa and Kecamatan if printed, as one line). "
+    "If a field is not legible, return an empty string for it. Do not guess or "
+    "invent digits."
 )
 
 
@@ -268,11 +276,14 @@ async def extract_ktp_fields(
     elif "PEREMPUAN" in gender_raw or "WANITA" in gender_raw:
         gender = "PEREMPUAN"
 
+    alamat = str(parsed.get("alamat", "") or "").strip() or None
+
     return {
         "is_ktp": bool(parsed.get("is_ktp", False)),
         "name": name,
         "nik": nik,
         "gender": gender,
+        "alamat": alamat,
     }
 
 

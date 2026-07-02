@@ -994,6 +994,10 @@ async def _extract_fields_from_documents(sess: SubmissionSession) -> None:
                 # Optional gender for later Pak/Bu tailoring.
                 if ktp.get("gender") and not sess.fields.get("gender"):
                     sess.fields["gender"] = ktp["gender"]
+                # Address from the KTP → pre-fills the "Alamat" field on the
+                # official SIAP templates (identity-only auto-fill).
+                if ktp.get("alamat") and not sess.fields.get("alamat"):
+                    sess.fields["alamat"] = ktp["alamat"]
                 if not need_name and not need_nik:
                     break
 
@@ -1946,6 +1950,43 @@ async def _send_doc_to_user(
     return False
 
 
+async def _render_doc_content(
+    sess: "SubmissionSession", doc_type: str, label: str, data: dict, nik: str
+) -> Optional[tuple[bytes, str, str]]:
+    """Render one sign-doc, preferring the OFFICIAL SIAP template.
+
+    1. If SIAP hosts a fillable template for this doc_type (or BIMA hand-builds
+       the legacy .doc one), deliver an editable DOCX with identity fields
+       pre-filled — NOT encrypted (it is meant to be opened + filled).
+    2. Otherwise fall back to the fpdf2 PDF, AES-locked with the citizen's NIK.
+
+    Returns (content_bytes, filename, lock_note) or None on total failure.
+    """
+    try:
+        from services import siap_templates
+        official = await siap_templates.render_official_docx(
+            sess.license_id, doc_type, sess.fields
+        )
+    except Exception:
+        logger.exception("official template render failed | user=%s doc=%s",
+                         _mask(sess.user_id), doc_type)
+        official = None
+    if official is not None:
+        content, out_name = official
+        return content, out_name, ""  # editable DOCX — no NIK lock note
+
+    from services import doc_generator
+    try:
+        pdf = doc_generator.generate(doc_type, data, encrypt_password=nik or None)
+    except Exception:
+        logger.exception("doc generate failed | user=%s doc=%s",
+                         _mask(sess.user_id), doc_type)
+        return None
+    safe_label = label.replace(" ", "_").replace("/", "-")
+    lock = " (terkunci - buka dengan NIK Anda)" if nik else ""
+    return pdf, f"{safe_label}.pdf", lock
+
+
 async def _generate_and_send_docs(sess: SubmissionSession) -> str:
     """All required data present: draft the docs, deliver them, hand off to
     Mekari, and rejoin COLLECTING_DOCS for the signed + uploaded set."""
@@ -1961,17 +2002,14 @@ async def _generate_and_send_docs(sess: SubmissionSession) -> str:
     # neutral — no name/NIK in the URL or the Content-Disposition header.
     nik = (sess.fields.get("nik") or "").strip()
     sent = 0
+    any_locked = False  # only the fpdf2-PDF fallback is NIK-encrypted; DOCX is not
     for d in (guide.get("generate_docs") or []):
-        try:
-            pdf = doc_generator.generate(d["doc_type"], data, encrypt_password=nik or None)
-        except Exception:
-            logger.exception(
-                "doc generate failed | user=%s | doc=%s", _mask(sess.user_id), d.get("key"),
-            )
+        rendered = await _render_doc_content(sess, d["doc_type"], d["label"], data, nik)
+        if rendered is None:
             continue
-        filename = f"{d['label'].replace(' ', '_').replace('/', '-')}.pdf"
-        token = generated_docs.store(pdf, filename)
-        lock = " (terkunci - buka dengan NIK Anda)" if nik else ""
+        content, filename, lock = rendered
+        any_locked = any_locked or bool(lock)
+        token = generated_docs.store(content, filename)  # mime inferred from ext
         if await _send_doc_to_user(
             sess.user_id, f"{base}/dl/{token}", filename,
             caption=f"Draf {d['label']}{lock}.",
@@ -1996,7 +2034,7 @@ async def _generate_and_send_docs(sess: SubmissionSession) -> str:
     lock_note = (
         "_Demi keamanan data Anda, dokumennya terkunci - buka dengan *NIK* Anda "
         "(16 digit)._\n\n"
-        if nik else ""
+        if any_locked else ""
     )
     return (
         f"{lead}\n\n{lock_note}Langkah berikutnya:\n\n"
@@ -2108,11 +2146,12 @@ async def _generate_and_send_one_doc(sess: SubmissionSession, doc_type: str) -> 
         data["jabatan"] = "Pemilik"
     nik = (sess.fields.get("nik") or "").strip()
 
-    pdf = doc_generator.generate(doc_type, data, encrypt_password=nik or None)
     label = entry.get("label") or doc_type.replace("_", " ").title()
-    filename = f"{label.replace(' ', '_').replace('/', '-')}.pdf"
-    token = generated_docs.store(pdf, filename)
-    lock = " (terkunci - buka dengan NIK Anda)" if nik else ""
+    rendered = await _render_doc_content(sess, doc_type, label, data, nik)
+    if rendered is None:
+        return "Maaf, ada kendala saat menyiapkan drafnya. Tim kami akan bantu."
+    content, filename, lock = rendered
+    token = generated_docs.store(content, filename)  # mime inferred from ext
     sent = await _send_doc_to_user(
         sess.user_id, f"{_public_base_url()}/dl/{token}", filename,
         caption=f"Draf {label}{lock}.",
@@ -2124,7 +2163,7 @@ async def _generate_and_send_one_doc(sess: SubmissionSession, doc_type: str) -> 
     if not sent:
         return "Maaf, ada kendala saat mengirim drafnya. Tim kami akan bantu."
     lock_note = (
-        "_Dokumen terkunci - buka dengan *NIK* Anda (16 digit)._\n\n" if nik else ""
+        "_Dokumen terkunci - buka dengan *NIK* Anda (16 digit)._\n\n" if lock else ""
     )
     return (
         f"Selesai - draf *{label}* sudah saya kirim di atas.\n\n{lock_note}"
