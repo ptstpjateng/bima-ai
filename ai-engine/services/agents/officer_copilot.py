@@ -292,12 +292,19 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "rekomendasi', panggil `draft_sk` (tanpa argumen, tanpa konfirmasi — ini "
     "hanya draf, bukan tindakan tulis). Tool memilih SENDIRI dokumen yang tepat "
     "untuk MEJA saat ini (Rekomendasi Teknis di meja teknis, Surat Keputusan di "
-    "meja tanda tangan) dan mengisinya dari DATA RESMI (profil pemohon SIAP, "
-    "data permohonan, serta dokumen unggahan). Sampaikan PERSIS field mana yang "
-    "terisi otomatis dan mana yang masih kosong SESUAI hasil tool, agar petugas "
-    "melengkapinya. JANGAN pernah menyatakan sebuah field terisi bila hasil tool "
-    "menandainya kosong — field kosong memang harus diisi tangan oleh petugas; "
-    "BIMA TIDAK menebak nilainya.\n"
+    "meja tanda tangan) dan mengisi field dari DUA jenis sumber yang HARUS Anda "
+    "bedakan saat menyampaikannya:\n"
+    "  (a) DATA RESMI SIAP — profil pemohon & data permohonan dari basis data "
+    "SIAP. Ini terpercaya; sampaikan sebagai 'terisi dari data resmi SIAP'.\n"
+    "  (b) HASIL BACA DOKUMEN UNGGAHAN — nilai yang dibaca (OCR) dari dokumen "
+    "yang diunggah pemohon. Ini BISA KELIRU. Sampaikan TERPISAH sebagai 'dibaca "
+    "dari dokumen unggahan, mohon diperiksa' — JANGAN pernah menyajikannya "
+    "seolah fakta resmi dari basis data.\n"
+    "Ikuti PERSIS pembagian sumber pada hasil tool: field mana yang dari data "
+    "resmi, mana yang dari pembacaan dokumen, dan mana yang masih kosong. JANGAN "
+    "pernah menyatakan sebuah field terisi bila hasil tool menandainya kosong — "
+    "field kosong memang harus diisi tangan oleh petugas; BIMA TIDAK menebak "
+    "nilainya.\n"
     "ARTI 'DRAFT' DALAM KONTEKS REVIEW: bila petugas mengatakan 'draft', "
     "'buatkan draftnya', 'buat draf', 'buatkan draft nya dulu' TANPA penjelas, "
     "maksudnya adalah DRAF SK — panggil `draft_sk` — KECUALI bila BIMA baru saja "
@@ -411,7 +418,10 @@ _SIGNATURE_SYSTEM_PROMPT_TEMPLATE = (
     "sebelumnya, itu berkas BANTU yang dikirim sebagai lampiran di chat — "
     "TIDAK tersimpan di SIAP dan TIDAK bisa diambil dari SIAP. Yang di SIAP "
     "hanyalah SK FINAL ber-TTE setelah beliau menandatangani. JANGAN menyuruh "
-    "mencari draf SK 'di sistem SIAP'.\n\n"
+    "mencari draf SK 'di sistem SIAP'. Bila draf itu memuat field yang dibaca "
+    "(OCR) dari dokumen unggahan pemohon, sampaikan sebagai hasil pembacaan yang "
+    "MASIH PERLU DIPERIKSA — JANGAN sajikan sebagai fakta resmi dari basis data "
+    "SIAP.\n\n"
     "Konteks sesi:\n"
     "- Tiket yang akan ditandatangani: {ticket}\n"
     "- Mulailah dengan sintesis rantai persetujuan (`get_case_log_notes` + "
@@ -1191,9 +1201,20 @@ async def draft_sk() -> str:
     # 4) Filled vs blank — computed from the DISCOVERED keys (any licence), not
     # a fixed 16-key list. A key present in `classes` but with no value in
     # `data` is a blank the officer must complete.
+    #
+    # H1 — separate provenance in the note. A PROFILE/CASE fill is a
+    # DETERMINISTIC read from SIAP's own DB (authoritative). A VISION fill was
+    # OCR'd off a citizen-uploaded document (probabilistic) — the officer MUST
+    # eyeball it. We NEVER present a Vision read as an authoritative DB fact, so
+    # the two are reported in distinct sentences.
     all_keys = list(classes.keys())
     filled = [k for k in all_keys if str(data.get(k) or "").strip()]
     blank = [k for k in all_keys if not str(data.get(k) or "").strip()]
+    filled_official = [
+        k for k in filled
+        if classes.get(k) in (st.SOURCE_PROFILE, st.SOURCE_CASE)
+    ]
+    filled_vision = [k for k in filled if classes.get(k) == st.SOURCE_VISION]
 
     # Queue the rendered .docx for out-of-band delivery on the officer channel.
     queue = _docs_to_send_context.get()
@@ -1229,13 +1250,15 @@ async def draft_sk() -> str:
         })
         pdf_sent = True
 
-    filled_labels = ", ".join(_pretty_field_label(k) for k in filled) or "(tidak ada)"
+    official_labels = ", ".join(_pretty_field_label(k) for k in filled_official) or "(tidak ada)"
+    vision_labels = ", ".join(_pretty_field_label(k) for k in filled_vision) or "(tidak ada)"
     blank_labels = ", ".join(_pretty_field_label(k) for k in blank) or "(tidak ada)"
     logger.info(
         "draft_sk | license_id=%s | kind=%s fell_back=%s | keys=%d filled=%d "
-        "blank=%d | pdf_view=%s",
+        "(official=%d vision=%d) blank=%d | pdf_view=%s",
         license_id, doc_kind, tmpl.get("fell_back"), len(all_keys),
-        len(filled), len(blank), pdf_sent,
+        len(filled), len(filled_official), len(filled_vision), len(blank),
+        pdf_sent,
     )
 
     # If the step called for a different stereotype than what we could fill,
@@ -1263,7 +1286,10 @@ async def draft_sk() -> str:
     return (
         fallback_note
         + delivery
-        + f"Terisi otomatis dari data resmi: {filled_labels}. "
+        + f"Terisi dari data resmi SIAP (profil pemohon & data permohonan): "
+        f"{official_labels}. "
+        + f"Dibaca otomatis dari dokumen unggahan — MOHON DIPERIKSA petugas "
+        f"karena hasil pembacaan bisa keliru: {vision_labels}. "
         + f"Masih kosong (mohon dilengkapi petugas): {blank_labels}. "
         + "Catatan: draf ini berkas bantu dari BIMA yang dikirim sebagai lampiran "
         "di chat ini — tidak tersimpan di SIAP. Dokumen final diterbitkan "
