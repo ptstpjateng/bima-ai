@@ -128,6 +128,65 @@ async def fetch_template_bytes(internal_filename: str) -> Optional[bytes]:
 
 
 # ---------------------------------------------------------------------------
+# Submission-document byte fetch (officer copilot — [[Multi-step Officer Copilot]])
+#
+# The next-step officer must be able to open the citizen's uploaded requirement
+# files STRAIGHT FROM SIAP. Those files live in the same Beta storage as the
+# blank templates, but under `storage/app/public/` (Laravel's public disk) with
+# the DB storing a relative key (`profile_requirements.profile_requirements_files`).
+# We reuse the exact same hardened GET (SSRF-safe: no redirects, size-capped,
+# never raises, never logs bytes) as `fetch_template_bytes`, only differing in
+# the storage sub-prefix. The sub-prefix is env-overridable because SIAP's
+# public-disk layout is environment-specific; the DB value may already include
+# the `app/public/` segment, so we try the value verbatim first, then prefixed.
+# ---------------------------------------------------------------------------
+
+# Laravel public-disk prefix under `/storage/`. The stored key is usually a bare
+# path like "berkas/2026/xyz.pdf"; the public URL is
+# {BASE}/storage/app/public/<key>. Overridable per environment; empty → the
+# key is fetched under `/storage/<key>` verbatim (same as templates).
+_SUBMISSION_STORAGE_PREFIX = os.getenv(
+    "SIAP_SUBMISSION_STORAGE_PREFIX", "app/public"
+).strip("/")
+
+
+def _submission_candidate_paths(file_ref: str) -> list[str]:
+    """Ordered storage paths to try for one submission-file key.
+
+    A DB value may already carry its own storage sub-path, so we try it
+    verbatim first, then under the public-disk prefix. De-duplicated; unsafe
+    keys are filtered by fetch_template_bytes itself."""
+    ref = (file_ref or "").strip().lstrip("/")
+    if not ref:
+        return []
+    candidates = [ref]
+    if _SUBMISSION_STORAGE_PREFIX and not ref.startswith(_SUBMISSION_STORAGE_PREFIX + "/"):
+        candidates.append(f"{_SUBMISSION_STORAGE_PREFIX}/{ref}")
+    # Preserve order, drop dupes.
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+async def fetch_submission_file_bytes(file_ref: str) -> Optional[bytes]:
+    """GET a citizen-uploaded requirement file from Beta SIAP storage.
+
+    `file_ref` is `ptsp.profile_requirements.profile_requirements_files`. Tries
+    the value verbatim, then under the public-disk prefix; returns the first
+    200-with-bytes hit. None on any miss/error. Never raises; never logs the
+    file name or the bytes (both may echo applicant PII)."""
+    for candidate in _submission_candidate_paths(file_ref):
+        data = await fetch_template_bytes(candidate)
+        if data:
+            return data
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Fill an existing .docx template in place (identity fields only)
 # ---------------------------------------------------------------------------
 def _iter_block_paragraphs(container):

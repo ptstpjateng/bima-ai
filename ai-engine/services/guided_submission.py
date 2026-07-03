@@ -347,6 +347,15 @@ _sessions: "OrderedDict[str, SubmissionSession]" = OrderedDict()
 # task in flight. Mutated only from the event loop (single-threaded asyncio).
 _debounce_tasks: dict[str, asyncio.Task] = {}
 
+# Strong references to the fire-and-forget doc-upload tasks. The event loop only
+# keeps a WEAK ref to a pending task, so a bare `create_task` whose handle is
+# dropped can be garbage-collected mid-flight — the upload would silently die.
+# Same strong-ref-until-done pattern as `_debounce_tasks`: hold the task here,
+# discard it in a done-callback (which also retrieves any exception, so no
+# "task exception was never retrieved" warning fires). Set, not dict — these
+# are best-effort and per-request_id, never deduped by user.
+_upload_tasks: set[asyncio.Task] = set()
+
 
 # ---------------------------------------------------------------------------
 # Redis serialization (durable sessions — services/session_store.py).
@@ -1612,6 +1621,20 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
         _mask(sess.user_id), sess.license_id, _mask(ticket),
     )
 
+    # --- Push the citizen's documents up to SIAP (STRICTLY best-effort) ---
+    # So the reviewing officer sees the actual attachments on the request, not
+    # just the application shell. FIRE-AND-FORGET: a slow/hung Beta-SIAP must not
+    # stall the citizen's WhatsApp confirmation below, so we detach the upload
+    # (up to _MAX_DOCS files × the per-file timeout) instead of awaiting it. The
+    # officer notify that follows does NOT depend on these bytes — it briefs from
+    # the in-memory session docs, and the officer's SIAP-backed copy is read
+    # later at case-open (load_case_from_siap), so backgrounding is safe. All the
+    # best-effort guarding (per-file try/except, PII masking, no-op when the doc
+    # client is unconfigured) lives INSIDE _upload_docs_to_siap. Only runs once
+    # we have the numeric request_id (the document API is keyed by it, not ticket).
+    if request_id is not None:
+        _spawn_doc_upload(sess, int(request_id))
+
     # --- Officer hand-off: brief + score (fire-and-forget) ---
     if ticket:
         try:
@@ -1650,6 +1673,115 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
         "Nomor tiket akan tersedia sebentar lagi. Bapak/Ibu dapat memantau "
         f"status di {_PORTAL_TRACK_URL.format(ticket='')[:-1]}. Terima kasih."
     )
+
+
+def _spawn_doc_upload(sess: SubmissionSession, request_id: int) -> None:
+    """Detach `_upload_docs_to_siap` as a fire-and-forget task so a slow SIAP
+    can't delay the citizen's success reply.
+
+    Holds a strong reference in `_upload_tasks` until the task finishes (the
+    event loop only weakly references pending tasks), and discards it in a
+    done-callback that also retrieves any exception — so no "task exception was
+    never retrieved" warning is emitted. `_upload_docs_to_siap` already swallows
+    every error internally; this is a defence-in-depth backstop. Never raises:
+    on the (unexpected) no-running-loop path it just logs and returns, leaving
+    the citizen's already-successful submit untouched.
+    """
+    try:
+        task = asyncio.create_task(_upload_docs_to_siap(sess, request_id))
+    except RuntimeError:
+        # No running event loop (shouldn't happen on the submit path). The
+        # submit already succeeded; the upload is best-effort, so just skip it.
+        logger.warning(
+            "Guided-submission: could not schedule doc-upload (no loop) | "
+            "user=%s | request_id=%s",
+            _mask(sess.user_id), request_id,
+        )
+        return
+    _upload_tasks.add(task)  # strong ref until the done-callback discards it
+
+    def _done(t: asyncio.Task) -> None:
+        _upload_tasks.discard(t)
+        # Retrieve any exception so asyncio doesn't warn. _upload_docs_to_siap
+        # swallows its own errors, so this is a belt-and-suspenders guard.
+        if not t.cancelled():
+            exc = t.exception()
+            if exc is not None:  # pragma: no cover — inner coro never re-raises
+                logger.warning(
+                    "Guided-submission doc-upload task errored (non-fatal) | "
+                    "user=%s | request_id=%s | err=%s",
+                    _mask(sess.user_id), request_id, exc,
+                )
+
+    task.add_done_callback(_done)
+
+
+async def _upload_docs_to_siap(sess: SubmissionSession, request_id: int) -> None:
+    """Attach the citizen's collected documents to the freshly-created SIAP
+    request, one file at a time via the scoped document client.
+
+    STRICTLY best-effort — this is called AFTER the submit has already succeeded
+    and the citizen has been (about to be) told their permit is filed. It must
+    NEVER raise, delay, or alter the submit result: the entire body is wrapped
+    so a not-configured client, a network blip, or a single bad file is logged
+    (PII-masked) and swallowed. A per-file failure does not stop the others.
+
+    No-ops silently when the document client is not configured, so an
+    environment without SIAP_DOCUMENT_API_TOKEN behaves exactly as before.
+    """
+    try:
+        from services.siap_document_client import get_siap_document_client
+
+        client = get_siap_document_client()
+        if not client.is_configured():
+            logger.info(
+                "Guided-submission doc-upload skipped (client not configured) "
+                "| user=%s | request_id=%s",
+                _mask(sess.user_id), request_id,
+            )
+            return
+
+        docs = list(sess.documents)
+        uploaded = 0
+        failed = 0
+        for doc in docs:
+            try:
+                res = await client.upload_document(
+                    request_id=request_id,
+                    filename=doc.filename or doc.file_id,
+                    content=doc.content,
+                    content_type=doc.mime_type or "application/octet-stream",
+                )
+            except Exception:  # pragma: no cover — client never raises, guard anyway
+                logger.exception(
+                    "Guided-submission doc-upload crashed on one file (non-fatal) "
+                    "| user=%s | file_id=%s",
+                    _mask(sess.user_id), doc.file_id,
+                )
+                failed += 1
+                continue
+            if res.get("ok"):
+                uploaded += 1
+            else:
+                failed += 1
+                logger.warning(
+                    "Guided-submission doc-upload rejected one file (non-fatal) "
+                    "| user=%s | file_id=%s | note=%s",
+                    _mask(sess.user_id), doc.file_id, res.get("note"),
+                )
+        logger.info(
+            "Guided-submission docs pushed to SIAP | user=%s | request_id=%s "
+            "| uploaded=%d | failed=%d | total=%d",
+            _mask(sess.user_id), request_id, uploaded, failed, len(docs),
+        )
+    except Exception:
+        # Absolute backstop — an upload problem can never touch the citizen's
+        # already-successful submission.
+        logger.exception(
+            "Guided-submission doc-upload block failed (non-fatal) | user=%s "
+            "| request_id=%s",
+            _mask(sess.user_id), request_id,
+        )
 
 
 # ===========================================================================

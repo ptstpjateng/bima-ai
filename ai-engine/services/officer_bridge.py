@@ -108,6 +108,48 @@ def _demo_officer_tg() -> str:
     return os.getenv("BIMA_OFFICER_TG_CHAT", "").strip()
 
 
+# The SIAP signing magic-link the LAST-step officer (Kepala Dinas) receives.
+# BIMA does NOT sign — SIAP owns TTE/BSRE — so the final step is a handoff: we
+# send a link that opens SIAP's signing surface for THIS case. It is a single
+# env-configurable Python format string with `{request_id}` and/or `{ticket}`
+# placeholders. The exact SIAP signing URL pattern is still TBD (the SIAP team
+# will supply it); until then the default points at SIAP's known "Tanda Tangan
+# Berkas" Filament page pre-filtered by ticket (the same surface the existing
+# copilot `get_siap_signing_link` tool builds), which is a working rehearsal
+# link rather than a dead placeholder.
+# TODO: user to confirm the exact SIAP signing URL (per-case deep link).
+_SK_SIGN_URL_TEMPLATE = os.getenv(
+    "BIMA_SK_SIGN_URL_TEMPLATE",
+    "https://beta-siap.nolongin.com/admin/tanda-tangan-berkas?tableSearch={ticket}",
+).strip()
+
+
+def _build_sk_sign_url(*, request_id: Optional[int], ticket: Optional[str]) -> Optional[str]:
+    """Render the SIAP signing magic-link from the env template. Never raises.
+
+    Supports `{request_id}` and `{ticket}` placeholders; a template that
+    references neither still renders (a static URL). Returns None when the
+    template is blank OR a referenced field is missing, so the caller degrades
+    to an honest "link belum tersedia" rather than emitting a broken URL."""
+    tmpl = _SK_SIGN_URL_TEMPLATE
+    if not tmpl:
+        return None
+    tkt = ""
+    if ticket:
+        digits = "".join(ch for ch in str(ticket) if ch.isdigit())
+        tkt = digits.zfill(9) if digits else str(ticket).strip()
+    rid = "" if request_id is None else str(request_id)
+    try:
+        url = tmpl.format(request_id=rid, ticket=tkt)
+    except (KeyError, IndexError, ValueError):
+        logger.warning("SK sign-url template has an unknown placeholder — skipping link")
+        return None
+    # A placeholder that resolved to empty means the datum we needed is missing.
+    if ("{request_id}" in tmpl and not rid) or ("{ticket}" in tmpl and not tkt):
+        return None
+    return url
+
+
 # ===========================================================================
 # Number normalization
 #
@@ -267,6 +309,12 @@ class OfficerCaseSession:
     # Rolling copilot history (list of {role, text}) so the conversation has
     # memory across the officer's messages.
     history: list[dict[str, str]] = field(default_factory=list)
+    # SIAP step position ([[Multi-step Officer Copilot]]) — carried so the
+    # bridge knows whether THIS officer sits at the LAST (SK-signing) desk. When
+    # True the copilot is steered to hand off the SIAP signing magic-link rather
+    # than recommend "forward". Populated by load_case_from_siap; absent (False)
+    # for a first-step submit-time notify (which is never the final desk).
+    is_final_step: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -355,6 +403,7 @@ def _encode_officer_session(sess: OfficerCaseSession) -> str:
         "documents": docs,
         "documents_digest": sess.documents_digest,
         "history": sess.history,
+        "is_final_step": sess.is_final_step,
         "created_at": sess.created_at,
         "updated_at": sess.updated_at,
     }
@@ -388,6 +437,7 @@ def _decode_officer_session(blob: str) -> OfficerCaseSession:
         documents=docs,
         documents_digest=list(raw.get("documents_digest") or []),
         history=list(raw.get("history") or []),
+        is_final_step=bool(raw.get("is_final_step", False)),
         created_at=float(raw.get("created_at", time.time())),
         updated_at=float(raw.get("updated_at", time.time())),
     )
@@ -596,6 +646,239 @@ def _documents_for_copilot(
             "detected_type": detected_by_fid.get(fid, ""),
         }
     return out
+
+
+# ===========================================================================
+# SIAP-grounded case loader ([[Multi-step Officer Copilot]]) — the CORE.
+#
+# The first-step officer sees the case via the citizen's in-memory session
+# (notify_officer_of_submission threads the live docs + validator score). But
+# every SUBSEQUENT desk in the SIAP approval chain never saw that session — so
+# to be the officer's copilot at EVERY step, BIMA must assemble the case PURELY
+# from SIAP:
+#   (a) the request's submission documents — resolved via profile_requirements,
+#       bytes fetched on demand from Beta storage (siap_templates), so
+#       get_doc_summary / send_document / compare_identity work verbatim;
+#   (b) ALL prior-step notes — read LIVE by the copilot's get_case_log_notes
+#       tool (keyed by ticket → vw_license_log / get_license_request_log), so we
+#       only need to carry the ticket, not snapshot the notes here;
+#   (c) the current step + whether it is the FINAL (SK-signing) desk;
+#   (d) validation/score — SIAP holds none; left absent (get_validation_summary
+#       then honestly reports "belum tersedia").
+#
+# Everything is grounded in SIAP. On a miss / DB-down every read degrades to an
+# empty result, and the loader returns a case with whatever it COULD read (or
+# None when even the request identity is unreadable) — never a fabrication.
+# ===========================================================================
+
+# Cap on how many submission-doc bodies we pull per case (across BOTH sources),
+# and — separately, per doc — an 8 MB byte ceiling on each body. BOTH sources now
+# enforce that ceiling: source (a) via siap_templates.fetch_submission_file_bytes
+# (_MAX_TEMPLATE_BYTES), source (b) via siap_document_client.download_document
+# (_SIAP_DOCUMENT_MAX_BYTES, same 8 MB default). Keeps a pathological upload set
+# from bloating the in-memory session / Redis blob.
+_MAX_SIAP_DOCS = int(os.getenv("BIMA_OFFICER_SIAP_MAX_DOCS", "12"))
+
+
+async def _load_siap_documents(
+    profile_id: Optional[int],
+    request_id: Optional[int] = None,
+) -> dict[str, dict[str, Any]]:
+    """Fetch the applicant's uploaded requirement files from SIAP into the
+    copilot `_doc_context` shape ({file_id: {filename, mime_type, content,
+    claimed_type, detected_type}}). Bytes pulled on demand from Beta storage.
+
+    Two sources are merged:
+      (a) profile_requirements — the requirement files linked to the applicant's
+          SIAP profile, bytes fetched from Beta storage (the original source);
+      (b) the per-request document API (siap_document_client) — the applicant-
+          upload docs that BIMA itself pushed on submit and that
+          profile_requirements does NOT contain for BIMA-created requests.
+    Both are cross-referenced into the SAME `_doc_context` shape and DEDUPED by
+    (filename/label), so a doc present in both sources appears once.
+
+    Source (b) only runs when a `request_id` is supplied AND the document client
+    is configured — otherwise this behaves byte-for-byte as before (source (a)
+    only). NEVER raises. A doc whose bytes can't be fetched is SKIPPED (not
+    faked) — the officer is never shown a document BIMA couldn't actually read.
+    File names/bytes are never logged.
+    """
+    if profile_id is None and request_id is None:
+        return {}
+    from services.siap_templates import fetch_submission_file_bytes
+
+    out: dict[str, dict[str, Any]] = {}
+    # Dedupe keys — normalised filename/label already claimed by an emitted doc.
+    seen_labels: set[str] = set()
+    fetched = 0
+
+    # --- Source (a): profile_requirements-backed docs (bytes from storage) ---
+    if profile_id is not None:
+        from services.siap_db import get_submission_doc_refs
+
+        refs = await get_submission_doc_refs(int(profile_id))
+        for ref in refs:
+            if fetched >= _MAX_SIAP_DOCS:
+                break
+            file_ref = ref.get("file_ref")
+            if not file_ref:
+                continue
+            try:
+                content = await fetch_submission_file_bytes(file_ref)
+            except Exception:  # pragma: no cover — defensive; fetch never raises but guard anyway
+                logger.exception("SIAP submission-doc fetch crashed (skipping one doc)")
+                content = None
+            if not content:
+                continue
+            # Synthetic, stable file_id keyed on the requirement so the copilot
+            # can cross-reference it; the requirement label is the human filename
+            # the officer recognises ("Fotokopi KTP"). claimed_type mirrors the
+            # label so _resolve_doc_ref can match "KTP" etc.
+            req_id = ref.get("requirements_id")
+            fid = f"siap:req:{req_id}" if req_id is not None else f"siap:{fetched}"
+            label = ref.get("requirement_name") or _basename(str(file_ref))
+            out[fid] = {
+                "filename": label,
+                "mime_type": _guess_mime(str(file_ref)),
+                "content": content,
+                "claimed_type": ref.get("requirement_name") or "",
+                "detected_type": "",
+            }
+            seen_labels.add(_dedupe_key(label))
+            fetched += 1
+
+    profile_docs = len(out)
+
+    # --- Source (b): per-request document API (applicant-upload docs) ---
+    # For a BIMA-created request the applicant uploads live behind the document
+    # API, not profile_requirements. Merge them in, deduping by filename/label
+    # so a doc present in both sources is emitted once. Best-effort: the client
+    # degrades (list → {ok:False}, download → None) rather than raising, so a
+    # not-configured / unreachable doc API leaves source (a) untouched.
+    doc_api_docs = 0
+    if request_id is not None:
+        from services.siap_document_client import get_siap_document_client
+
+        doc_client = get_siap_document_client()
+        if doc_client.is_configured():
+            listing = await doc_client.list_documents(int(request_id))
+            for entry in listing.get("documents", []):
+                if fetched >= _MAX_SIAP_DOCS:
+                    break
+                if not isinstance(entry, dict):
+                    continue
+                file_id = entry.get("id") or entry.get("file_id")
+                if file_id is None:
+                    continue
+                label = (
+                    str(entry.get("filename") or "").strip()
+                    or f"dokumen-{file_id}"
+                )
+                # DEDUPE — skip a doc already emitted from source (a).
+                if _dedupe_key(label) in seen_labels:
+                    continue
+                content = await doc_client.download_document(int(file_id))
+                if not content:
+                    continue
+                fid = f"siap:doc:{file_id}"
+                out[fid] = {
+                    "filename": label,
+                    "mime_type": (
+                        str(entry.get("mime") or "").strip()
+                        or _guess_mime(label)
+                    ),
+                    "content": content,
+                    "claimed_type": label,
+                    "detected_type": "",
+                }
+                seen_labels.add(_dedupe_key(label))
+                fetched += 1
+                doc_api_docs += 1
+
+    logger.info(
+        "officer case: SIAP submission docs loaded | profile_id=%s request_id=%s "
+        "| profile_docs=%d doc_api_docs=%d total=%d",
+        profile_id, request_id, profile_docs, doc_api_docs, len(out),
+    )
+    return out
+
+
+def _dedupe_key(label: str) -> str:
+    """Normalise a filename/label for cross-source dedupe: lowercased, with the
+    formatting differences the two sources introduce (underscores vs spaces,
+    surrounding whitespace) collapsed. Mirrors the tolerance officer_copilot's
+    `_resolve_doc_ref` applies so a doc that would resolve to the same ref is
+    treated as the same doc here.
+    """
+    return " ".join((label or "").replace("_", " ").lower().split())
+
+
+def _basename(path: str) -> str:
+    """Last path segment of a storage key, for a human filename fallback."""
+    cleaned = (path or "").rstrip("/")
+    return cleaned.rsplit("/", 1)[-1] or "dokumen"
+
+
+def _guess_mime(file_ref: str) -> str:
+    ext = (file_ref or "").rsplit(".", 1)[-1].lower()
+    return {
+        "pdf": "application/pdf",
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }.get(ext, "application/octet-stream")
+
+
+async def load_case_from_siap(
+    request_id: int,
+    *,
+    channel: str = CHANNEL_WHATSAPP,
+    channel_id: str = "",
+) -> Optional[OfficerCaseSession]:
+    """Assemble an officer case context PURELY from SIAP for `request_id`.
+
+    Returns an OfficerCaseSession (NOT persisted — the caller registers it for
+    the specific officer) grounded entirely in SIAP: submission docs (a),
+    ticket for the live prior-step-notes tool (b), current step + is_final_step
+    (c); validation is left None (SIAP has none) (d).
+
+    Returns None only when SIAP can't even identify the request (no ticket / DB
+    down) — the caller then skips notifying rather than sending an empty brief.
+    NEVER raises. PII is never logged.
+    """
+    from services.siap_db import get_request_case_meta
+
+    meta = await get_request_case_meta(int(request_id))
+    if not meta.get("found") or not meta.get("ticket"):
+        logger.info(
+            "load_case_from_siap: request not resolvable in SIAP | request_id=%s",
+            request_id,
+        )
+        return None
+
+    documents = await _load_siap_documents(meta.get("profile_id"), int(request_id))
+
+    sess = OfficerCaseSession(
+        channel_id=channel_id,
+        channel=channel,
+        ticket=str(meta["ticket"]),
+        request_id=int(request_id),
+        license_id=meta.get("license_id"),
+        license_name=None,          # not needed for the copilot's SIAP tools
+        applicant_name=None,        # copilot reads identity from docs, grounded
+        alamat=None,
+        validation=None,            # SIAP holds no BIMA score
+        documents=documents,
+        documents_digest=[],
+        is_final_step=bool(meta.get("is_final_step")),
+    )
+    logger.info(
+        "load_case_from_siap | request_id=%s ticket=%s docs=%d final_step=%s",
+        request_id, _mask(str(meta["ticket"])), len(documents), sess.is_final_step,
+    )
+    return sess
 
 
 # ===========================================================================
@@ -815,6 +1098,115 @@ async def notify_officer_of_submission(
 
 
 # ===========================================================================
+# 1b) Auto-notify the NEXT desk when a request ADVANCES ([[Multi-step Copilot]])
+# ===========================================================================
+
+
+async def notify_next_step(request_id: int) -> bool:
+    """Notify the officer(s) at the request's now-CURRENT step, chaining the
+    copilot to the next desk in the SIAP approval chain.
+
+    Called after BIMA's own confirmed forward / approved-decision write moves a
+    file forward. SIAP has already advanced `license_request.approval_step_id`,
+    so `resolve_step_officers` now resolves the NEW current desk. For each
+    resolved officer we register a SIAP-grounded case session
+    (load_case_from_siap → docs + step + is_final_step, all from SIAP) and send
+    the approved new-submission template exactly like the first step.
+
+    Returns True if at least one next-step officer was notified. NEVER raises;
+    a SIAP miss / DB-down / applicant-step (chain ended at the citizen) all
+    degrade to a logged False. PII never logged.
+    """
+    if not is_enabled():
+        logger.info("next-step notify suppressed (flag off) | request_id=%s", request_id)
+        return False
+    if request_id is None:
+        return False
+
+    try:
+        from services.siap_db import resolve_step_officers
+
+        resolution = await resolve_step_officers(int(request_id))
+    except Exception:
+        logger.exception(
+            "next-step notify: resolution crashed | request_id=%s", request_id
+        )
+        return False
+
+    officer_whatsapps = list(resolution.get("officer_whatsapps") or [])
+    logger.info(
+        "next-step notify resolution | request_id=%s wa_active=%s applicant_step=%s "
+        "group_id=%s resolved=%d",
+        request_id, resolution.get("wa_active"), resolution.get("is_applicant_step"),
+        resolution.get("group_id"), len(officer_whatsapps),
+    )
+    if not officer_whatsapps:
+        # Chain terminus, non-active desk, or applicant step → nobody to notify.
+        return False
+
+    # Build ONE SIAP-grounded case; each officer gets their own doc copy + session.
+    base_case = await load_case_from_siap(int(request_id))
+    if base_case is None:
+        logger.info(
+            "next-step notify: case not loadable from SIAP | request_id=%s", request_id
+        )
+        return False
+
+    # Make each just-resolved officer immediately recognizable on their first
+    # reply (same union the submit-time notify does).
+    global _officer_cache
+    _officer_cache |= {n for n in officer_whatsapps if n}
+
+    brief = _render_brief(
+        ticket=base_case.ticket,
+        license_name=base_case.license_name,
+        applicant_name=None,
+        validation=None,
+    )
+
+    any_sent = False
+    for wa_num in officer_whatsapps:
+        sess = OfficerCaseSession(
+            channel_id=wa_num,
+            channel=CHANNEL_WHATSAPP,
+            ticket=base_case.ticket,
+            request_id=base_case.request_id,
+            license_id=base_case.license_id,
+            license_name=base_case.license_name,
+            applicant_name=base_case.applicant_name,
+            alamat=base_case.alamat,
+            validation=None,
+            documents=dict(base_case.documents),  # per-officer copy
+            documents_digest=[],
+            is_final_step=base_case.is_final_step,
+        )
+        await _put_session(sess)
+
+        # LAST step (Kepala Dinas): send the SK signing magic-link so the Kepala
+        # can sign in SIAP; earlier desks get the standard new-submission alert.
+        if base_case.is_final_step:
+            sent = await _send_final_step_notify(
+                CHANNEL_WHATSAPP, wa_num,
+                license_name=base_case.license_name,
+                ticket=base_case.ticket,
+                request_id=base_case.request_id,
+            )
+        else:
+            sent = await _send_officer_notify(
+                CHANNEL_WHATSAPP, wa_num,
+                license_name=base_case.license_name, ticket=base_case.ticket,
+                validation=None, brief=brief,
+            )
+        any_sent = any_sent or sent
+        logger.info(
+            "next-step notify | request_id=%s officer=%s sent=%s final_step=%s docs=%d",
+            request_id, _mask(wa_num), sent, base_case.is_final_step,
+            len(base_case.documents),
+        )
+    return any_sent
+
+
+# ===========================================================================
 # 2) Officer reply → copilot bridge (inbound FAST-PATH)
 # ===========================================================================
 
@@ -887,6 +1279,33 @@ def _case_was_closed(tool_calls: list) -> bool:
     return False
 
 
+def _case_advanced(tool_calls: list) -> bool:
+    """True when the confirmed write MOVED THE FILE FORWARD to the next desk —
+    a successful `forward_case`, or a `record_decision(approved)`. A `rejected`
+    decision routes the file BACK a desk (SIAP-side), so it must NOT trigger a
+    next-step notify (there is no new forward desk). Same three-signal guard as
+    `_case_was_closed`, plus: for record_decision the decision must be
+    'approved'."""
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name")
+        if name not in _CASE_CLOSING_TOOLS:
+            continue
+        args = call.get("args")
+        if not (isinstance(args, dict) and args.get("confirmed") is True):
+            continue
+        preview = str(call.get("result_preview") or "").replace(" ", "")
+        if not ('"executed":true' in preview and '"ok":true' in preview):
+            continue
+        if name == "record_decision":
+            decision = str(args.get("decision") or "").strip().lower()
+            if decision != "approved":
+                continue  # rejected → routed back, not advanced
+        return True
+    return False
+
+
 async def maybe_handle_officer_reply(
     *,
     channel: str,
@@ -935,13 +1354,20 @@ async def maybe_handle_officer_reply(
         # Cap history so the turn stays bounded.
         history = sess.history[-(_MAX_HISTORY_TURNS * 2):]
 
+        # LAST step (Kepala Dinas / SK-signing): drive the copilot in
+        # "signature" mode — it exposes the SIAP signing handoff (no "forward"
+        # recommendation, no write tools) so BIMA tells the Kepala the SK is
+        # ready and links out to SIAP for the TTE. Every earlier desk uses
+        # "officer" mode (forward/decision writes).
+        copilot_mode = "signature" if sess.is_final_step else "officer"
+
         result = await get_copilot().chat(
             message=msg,
             ticket=sess.ticket,
             history=history,
             officer_id=None,           # masked-logging only; we hold no JWT here
             validation=sess.validation,
-            mode="officer",
+            mode=copilot_mode,
             documents=sess.documents,  # in-session bytes → real get_doc_summary
             # SK-draft context (draft_sk) — licence id + applicant identity so
             # the deputy can render SIAP's PKPP approval-letter template. The
@@ -997,6 +1423,18 @@ async def maybe_handle_officer_reply(
         # officer's next, unrelated message for up to the 12h TTL. The desk
         # returns to "nothing queued" until the next brief arrives.
         await clear_session(channel_id)
+        # If the file ADVANCED (forward, or an approved decision — NOT a reject,
+        # which routes back), auto-notify the NEXT desk's officer(s), chaining
+        # the copilot down the SIAP approval chain to the last step. Never
+        # raises out of the officer reply path.
+        if _case_advanced(tool_calls) and sess.request_id is not None:
+            try:
+                await notify_next_step(sess.request_id)
+            except Exception:
+                logger.exception(
+                    "next-step officer notify crashed (non-fatal) | ticket=%s",
+                    sess.ticket,
+                )
         return reply
 
     # Otherwise persist the rolling history the copilot returned (it includes
@@ -1168,4 +1606,84 @@ async def _send_officer_notify(
             )
             return False
     # Telegram, or template disabled → free-form brief.
+    return await _send(channel, channel_id, brief)
+
+
+# ===========================================================================
+# 3) Final step → SIAP signing magic-link (Kepala Dinas)
+# ===========================================================================
+
+
+def _render_sk_sign_brief(
+    *, license_name: Optional[str], ticket: str, sign_url: Optional[str]
+) -> str:
+    """The message the LAST-step signer (Kepala Dinas) receives: the SK is ready
+    and here is the SIAP signing link. BIMA does NOT sign — it links out."""
+    lines = [
+        "🖋️ *Berkas siap ditandatangani*",
+        "",
+        f"📋 *Izin:* {license_name or '-'}",
+        f"🎟️ *Tiket:* {ticket}",
+        "",
+        "Surat Keputusan (SK) untuk permohonan ini sudah siap. "
+        "Penandatanganan ber-TTE dilakukan langsung di SIAP.",
+    ]
+    if sign_url:
+        lines += ["", f"🔗 Tautan tanda tangan SIAP:\n{sign_url}"]
+    else:
+        lines += [
+            "",
+            "Tautan tanda tangan SIAP belum tersedia di lingkungan ini. "
+            "Silakan buka SIAP untuk menandatangani.",
+        ]
+    lines += [
+        "",
+        "Balas pesan ini bila ingin BIMA menyiapkan draf SK atau meringkas "
+        "catatan meja-meja sebelumnya sebelum Anda menandatangani.",
+    ]
+    return "\n".join(lines)
+
+
+async def _send_final_step_notify(
+    channel: str,
+    channel_id: str,
+    *,
+    license_name: Optional[str],
+    ticket: str,
+    request_id: Optional[int],
+) -> bool:
+    """Alert the LAST-step signer + hand them the SIAP signing magic-link.
+
+    WhatsApp: fire the approved template first (reaches a cold number outside
+    the 24h window), then best-effort a free-form message carrying the magic
+    link (delivered when inside the window; a bounce is harmless — the copilot
+    also surfaces the link on reply via get_siap_signing_link). Telegram gets
+    the link brief directly. Never raises."""
+    sign_url = _build_sk_sign_url(request_id=request_id, ticket=ticket)
+    brief = _render_sk_sign_brief(
+        license_name=license_name, ticket=ticket, sign_url=sign_url
+    )
+
+    if channel == CHANNEL_WHATSAPP and _OFFICER_TEMPLATE_NAME:
+        # Template alert (cold-window safe). Reuse the approved arity; the third
+        # param is a status label rather than a score at the signing desk.
+        template_sent = False
+        try:
+            from services.whatsapp_template import send_template
+
+            template_sent = await send_template(
+                recipient_phone=channel_id,
+                template_name=_OFFICER_TEMPLATE_NAME,
+                body_params=[license_name or "Perizinan", ticket or "-", "Siap TTE"],
+                language_code=_OFFICER_TEMPLATE_LANG,
+            )
+        except Exception:
+            logger.exception(
+                "final-step template send failed | officer=%s", _mask(channel_id)
+            )
+        # Best-effort in-window link delivery; a bounce outside 24h is fine.
+        link_sent = await _send(channel, channel_id, brief)
+        return bool(template_sent or link_sent)
+
+    # Telegram, or template disabled → free-form signing brief directly.
     return await _send(channel, channel_id, brief)
