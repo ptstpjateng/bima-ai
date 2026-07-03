@@ -450,5 +450,250 @@ class TestFetchSubmissionFileBytes(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(called)
 
 
+@unittest.skipUnless(_DEPS_OK, "python-docx/httpx not installed")
+class TestPlaceholderDiscovery(unittest.TestCase):
+    """discover_placeholder_keys — run-aware, ordered, de-duplicated."""
+
+    def _doc(self, run_groups):
+        d = Document()
+        for runs in run_groups:
+            p = d.add_paragraph()
+            for t in runs:
+                p.add_run(t)
+        buf = io.BytesIO(); d.save(buf)
+        return buf.getvalue()
+
+    def test_discovers_intact_and_shattered_tokens_in_order(self):
+        raw = self._doc([
+            ["Pemohon: ", "[data.nama_pemohon]"],
+            ["SIUP ", "[", "data.no_siup", "]", " tgl ", "[data.tgl_siup]"],
+            ["Ukuran: ", "[data.gt]"],
+        ])
+        keys = st.discover_placeholder_keys(raw)
+        self.assertEqual(
+            keys, ["nama_pemohon", "no_siup", "tgl_siup", "gt"])
+
+    def test_dedupes_repeated_key(self):
+        raw = self._doc([["[data.nama_pemohon] ... [data.nama_pemohon]"]])
+        self.assertEqual(st.discover_placeholder_keys(raw), ["nama_pemohon"])
+
+    def test_no_tokens_is_empty(self):
+        raw = self._doc([["Tidak ada token di sini."]])
+        self.assertEqual(st.discover_placeholder_keys(raw), [])
+
+
+class TestClassifyPlaceholderKey(unittest.TestCase):
+    """classify_placeholder_key — the no-hallucination source router. Pure (no
+    docx), so it runs even in the bare env."""
+
+    def test_profile_keys(self):
+        for k in ("nama_pemohon", "alamat", "nik", "no_hp", "email",
+                  "atas_nama_perusahaan", "alamat_perusahaan", "pekerjaan_pemohon"):
+            self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_PROFILE, k)
+
+    def test_case_keys(self):
+        for k in ("no_tiket", "ticket_num", "nama_izin", "jenis_pengadaan"):
+            self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_CASE, k)
+
+    def test_siap_issued_keys_are_blank(self):
+        # SK/reg number, penetapan/TTE date, QR/signature → NEVER sourced.
+        for k in ("no_ppkp", "no_sk", "no_rekom", "rekom_tgl_penetapan",
+                  "tgl_penetapan", "qrcode_signed", "ttd_gbr", "masa_berlaku",
+                  "nomor_rekomtek"):
+            self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_BLANK, k)
+
+    def test_doc_only_keys_go_to_vision(self):
+        for k in ("nama_kapal", "gt", "bahan", "galangan", "luas_tanah",
+                  "status_tanah", "batas_tanah"):
+            self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_VISION, k)
+
+    def test_unknown_key_falls_to_vision_not_guess(self):
+        # A never-seen doc-only key on a NEW template → Vision (best-effort),
+        # which returns "" when not visible → blank. Never fabricated.
+        self.assertEqual(
+            st.classify_placeholder_key("some_new_field"), st.SOURCE_VISION)
+
+    def test_empty_key_is_blank(self):
+        self.assertEqual(st.classify_placeholder_key(""), st.SOURCE_BLANK)
+
+
+class TestResolveFillData(unittest.IsolatedAsyncioTestCase):
+    """resolve_fill_data — the DATA-SOURCE RESOLVER. Profile/case deterministic,
+    Vision best-effort, everything unresolved stays OUT of the data map (→ the
+    renderer emits a blank fill line). No value is ever fabricated."""
+
+    async def test_profile_and_case_resolve_deterministically(self):
+        keys = ["nama_pemohon", "alamat", "nik", "no_tiket", "nama_izin",
+                "jenis_pengadaan", "no_ppkp"]
+        profile = {
+            "full_name": "CASMO", "address": "Jl. Laut No. 1",
+            "identity_number": "3374012345678901",
+        }
+        case = {"ticket": "000123456"}
+        data, classes = await st.resolve_fill_data(
+            keys, profile=profile, case_meta=case,
+            license_name="Pengadaan Kapal (Pembangunan)",
+            documents=None, run_vision=False,
+        )
+        self.assertEqual(data["nama_pemohon"], "CASMO")
+        self.assertEqual(data["alamat"], "Jl. Laut No. 1")
+        self.assertEqual(data["nik"], "3374012345678901")
+        self.assertEqual(data["no_tiket"], "000123456")
+        self.assertEqual(data["nama_izin"], "Pengadaan Kapal (Pembangunan)")
+        self.assertEqual(data["jenis_pengadaan"], "Pembangunan")
+        # SIAP-issued → NOT sourced → absent → renders blank.
+        self.assertNotIn("no_ppkp", data)
+        self.assertEqual(classes["no_ppkp"], st.SOURCE_BLANK)
+        # Every discovered key is classified (for the filled/blank note).
+        self.assertEqual(set(classes.keys()), set(keys))
+
+    async def test_missing_profile_field_stays_blank(self):
+        # Profile lacks address → alamat is NOT added to data (blank), never
+        # guessed from another field.
+        data, classes = await st.resolve_fill_data(
+            ["nama_pemohon", "alamat"],
+            profile={"full_name": "CASMO"}, case_meta={},
+            license_name=None, documents=None, run_vision=False,
+        )
+        self.assertEqual(data["nama_pemohon"], "CASMO")
+        self.assertNotIn("alamat", data)
+        self.assertEqual(classes["alamat"], st.SOURCE_PROFILE)
+
+    async def test_vision_fills_doc_only_keys(self):
+        # A VISION key with a value visible in the doc is filled; one not visible
+        # stays blank. Stub gemini_vision.
+        mod = types.ModuleType("services.gemini_vision")
+        captured = {}
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            captured["schema_keys"] = sorted(response_schema["properties"].keys())
+            return {"nama_kapal": "KM BAHARI", "gt": ""}
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            data, classes = await st.resolve_fill_data(
+                ["nama_pemohon", "nama_kapal", "gt"],
+                profile={"full_name": "CASMO"}, case_meta={},
+                license_name=None,
+                documents={"d1": {"content": b"x", "mime_type": "application/pdf"}},
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        # Schema built ONLY from the VISION-classified keys (data-driven, no
+        # hardcode) — nama_pemohon is profile so it's not in the vision schema.
+        self.assertEqual(captured["schema_keys"], ["gt", "nama_kapal"])
+        self.assertEqual(data["nama_pemohon"], "CASMO")
+        self.assertEqual(data["nama_kapal"], "KM BAHARI")
+        self.assertNotIn("gt", data)          # empty vision value → blank
+        self.assertEqual(classes["gt"], st.SOURCE_VISION)
+
+    async def test_vision_unconfigured_leaves_doc_keys_blank(self):
+        mod = types.ModuleType("services.gemini_vision")
+        mod.extract_structured = None
+        mod.is_configured = lambda: False
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            data, classes = await st.resolve_fill_data(
+                ["nama_kapal", "gt"], profile={}, case_meta={},
+                license_name=None,
+                documents={"d1": {"content": b"x", "mime_type": "application/pdf"}},
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        self.assertEqual(data, {})            # nothing sourced → all blank
+        self.assertEqual(classes["nama_kapal"], st.SOURCE_VISION)
+
+
+@unittest.skipUnless(_DEPS_OK, "python-docx/httpx not installed")
+class TestRenderOutputDocx(unittest.IsolatedAsyncioTestCase):
+    """render_output_docx — the generic renderer: fetch → discover → resolve →
+    fill, returning (bytes, name, data, classes). Verifies an UNKNOWN licence
+    template (different key set than PKPP) works with NO code change and that
+    unresolved keys render blank."""
+
+    def _template(self, run_groups):
+        d = Document()
+        for runs in run_groups:
+            p = d.add_paragraph()
+            for t in runs:
+                p.add_run(t)
+        buf = io.BytesIO(); d.save(buf)
+        return buf.getvalue()
+
+    async def test_fills_unknown_license_from_real_sources(self):
+        # A pengairan-style template with a DIFFERENT key set than PKPP.
+        raw = self._template([
+            ["Nama Pemohon: ", "[data.nama_pemohon]"],
+            ["Alamat: ", "[data.alamat_pemohon]"],
+            ["Luas Tanah: ", "[", "data.luas_tanah", "]"],
+            ["Nomor Rekomtek: ", "[data.nomor_rekomtek]"],  # SIAP-issued → blank
+        ])
+
+        async def _fetch(internal):
+            return raw
+
+        # Stub Vision so luas_tanah resolves from the doc.
+        vmod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            return {"luas_tanah": "250 m2"}
+
+        vmod.extract_structured = _extract
+        vmod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = vmod
+
+        old_fetch = st.fetch_template_bytes
+        st.fetch_template_bytes = _fetch
+        try:
+            res = await st.render_output_docx(
+                internal_filename="master/REK.docx",
+                profile={"full_name": "SUTRISNO", "address": "Jl. Air No. 9"},
+                case_meta={"ticket": "000900900"},
+                license_name="Izin Pemanfaatan Air (IPTB)",
+                documents={"d1": {"content": b"x", "mime_type": "application/pdf"}},
+                ticket="000900900",
+                out_prefix="Rekomtek",
+            )
+        finally:
+            st.fetch_template_bytes = old_fetch
+            sys.modules.pop("services.gemini_vision", None)
+
+        self.assertIsNotNone(res)
+        docx_bytes, name, data, classes = res
+        self.assertEqual(name, "Rekomtek_000900900.docx")
+        self.assertEqual(docx_bytes[:2], b"PK")
+        # Real sources filled; SIAP-issued left blank.
+        self.assertEqual(data["nama_pemohon"], "SUTRISNO")
+        self.assertEqual(data["alamat_pemohon"], "Jl. Air No. 9")
+        self.assertEqual(data["luas_tanah"], "250 m2")
+        self.assertNotIn("nomor_rekomtek", data)
+        self.assertEqual(classes["nomor_rekomtek"], st.SOURCE_BLANK)
+        # The rendered doc carries the values + a blank line for the issued key,
+        # and NO raw token survives.
+        text = "\n".join(p.text for p in st._iter_block_paragraphs(
+            Document(io.BytesIO(docx_bytes))))
+        self.assertIn("SUTRISNO", text)
+        self.assertIn("250 m2", text)
+        self.assertIn(st._BLANK_FILL, text)   # nomor_rekomtek blank line
+        self.assertNotIn("[data.", text)
+
+    async def test_none_when_not_a_docx(self):
+        res = await st.render_output_docx(internal_filename="master/OLD.doc")
+        self.assertIsNone(res)
+
+    async def test_none_when_fetch_misses(self):
+        async def _fetch(internal):
+            return None
+        old = st.fetch_template_bytes
+        st.fetch_template_bytes = _fetch
+        try:
+            res = await st.render_output_docx(internal_filename="master/X.docx")
+        finally:
+            st.fetch_template_bytes = old
+        self.assertIsNone(res)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

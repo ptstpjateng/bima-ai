@@ -488,6 +488,212 @@ async def siap_get_output_template(license_id: int) -> dict:
 
 
 # ===========================================================================
+# Tool 1d — siap_get_step_output_template  (PER-STEP output selection)
+#
+# ([[Generalize copilot SK/output-doc from real data]] — task #80.)
+#
+# Which output template applies depends on the DESK the case is currently on.
+# From the SIAP step→doc investigation:
+#   * The TECHNICAL / Balai review desk produces the Rekomtek
+#     (stereotype 'LICENSE-RECOMMEND').
+#   * The final Kepala-Dinas SIGNING desk produces the Surat Keputusan
+#     (stereotype 'LICENSE-SK').
+# The binding in SIAP is by the two signing RESOURCES (Tanda Tangan
+# Rekomendasi vs Tanda Tangan Berkas), scoped by the step's owning role, NOT a
+# per-step template pointer. BIMA has no per-step pointer either, so we key the
+# choice on the case-meta signals BIMA already computes in
+# `get_request_case_meta`: `is_final_step` (the desk's role is a configured
+# SK-signing role) and the step `stereotype` (a strong secondary hint —
+# 'TTE'/'PENANDATANGANAN BERKAS'/'PENYERAHAN SK' ⇒ SK; 'SURVEY-LAPANGAN'/
+# 'REVIEW-PERMOHONAN' ⇒ Rekomtek).
+#
+# IMPORTANT (no-guess fallback): BIMA's current `[data.KEY]` filler matches the
+# LICENSE-RECOMMEND syntax; LICENSE-SK templates use PhpWord `${key}` which BIMA
+# does NOT fill. So even when the step points at the SK desk, if only a
+# LICENSE-SK template exists, drafting it would leave it almost entirely blank.
+# We therefore return WHICH stereotype the step calls for AND which templates
+# actually exist, letting the caller choose the fillable one and SAY so when it
+# had to fall back — rather than silently drafting the wrong/empty doc.
+# ===========================================================================
+
+# Step stereotypes that indicate the FINAL SK-signing desk (produces LICENSE-SK).
+# Case-insensitive substring match on the step's own `stereotype` column.
+_SK_STEP_STEREOTYPES = ("tte", "penandatanganan berkas", "penyerahan sk")
+# Step stereotypes that indicate a technical/recommendation desk (LICENSE-RECOMMEND).
+_RECOMMEND_STEP_STEREOTYPES = (
+    "survey", "review-permohonan", "review permohonan",
+    "penyerahan surat persetujuan", "rekom",
+)
+
+
+async def _fetch_template_row(conn, license_id: int, stereotype: str):
+    """Return the first (lowest file_id) ptsp.files row of `stereotype` for the
+    licence, as a plain dict, or None. Parameterised — `stereotype` is passed
+    as a bind value, never interpolated."""
+    row = await conn.fetchrow(
+        """
+        SELECT file_id, file_name, file_type, internal_filename
+          FROM ptsp.files
+         WHERE stereotype = $2
+           AND owner_id = $1
+         ORDER BY file_id
+         LIMIT 1
+        """,
+        int(license_id), stereotype,
+    )
+    if row is None:
+        return None
+    return {
+        "file_id": row["file_id"],
+        "file_name": row["file_name"],
+        "file_type": row["file_type"],
+        "internal_filename": row["internal_filename"],
+    }
+
+
+def _preferred_stereotype_for_step(
+    *, is_final_step: bool, step_stereotype: Optional[str]
+) -> str:
+    """Decide which output stereotype the CURRENT step calls for.
+
+    Returns 'LICENSE-SK' for the final signing desk, else 'LICENSE-RECOMMEND'.
+    Primary signal: `is_final_step` (BIMA's role-based SK-signing detection).
+    Secondary: the step's own `stereotype` column (TTE / PENANDATANGANAN BERKAS
+    ⇒ SK; SURVEY-LAPANGAN / REVIEW-PERMOHONAN ⇒ Rekomtek). Defaults to the
+    Rekomtek when nothing is decisive — it is the earlier, more common desk and
+    the one BIMA can actually fill."""
+    stereo = (step_stereotype or "").strip().lower()
+    if is_final_step:
+        return "LICENSE-SK"
+    if stereo:
+        if any(s in stereo for s in _SK_STEP_STEREOTYPES):
+            return "LICENSE-SK"
+        if any(s in stereo for s in _RECOMMEND_STEP_STEREOTYPES):
+            return "LICENSE-RECOMMEND"
+    return "LICENSE-RECOMMEND"
+
+
+async def siap_get_step_output_template(
+    license_id: int,
+    *,
+    is_final_step: bool = False,
+    step_stereotype: Optional[str] = None,
+) -> dict:
+    """Return the output template for the case at its CURRENT step, choosing
+    between the Rekomtek (LICENSE-RECOMMEND) and the SK (LICENSE-SK) by the
+    desk the case sits on.
+
+    The step signals come from `get_request_case_meta` (siap_db): pass
+    `is_final_step` (the desk is a configured SK-signing role) and the step
+    `stereotype`. We resolve the PREFERRED stereotype for that step, then return
+    the actual template — but if the preferred one is missing OR is not a
+    BIMA-fillable `.docx`, we fall back to whichever fillable output template
+    the licence DOES have, and REPORT the fallback so the caller can tell the
+    officer honestly which document was drafted.
+
+    Returns:
+      {
+        "found": bool,
+        "license_id": int,
+        "stereotype": str | None,           # the stereotype we RESOLVED to
+        "preferred_stereotype": str,        # what the step called for
+        "fell_back": bool,                  # preferred missing/unfillable → other
+        "file_id": int | None,
+        "file_name": str | None,
+        "file_type": str | None,
+        "internal_filename": str | None,
+        "doc_kind": "rekomendasi" | "sk" | None,   # human doc family
+      }
+    On miss / not configured / error: found=False with a `note`. Never raises.
+    """
+    if not is_siap_db_configured():
+        return {"found": False, "note": "Integrasi basis data SIAP belum dikonfigurasi."}
+    if license_id is None:
+        return {"found": False, "note": "Wajib mengisi license_id."}
+
+    preferred = _preferred_stereotype_for_step(
+        is_final_step=is_final_step, step_stereotype=step_stereotype
+    )
+    # The two stereotypes, preferred first, then the other as the fallback.
+    order = (
+        ["LICENSE-SK", "LICENSE-RECOMMEND"]
+        if preferred == "LICENSE-SK"
+        else ["LICENSE-RECOMMEND", "LICENSE-SK"]
+    )
+
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            rows: dict[str, Optional[dict]] = {}
+            for stereo in ("LICENSE-RECOMMEND", "LICENSE-SK"):
+                rows[stereo] = await _fetch_template_row(conn, int(license_id), stereo)
+
+        # Prefer the step's stereotype, but only if it is a fillable .docx. BIMA
+        # fills `[data.KEY]` (LICENSE-RECOMMEND) — a legacy .doc/.rtf or the
+        # `${key}` SK docx cannot be filled here, so we treat a non-.docx as
+        # "not fillable" and let the fallback pick the other one.
+        def _is_fillable_docx(r: Optional[dict]) -> bool:
+            fn = (r or {}).get("internal_filename") or ""
+            return bool(fn) and str(fn).lower().endswith(".docx")
+
+        chosen_stereo: Optional[str] = None
+        for stereo in order:
+            if _is_fillable_docx(rows.get(stereo)):
+                chosen_stereo = stereo
+                break
+        # If neither is a fillable .docx, still surface the preferred row (if
+        # any exists) so the caller can report "template ada tapi belum bisa
+        # diisi otomatis" rather than a bare not-found.
+        if chosen_stereo is None:
+            for stereo in order:
+                if rows.get(stereo) is not None:
+                    chosen_stereo = stereo
+                    break
+
+        if chosen_stereo is None:
+            logger.info(
+                "siap_get_step_output_template | license_id=%s | no template "
+                "(preferred=%s)", license_id, preferred,
+            )
+            return {
+                "found": False,
+                "license_id": int(license_id),
+                "preferred_stereotype": preferred,
+                "note": (
+                    "Tidak ada template output (Rekomendasi/SK) untuk izin ini "
+                    "di SIAP."
+                ),
+            }
+
+        row = rows[chosen_stereo] or {}
+        doc_kind = "sk" if chosen_stereo == "LICENSE-SK" else "rekomendasi"
+        fell_back = chosen_stereo != preferred
+        logger.info(
+            "siap_get_step_output_template | license_id=%s | preferred=%s "
+            "chosen=%s fell_back=%s file_id=%s",
+            license_id, preferred, chosen_stereo, fell_back, row.get("file_id"),
+        )
+        return {
+            "found": True,
+            "license_id": int(license_id),
+            "stereotype": chosen_stereo,
+            "preferred_stereotype": preferred,
+            "fell_back": fell_back,
+            "file_id": row.get("file_id"),
+            "file_name": row.get("file_name"),
+            "file_type": row.get("file_type"),
+            "internal_filename": row.get("internal_filename"),
+            "doc_kind": doc_kind,
+        }
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.exception(
+            "siap_get_step_output_template failed | license_id=%s", license_id
+        )
+        return {"found": False, "license_id": license_id,
+                "note": f"Gagal membaca template output dari basis data SIAP: {exc}"}
+
+
+# ===========================================================================
 # Tool 2 — siap_get_status
 #
 # Per-ticket live status. The inventory backs this with the REST endpoint;
