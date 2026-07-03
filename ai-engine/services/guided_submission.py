@@ -1549,13 +1549,89 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
             "pengajuan, atau coba lagi nanti. Mohon maaf atas ketidaknyamanannya."
         )
 
-    profile_id_raw = os.getenv("GUIDED_SUBMISSION_PROFILE_ID", "").strip()
-    if not profile_id_raw.isdigit():
+    # --- Resolve-or-create the REAL applicant profile (bind the true pemohon) ---
+    # BIMA already Vision-read the applicant's KTP during scoring; the NIK +
+    # name (+ address/gender/phone) live on sess.fields. Resolve-or-create the
+    # applicant's SIAP person-profile from those so the request carries the
+    # CORRECT Nama Pemohon — replacing the fixed placeholder profile. This is
+    # strictly best-effort: if the profile client is unconfigured, the NIK is
+    # missing/invalid, the name is missing, or the upsert fails, we FALL BACK to
+    # the fixed GUIDED_SUBMISSION_PROFILE_ID. A profile hiccup NEVER blocks or
+    # delays the citizen's submission.
+    fixed_profile_raw = os.getenv("GUIDED_SUBMISSION_PROFILE_ID", "").strip()
+
+    resolved_profile_id: Optional[int] = None
+    applicant_nik = str(sess.fields.get("nik") or "").strip()
+    applicant_name = str(sess.fields.get("applicant_name") or "").strip()
+    # ASCII-only match: str.isdigit() also accepts non-ASCII/full-width numerals
+    # (e.g. "３３…") that SIAP's `[0-9]{16}` regex 422-rejects — an ASCII regex
+    # catches that class here so we fall back instead of bouncing a 422.
+    nik_ok = re.fullmatch(r"[0-9]{16}", applicant_nik) is not None
+    # STRICTLY best-effort: any failure (unconfigured, bad NIK/name, upsert
+    # error, or ANY unexpected exception) leaves resolved_profile_id as None so
+    # the code falls through to the fixed GUIDED_SUBMISSION_PROFILE_ID fallback.
+    # A profile hiccup NEVER blocks or delays the citizen's submission.
+    try:
+        from services.siap_profile_client import get_siap_profile_client
+        profile_client = get_siap_profile_client()
+        if profile_client.is_configured() and nik_ok and applicant_name:
+            # Forward only the identity fields we already read; the client
+            # whitelists + drops blanks. NIK/name are never logged here
+            # (masked / omitted).
+            upsert = await profile_client.upsert_profile(
+                identity_number=applicant_nik,
+                full_name=applicant_name,
+                address=sess.fields.get("alamat"),
+                gender=sess.fields.get("gender"),
+                mobile_phone=sess.fields.get("phone"),
+            )
+            if upsert.get("ok") and upsert.get("profile_id") is not None:
+                try:
+                    resolved_profile_id = int(upsert["profile_id"])
+                except (TypeError, ValueError):
+                    resolved_profile_id = None
+            if resolved_profile_id is None:
+                logger.warning(
+                    "Guided-submission: applicant profile upsert did not yield "
+                    "a profile_id, falling back to fixed profile | user=%s | "
+                    "nik=%s | note=%s",
+                    _mask(sess.user_id), _mask(applicant_nik),
+                    upsert.get("note", ""),
+                )
+        else:
+            logger.warning(
+                "Guided-submission: applicant profile resolve skipped "
+                "(configured=%s, nik_ok=%s, name_ok=%s), falling back to fixed "
+                "profile | user=%s | nik=%s",
+                profile_client.is_configured(),
+                nik_ok,
+                bool(applicant_name),
+                _mask(sess.user_id), _mask(applicant_nik),
+            )
+    except Exception as exc:  # noqa: BLE001 — never let a profile hiccup abort
+        # upsert_profile only guarantees no-raise for httpx timeout/RequestError;
+        # any OTHER error (JSON/attr, a bad get_siap_profile_client, …) must not
+        # propagate and abort the citizen's submission. Log PII-masked (NIK
+        # masked, name never logged) and fall back to the fixed profile.
+        resolved_profile_id = None
+        logger.warning(
+            "Guided-submission: applicant profile resolve raised, falling back "
+            "to fixed profile | user=%s | nik=%s | err=%s",
+            _mask(sess.user_id), _mask(applicant_nik), exc,
+        )
+
+    if resolved_profile_id is not None:
+        profile_id_for_request = resolved_profile_id
+    elif fixed_profile_raw.isdigit():
+        profile_id_for_request = int(fixed_profile_raw)
+    else:
+        # No resolved profile AND no valid fixed fallback → cannot bind a pemohon.
         sess.stage = Stage.FAILED
         sess.touch()
         await _put_session(sess)
         logger.warning(
-            "Guided-submission: no GUIDED_SUBMISSION_PROFILE_ID configured | user=%s",
+            "Guided-submission: no applicant profile resolved and no "
+            "GUIDED_SUBMISSION_PROFILE_ID configured | user=%s",
             _mask(sess.user_id),
         )
         return (
@@ -1571,7 +1647,7 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     )
     submit = await client.create_request(
         license_id=sess.license_id,
-        profile_id=int(profile_id_raw),
+        profile_id=profile_id_for_request,
         description=description,
     )
 
