@@ -271,17 +271,28 @@ def fill_docx_identity(docx_bytes: bytes, fields: dict[str, Any]) -> bytes:
 # complete them by hand.
 # ---------------------------------------------------------------------------
 
-# The literal fill token. Keys are [A-Za-z_]+ (the 16 PKPP keys are all snake).
-_PLACEHOLDER_RE = re.compile(r"\[data\.([A-Za-z_]+)\]")
+# The literal fill tokens BIMA understands. TWO syntaxes coexist on Beta,
+# cleanly split by stereotype:
+#   * LICENSE-RECOMMEND (Rekomtek) templates use  [data.KEY]
+#   * LICENSE-SK        templates use PhpWord      ${key}
+# Keys are snake_case but some templates carry a trailing digit (catatan1,
+# syarat1, pernyataan_1), so allow digits — an [A-Za-z_]+ class silently dropped
+# those. Both tokens are read off the JOINED paragraph text (run-aware) and both
+# route through the SAME classifier/resolver, so a template using either syntax
+# fills identically and an unresolved key always becomes the blank fill line.
+_PLACEHOLDER_RE = re.compile(r"\[data\.([A-Za-z0-9_]+)\]")
+_PHPWORD_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 
 # What an unmapped/blank field becomes — a visible fill line, not a broken token.
 _BLANK_FILL = "…" * 12
 
 
 def _fill_placeholders_in_text(text: str, data: dict[str, Any]) -> tuple[str, list[str], list[str]]:
-    """Replace every `[data.KEY]` in `text`. Returns (new_text, filled_keys,
-    blank_keys). A key present in `data` with a non-empty value fills; anything
-    else (unknown key OR empty value) becomes the blank fill line."""
+    """Replace every `[data.KEY]` AND every `${key}` in `text`. Returns
+    (new_text, filled_keys, blank_keys). A key present in `data` with a non-empty
+    value fills; anything else (unknown key OR empty value) becomes the blank
+    fill line — so an SK template's `${qrcode_signed}` / `${ttd_gbr}` image
+    anchors (classified BLANK) render as a fill line, never a raw token."""
     filled: list[str] = []
     blanks: list[str] = []
 
@@ -295,7 +306,9 @@ def _fill_placeholders_in_text(text: str, data: dict[str, Any]) -> tuple[str, li
         blanks.append(key)
         return _BLANK_FILL
 
-    return _PLACEHOLDER_RE.sub(_sub, text), filled, blanks
+    text = _PLACEHOLDER_RE.sub(_sub, text)
+    text = _PHPWORD_RE.sub(_sub, text)
+    return text, filled, blanks
 
 
 def _rewrite_paragraph_text(paragraph, new_text: str) -> None:
@@ -328,7 +341,7 @@ def fill_docx_placeholders(docx_bytes: bytes, data: dict[str, Any]) -> bytes:
     all_blank: list[str] = []
     for paragraph in _iter_block_paragraphs(doc):
         text = paragraph.text
-        if "[data." not in text:
+        if "[data." not in text and "${" not in text:
             continue
         new_text, filled, blanks = _fill_placeholders_in_text(text, data)
         if new_text != text:
@@ -387,13 +400,16 @@ def discover_placeholder_keys(docx_bytes: bytes) -> list[str]:
     keys: list[str] = []
     for paragraph in _iter_block_paragraphs(doc):
         text = paragraph.text
-        if "[data." not in text:
+        if "[data." not in text and "${" not in text:
             continue
-        for m in _PLACEHOLDER_RE.finditer(text):
-            key = m.group(1)
-            if key not in seen:
-                seen.add(key)
-                keys.append(key)
+        # Both token syntaxes ([data.KEY] and PhpWord ${key}); read off the
+        # joined paragraph text so a run-shattered token is still found.
+        for regex in (_PLACEHOLDER_RE, _PHPWORD_RE):
+            for m in regex.finditer(text):
+                key = m.group(1)
+                if key not in seen:
+                    seen.add(key)
+                    keys.append(key)
     return keys
 
 
