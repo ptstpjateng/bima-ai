@@ -695,5 +695,54 @@ class TestRenderOutputDocx(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(res)
 
 
+class TestPhpWordAndDigitKeys(unittest.TestCase):
+    """LICENSE-SK templates use PhpWord ${key}, not [data.KEY]; some RECOMMEND
+    templates carry digit keys (catatan1). The engine must discover AND fill
+    both syntaxes (run-aware) and blank issuance/signature anchors."""
+
+    def _para_from_runs(self, doc, run_texts):
+        p = doc.add_paragraph()
+        for t in run_texts:
+            p.add_run(t)
+        return p
+
+    def _sk_template(self):
+        d = Document()
+        # ${nama_pemohon} run-shattered like Word does; ${no_sk} + ${qrcode_signed}
+        # are issuance/signature anchors that must blank; a [data.catatan1] digit
+        # key must also fill.
+        self._para_from_runs(d, ["Yth. ", "$", "{nama_pemohon", "}", ","])
+        self._para_from_runs(d, ["Nomor SK: ", "${no_sk}", "  QR: ", "${qrcode_signed}"])
+        self._para_from_runs(d, ["Catatan: ", "[data.catatan1]"])
+        buf = io.BytesIO(); d.save(buf); return buf.getvalue()
+
+    def _text(self, docx_bytes):
+        fd = Document(io.BytesIO(docx_bytes))
+        return "\n".join(p.text for p in st._iter_block_paragraphs(fd))
+
+    def test_discovers_both_syntaxes_and_digit_keys(self):
+        keys = st.discover_placeholder_keys(self._sk_template())
+        self.assertIn("nama_pemohon", keys)   # ${key}, run-shattered
+        self.assertIn("no_sk", keys)
+        self.assertIn("qrcode_signed", keys)
+        self.assertIn("catatan1", keys)        # [data.KEY] with a digit
+
+    def test_fills_phpword_blanks_issuance_and_signature(self):
+        out = st.fill_docx_placeholders(
+            self._sk_template(),
+            {"nama_pemohon": "CASMO", "catatan1": "lengkap"},
+        )
+        text = self._text(out)
+        self.assertIn("CASMO", text)           # ${nama_pemohon} filled
+        self.assertIn("lengkap", text)         # [data.catatan1] filled
+        self.assertNotIn("${", text)           # no raw PhpWord token left
+        self.assertNotIn("[data.", text)
+        # no_sk / qrcode_signed are SIAP-issued/signature → classified BLANK →
+        # never filled with a fabricated value, rendered as the fill line.
+        self.assertEqual(st.classify_placeholder_key("no_sk"), st.SOURCE_BLANK)
+        self.assertEqual(st.classify_placeholder_key("qrcode_signed"), st.SOURCE_BLANK)
+        self.assertIn(st._BLANK_FILL, text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
