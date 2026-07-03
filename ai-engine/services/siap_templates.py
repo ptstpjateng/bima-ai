@@ -67,10 +67,15 @@ _IDENTITY_LABELS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 
 def _identity_value(field_key: str, fields: dict[str, Any]) -> Optional[str]:
-    """Resolve the value BIMA has for an identity field, or None to leave blank."""
-    if field_key == "jabatan":
-        # PPKP applicants are the vessel owner; default when unset.
-        return (fields.get("jabatan") or "Pemilik Kapal").strip() or "Pemilik Kapal"
+    """Resolve the value BIMA has for an identity field, or None to leave blank.
+
+    NO-HALLUCINATION CONTRACT (M2): every field, including `jabatan`, returns the
+    citizen's REAL value or None — no hardcoded default. `jabatan` used to default
+    to "Pemilik Kapal", which stamped a guessed occupation onto the citizen's own
+    Surat Permohonan; that is a fabricated value and is removed. An unset jabatan
+    now renders blank for the citizen to fill (the standalone "Pemilik Kapal"
+    caption below the signature block in build_surat_permohonan_ppkp_docx is a
+    fixed template caption, not a per-citizen data fill, and is left as-is)."""
     val = fields.get(field_key)
     if val is None:
         return None
@@ -444,11 +449,13 @@ _PROFILE_KEY_MAP: dict[str, str] = {
     "nama": "full_name",
     "full_name": "full_name",
     "atas_nama": "full_name",
-    "atas_nama_perusahaan": "full_name",
+    # NB: atas_nama_perusahaan / alamat_perusahaan are NOT here — a COMPANY is
+    # not the applicant person, so they route to BLANK (see C2 exclusion in
+    # classify_placeholder_key). Mapping them to the person profile would stamp
+    # the human's name/address where the company block belongs.
     # address
     "alamat": "address",
     "alamat_pemohon": "address",
-    "alamat_perusahaan": "address",
     "address": "address",
     # NIK / identity number
     "nik": "identity_number",
@@ -489,12 +496,31 @@ _PROFILE_KEY_MAP: dict[str, str] = {
 # Substring heuristics for PROFILE keys the exact map misses (a new template
 # that names a field slightly differently). Ordered longest-first so a more
 # specific hint wins. Each maps a key-name substring → profile field.
+#
+# ⚠️ These substrings (jabatan, alamat, pekerjaan) also occur inside keys that
+# name an OFFICIAL / OFFICE / COMPANY (jabatan_pejabat, alamat_balai,
+# alamat_perusahaan). Those are NOT the applicant, so `_names_official_or_company`
+# is consulted BEFORE these hints ever fire — see classify_placeholder_key.
 _PROFILE_KEY_HINTS: tuple[tuple[str, str], ...] = (
     ("nama_pemohon", "full_name"),
     ("alamat", "address"),
     ("pekerjaan", "position_name"),
     ("jabatan", "position_name"),
     ("email", "email"),
+)
+
+# C2 — official / office / company markers. A key that names the SIGNING
+# OFFICIAL, the ISSUING OFFICE, or the applicant's COMPANY is NOT the person
+# profile: it must never be filled from person_profile.properties (which holds
+# the human applicant). Any placeholder key containing one of these substrings
+# is routed to BLANK before any PROFILE match. The applicant is a natural
+# person; "atas nama perusahaan" / "alamat balai" / "jabatan pejabat" are a
+# different subject entirely and are officer/office-authored, so they stay blank
+# fill lines. `pemohon` is deliberately absent — nama_pemohon / alamat_pemohon
+# ARE the applicant and must stay PROFILE.
+_OFFICIAL_OR_COMPANY_MARKERS: tuple[str, ...] = (
+    "pejabat", "penandatangan", "kepala", "balai", "dinas", "kantor",
+    "instansi", "perusahaan", "badan_usaha", "plt", "cabdin", "skpd",
 )
 
 # Case-derived placeholder key → the get_request_case_meta field (or a
@@ -515,9 +541,64 @@ _BLANK_KEY_EXACT = frozenset({
     "mulai_tanggal_sk", "sampai_tanggal_sk", "masa_berlaku", "tgl_berlaku",
     "tgl_hbs_berlaku", "qrcode_signed", "ttd_gbr", "no_reg", "nomor_reg",
 })
+
+# SIAP-ISSUED / signature substring hints (C1c). Broadened SURGICALLY to catch
+# the issuance number/date/signature/validity synonyms the exact set misses —
+# WITHOUT blanket-blanking the bare `no_`/`tgl_` prefixes (which would wrongly
+# kill no_siup / tgl_siup — the applicant's prior SIUP, physically on an uploaded
+# doc — and tgl_surat_permohonan — the readable application-letter date). Every
+# hint here is anchored to an ISSUANCE NOUN, a SIGNATURE noun, or a VALIDITY
+# noun, never a bare number/date prefix.
 _BLANK_KEY_HINTS: tuple[str, ...] = (
-    "penetapan", "qrcode", "ttd_", "_signed", "tgl_terbit", "nomor_surat_keputusan",
+    # issuance / registration number & date nouns
+    "penetapan", "ditetapkan", "diterbitkan", "terbit",
+    "reg", "registrasi", "agenda", "verifikasi",
+    # the SK / decision / recommendation nouns themselves — a no_/tgl_/nomor_
+    # bound to one of these is SIAP-issued (no_sk, tgl_sk, nomor_keputusan…)
+    "sk", "keputusan", "rekom", "pertek", "persetujuan",
+    # QR / barcode / verification anchors
+    "qrcode", "qr_code", "barcode", "kode_verifikasi",
+    # signature / signing-official block
+    "ttd_", "tanda_tangan", "penandatangan", "penandatanganan",
+    "pejabat", "tmt", "_signed",
+    # validity window
+    "masa_", "berlaku", "mulai_tanggal_sk", "sampai_tanggal_sk",
+    # officer-authored SK clause / free-text fields (H2) — the officer writes
+    # these by hand; NEVER Vision-fabricated clause text.
+    "catatan", "syarat", "pernyataan", "keterangan", "isian",
 )
+
+# VISION allow-list (C1b). A key qualifies for a Gemini Vision OCR pass ONLY if
+# it names a value that PHYSICALLY LIVES ON a citizen-uploaded document. Built
+# from the real templates seen (vessel / land / prior-permit). Anything that is
+# not PROFILE, not CASE, and not on this allow-list falls through to BLANK — the
+# inverted default that makes an unrecognized issuance-field synonym render as a
+# blank fill line rather than an OCR-fabricated value stamped as official data.
+_VISION_KEY_HINTS: tuple[str, ...] = (
+    # vessel (PPKP) — data off the vessel spec / surat permohonan
+    "kapal", "gt", "alat", "bahan", "galangan", "tipe",
+    "thn_bangun", "tahun_bangun",
+    # land (pertanahan / pengairan) — off the land situation drawing / survey
+    "tanah", "luas", "batas", "status_tanah", "dimanfaatkan", "peruntukan",
+    "maksud", "tujuan", "lokasi", "desa_lokasi", "kab_lokasi", "kec_lokasi",
+    "situasi", "gbr_situasi",
+    # applicant PRIOR-PERMIT fields that ARE on an uploaded doc (the citizen's
+    # existing SIUP). Kept fillable via Vision, and explicitly protected from the
+    # `no_`/`tgl_` blank sweep by anchoring the blank hints to issuance nouns.
+    "siup",
+    # the APPLICATION LETTER (surat permohonan) — number/date/subject are read
+    # off the citizen's own letter, not SIAP-issued. tgl_surat_permohonan /
+    # tgl_srt_permohonan / no_surat_perm / perihal_surat_perm stay fillable. This
+    # is the applicant's letter, NOT the SK, so it is a Vision read, not blank.
+    "permohonan", "surat_perm", "srt_perm",
+)
+
+
+def _names_official_or_company(k: str) -> bool:
+    """True if the key names the SIGNING OFFICIAL, the ISSUING OFFICE, or the
+    applicant's COMPANY — i.e. NOT the applicant person. Such a key must route to
+    BLANK before any PROFILE substring (jabatan/alamat) can fire on it (C2)."""
+    return any(m in k for m in _OFFICIAL_OR_COMPANY_MARKERS)
 
 
 def classify_placeholder_key(key: str) -> str:
@@ -525,32 +606,48 @@ def classify_placeholder_key(key: str) -> str:
 
     Returns one of SOURCE_PROFILE / SOURCE_CASE / SOURCE_VISION / SOURCE_BLANK.
 
-    Resolution ladder (STOP at first hit) — mirrors the no-hallucination
-    contract:
-      1. SIAP-issued (SK/reg number, penetapan/TTE date, QR/signature) → BLANK.
-      2. applicant identity (exact map, then substring hint) → PROFILE.
-      3. case attribute (ticket / licence name / jenis_pengadaan) → CASE.
-      4. else → VISION (best-effort; a Vision miss renders blank anyway).
-    Case/profile before Vision so a value we can read deterministically is never
-    left to a probabilistic OCR pass."""
+    THE INVERTED DEFAULT (no-hallucination core): an unrecognized key is BLANK,
+    NOT Vision. A value goes to Vision ONLY when it matches a known applicant-
+    DOCUMENT data pattern (the _VISION_KEY_HINTS allow-list). This kills the old
+    hole where an issuance-field synonym on a new SK template (nomor_surat,
+    tgl_ditetapkan, kode_verifikasi…) fell through to Vision and got a number/
+    date OCR'd off some uploaded doc and stamped as the SK's official issuance
+    data.
+
+    Resolution ladder (STOP at first hit):
+      1. SIAP-issued / signature / validity / officer-clause → BLANK.
+      2. official / office / company key → BLANK (never the applicant person).
+      3. applicant identity (exact map, then substring hint) → PROFILE.
+      4. case attribute (ticket / licence name / jenis_pengadaan) → CASE.
+      5. applicant-DOCUMENT data pattern (allow-list) → VISION (best-effort;
+         a Vision miss renders blank anyway).
+      6. else → BLANK (the inverted default — never a guessed/OCR value)."""
     k = (key or "").strip().lower()
     if not k:
         return SOURCE_BLANK
-    # 1) SIAP-issued → never sourced.
+    # 1) SIAP-issued / signature / validity / officer-clause → never sourced.
     if k in _BLANK_KEY_EXACT or any(h in k for h in _BLANK_KEY_HINTS):
         return SOURCE_BLANK
-    # 2) applicant identity → profile.
+    # 2) official / office / company → BLANK (NOT the applicant profile). This
+    #    runs BEFORE the profile match so jabatan_pejabat / alamat_balai /
+    #    atas_nama_perusahaan never draw the human applicant's data.
+    if _names_official_or_company(k):
+        return SOURCE_BLANK
+    # 3) applicant identity → profile.
     if k in _PROFILE_KEY_MAP:
         return SOURCE_PROFILE
     for hint, _field in _PROFILE_KEY_HINTS:
         if hint in k:
             return SOURCE_PROFILE
-    # 3) case attribute → case meta / DB.
+    # 4) case attribute → case meta / DB.
     if (k in _CASE_KEY_TICKET or k in _CASE_KEY_LICENSE_NAME
             or k in _CASE_KEY_JENIS_PENGADAAN):
         return SOURCE_CASE
-    # 4) doc-only → Vision.
-    return SOURCE_VISION
+    # 5) applicant-DOCUMENT data pattern → Vision (allow-list only).
+    if any(h in k for h in _VISION_KEY_HINTS):
+        return SOURCE_VISION
+    # 6) INVERTED DEFAULT — unrecognized → BLANK, never a guessed/OCR value.
+    return SOURCE_BLANK
 
 
 def _profile_field_for_key(key: str) -> Optional[str]:

@@ -389,6 +389,30 @@ class TestDraftSkTool(unittest.TestCase):
         # The note states the draft is NOT in SIAP (kills the hallucination).
         self.assertIn("tidak tersimpan di SIAP", out)
 
+    def test_note_separates_official_from_vision_provenance(self):
+        # H1 — a PROFILE/CASE fill is reported as authoritative SIAP DB data; a
+        # VISION fill is reported SEPARATELY as an OCR read the officer must
+        # verify. BIMA must never present a Vision read as a DB fact.
+        data = {"nama_pemohon": "CASMO", "nama_kapal": "KM BAHARI"}
+        classes = {
+            "nama_pemohon": "profile",   # authoritative DB read
+            "nama_kapal": "vision",      # OCR'd off an uploaded doc
+            "no_ppkp": "blank",
+        }
+        out, _ = self._run_draft(sk_ctx=self._sk_ctx(), data=data, classes=classes)
+        low = out.lower()
+        # Two DISTINCT provenance sentences exist.
+        self.assertIn("data resmi siap", low)
+        self.assertIn("dokumen unggahan", low)
+        self.assertIn("diperiksa", low)   # the officer must eyeball the OCR read
+        # The official field is in the DB-sourced sentence; the vision field is
+        # in the "read from upload, please check" sentence — not swapped.
+        official_seg = out.split("Dibaca otomatis")[0]
+        vision_seg = out.split("Dibaca otomatis", 1)[1].split("Masih kosong")[0]
+        self.assertIn("Nama Pemohon", official_seg)
+        self.assertNotIn("Nama Kapal", official_seg)
+        self.assertIn("Nama Kapal", vision_seg)
+
     def test_pdf_view_render_miss_ships_docx_alone(self):
         data = {"nama_pemohon": "CASMO"}
         classes = {"nama_pemohon": "profile"}
@@ -971,6 +995,25 @@ class TestSystemPromptContent(unittest.TestCase):
         # P5: explicit officer clearance drops the finding on the first pass.
         self.assertIn("override", p)
         self.assertIn("sudah saya periksa dan sesuai", p)
+
+    def test_officer_prompt_separates_db_from_vision_provenance(self):
+        # H1: the draft_sk block must tell the model to report DB reads and
+        # uploaded-doc (OCR) reads SEPARATELY, and never present the OCR read as
+        # authoritative SIAP DB fact.
+        p = oc._SYSTEM_PROMPT_TEMPLATE
+        low = p.lower()
+        self.assertIn("data resmi siap", low)
+        self.assertIn("dokumen unggahan", low)
+        self.assertIn("mohon diperiksa", low)
+        # It explicitly forbids presenting the OCR read as official DB fact.
+        self.assertIn("jangan", low)
+
+    def test_signature_prompt_flags_vision_reads_as_uncertain(self):
+        # H1: the signature-desk prompt likewise must not let a Vision read on a
+        # BIMA draft be presented as an authoritative DB fact.
+        p = oc._SIGNATURE_SYSTEM_PROMPT_TEMPLATE.lower()
+        self.assertIn("dokumen unggahan", p)
+        self.assertIn("diperiksa", p)
 
 
 class _FakeResp:

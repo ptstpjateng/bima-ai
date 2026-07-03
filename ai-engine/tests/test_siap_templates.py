@@ -43,12 +43,20 @@ def _ensure_stub(name: str, attrs: dict | None = None) -> None:
 _ensure_stub("asyncpg")
 _ensure_stub("dotenv", {"load_dotenv": lambda *a, **k: None})
 
+# `services.siap_templates` imports cleanly with only httpx present (python-docx
+# is imported LAZILY inside each fill/build function, never at module load). So
+# we bind `st` UNCONDITIONALLY — the pure classifier/resolver tests
+# (TestClassifyPlaceholderKey / TestResolveFillData) run in a bare env, and only
+# the docx-BUILDING classes are gated on `_DEPS_OK`. Without this, those pure
+# classes referenced `st` bound only under the try/except and ERRORed (not
+# skipped) when python-docx was absent.
+from services import siap_templates as st  # noqa: E402  (imports httpx at top)
+
 try:
     import docx  # noqa: F401  (fill/build need it; lazy inside the module)
     from docx import Document
-    from services import siap_templates as st  # imports httpx at top
     _DEPS_OK = True
-except Exception:  # pragma: no cover — bare env without python-docx/httpx
+except Exception:  # pragma: no cover — bare env without python-docx
     _DEPS_OK = False
 
 _FIELDS = {
@@ -96,10 +104,22 @@ class TestSuratPermohonanBuilder(unittest.TestCase):
         self.assertEqual(rows.get("NIK"), "3374012345678901")
         self.assertEqual(rows.get("Nomer HP"), "628123456789")
         self.assertEqual(rows.get("Alamat"), "Jl. Laut No. 1, Tegal")
-        self.assertEqual(rows.get("Jabatan"), "Pemilik Kapal")
+        # M2 — no hardcoded jabatan default. _FIELDS carries no `jabatan`, so the
+        # Jabatan value slot is BLANK for the citizen to fill (no fabricated
+        # "Pemilik Kapal"). The fixed caption under the signature block is a
+        # template constant, not a per-citizen data fill — checked separately.
+        self.assertEqual(rows.get("Jabatan"), "")
         for vessel in ("Nama Kapal", "Range GT", "Bahan Kapal",
                        "Alat Penangkap Ikan", "Nama Tukang dan Alamat Galangan"):
             self.assertEqual(rows.get(vessel), "", f"{vessel} must be blank")
+
+    def test_jabatan_fills_when_citizen_provides_it(self):
+        # M2 — when the citizen DID supply a jabatan, it fills (real value).
+        doc = Document(io.BytesIO(st.build_surat_permohonan_ppkp_docx(
+            {**_FIELDS, "jabatan": "Nelayan"})))
+        rows = {t.rows[i].cells[0].text: t.rows[i].cells[2].text
+                for t in doc.tables for i in range(len(t.rows))}
+        self.assertEqual(rows.get("Jabatan"), "Nelayan")
 
     def test_output_is_valid_docx(self):
         data = st.build_surat_permohonan_ppkp_docx(_FIELDS)
@@ -487,8 +507,12 @@ class TestClassifyPlaceholderKey(unittest.TestCase):
     docx), so it runs even in the bare env."""
 
     def test_profile_keys(self):
-        for k in ("nama_pemohon", "alamat", "nik", "no_hp", "email",
-                  "atas_nama_perusahaan", "alamat_perusahaan", "pekerjaan_pemohon"):
+        # Genuine APPLICANT identity → the person profile. NB: company keys
+        # (atas_nama_perusahaan / alamat_perusahaan) are NO LONGER here — a
+        # company is not the applicant person; C2 routes them to BLANK (see
+        # test_official_and_company_keys_are_blank).
+        for k in ("nama_pemohon", "alamat", "alamat_pemohon", "nik", "no_hp",
+                  "email", "pekerjaan_pemohon"):
             self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_PROFILE, k)
 
     def test_case_keys(self):
@@ -502,16 +526,53 @@ class TestClassifyPlaceholderKey(unittest.TestCase):
                   "nomor_rekomtek"):
             self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_BLANK, k)
 
+    def test_c1_issuance_synonyms_are_blank(self):
+        # C1 — the inverted default. Issuance number / date / QR / verification /
+        # validity synonyms a NEW SK template might use MUST render BLANK, never
+        # a Vision-OCR'd value stamped as the SK's official issuance data.
+        for k in ("nomor_surat", "tgl_sk", "tgl_ditetapkan", "berlaku_sampai",
+                  "qr_code", "kode_verifikasi", "nomor_agenda", "tgl_terbit",
+                  "no_registrasi", "mulai_tanggal_sk", "sampai_tanggal_sk"):
+            self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_BLANK, k)
+
+    def test_c1_legitimate_applicant_fields_stay_fillable(self):
+        # C1 — the surgical carve-outs. These are on a citizen-uploaded document
+        # (prior SIUP, application letter, vessel/land specs), so they MUST stay
+        # fillable (VISION or CASE), NOT swept into BLANK by the issuance guard.
+        for k in ("no_siup", "tgl_siup", "nama_kapal", "gt", "luas_tanah",
+                  "jenis_tanah", "batas_tanah", "status_tanah", "galangan",
+                  "thn_bangun", "tgl_surat_permohonan", "tgl_srt_permohonan"):
+            self.assertNotEqual(
+                st.classify_placeholder_key(k), st.SOURCE_BLANK, k)
+
+    def test_official_and_company_keys_are_blank(self):
+        # C2 — a key naming the SIGNING OFFICIAL, the ISSUING OFFICE, or the
+        # applicant's COMPANY must NEVER draw the human applicant profile. The
+        # jabatan/alamat substrings inside them must not fire PROFILE.
+        for k in ("jabatan_pejabat", "jabatan_penandatangan", "alamat_balai",
+                  "alamat_kantor", "atas_nama_perusahaan", "alamat_perusahaan",
+                  "nama_kepala_balai", "nama_instansi", "nama_dinas",
+                  "jabatan_kepala_cabdin"):
+            self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_BLANK, k)
+
+    def test_h2_officer_clause_keys_are_blank(self):
+        # H2 — officer-authored SK clause / free-text fields the officer writes
+        # by hand render as blank fill lines, never Vision-fabricated prose.
+        for k in ("catatan1", "syarat1", "pernyataan_1", "isian_a",
+                  "keterangan"):
+            self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_BLANK, k)
+
     def test_doc_only_keys_go_to_vision(self):
         for k in ("nama_kapal", "gt", "bahan", "galangan", "luas_tanah",
                   "status_tanah", "batas_tanah"):
             self.assertEqual(st.classify_placeholder_key(k), st.SOURCE_VISION, k)
 
-    def test_unknown_key_falls_to_vision_not_guess(self):
-        # A never-seen doc-only key on a NEW template → Vision (best-effort),
-        # which returns "" when not visible → blank. Never fabricated.
+    def test_unknown_key_falls_to_blank_not_vision(self):
+        # C1 INVERTED DEFAULT: a never-seen key that matches NO known applicant-
+        # document pattern is BLANK, not Vision. The old default sent it to Vision
+        # and risked an OCR-fabricated value on a legally-binding document.
         self.assertEqual(
-            st.classify_placeholder_key("some_new_field"), st.SOURCE_VISION)
+            st.classify_placeholder_key("some_new_field"), st.SOURCE_BLANK)
 
     def test_empty_key_is_blank(self):
         self.assertEqual(st.classify_placeholder_key(""), st.SOURCE_BLANK)
@@ -695,10 +756,14 @@ class TestRenderOutputDocx(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(res)
 
 
+@unittest.skipUnless(_DEPS_OK, "python-docx not installed")
 class TestPhpWordAndDigitKeys(unittest.TestCase):
     """LICENSE-SK templates use PhpWord ${key}, not [data.KEY]; some RECOMMEND
     templates carry digit keys (catatan1). The engine must discover AND fill
-    both syntaxes (run-aware) and blank issuance/signature anchors."""
+    both syntaxes (run-aware) and blank issuance/signature anchors.
+
+    Gated on _DEPS_OK: this class builds Document() so it needs python-docx,
+    unlike the pure TestClassifyPlaceholderKey / TestResolveFillData."""
 
     def _para_from_runs(self, doc, run_texts):
         p = doc.add_paragraph()

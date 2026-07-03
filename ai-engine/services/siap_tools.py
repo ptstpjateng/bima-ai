@@ -518,7 +518,14 @@ async def siap_get_output_template(license_id: int) -> dict:
 
 # Step stereotypes that indicate the FINAL SK-signing desk (produces LICENSE-SK).
 # Case-insensitive substring match on the step's own `stereotype` column.
-_SK_STEP_STEREOTYPES = ("tte", "penandatanganan berkas", "penyerahan sk")
+# Broadened (M1) so PENANDATANGANAN SURAT KEPUTUSAN / TANDA TANGAN SK / PENETAPAN
+# SK all read as SK-leaning — the signing/SK nouns, not just the exact three
+# earlier phrases. `is_final_step` (role-based) remains the AUTHORITATIVE primary
+# signal in _preferred_stereotype_for_step; this only sharpens the secondary hint.
+_SK_STEP_STEREOTYPES = (
+    "tte", "penandatanganan", "tanda tangan", "keputusan", "penetapan",
+    "penyerahan sk", " sk", "sk ", "-sk", "_sk",
+)
 # Step stereotypes that indicate a technical/recommendation desk (LICENSE-RECOMMEND).
 _RECOMMEND_STEP_STEREOTYPES = (
     "survey", "review-permohonan", "review permohonan",
