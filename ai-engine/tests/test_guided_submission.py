@@ -494,6 +494,165 @@ class TestSubThresholdOverride(_GuidedFlowBase):
         mc.create_request.assert_awaited_once()
 
 
+class TestApplicantProfileBinding(_GuidedFlowBase):
+    """The submission must bind the REAL applicant profile — resolved-or-created
+    from the KTP NIK + name BIMA already read — not the fixed placeholder.
+
+    Coverage:
+      (a) valid NIK → the profile client's RETURNED profile_id is used in
+          create_request (not the fixed GUIDED_SUBMISSION_PROFILE_ID);
+      (b) missing/invalid NIK → fall back to the fixed profile;
+      (c) upsert error (ok:false) → fall back to the fixed profile;
+      (d) profile client unconfigured → fall back to the fixed profile.
+
+    In every case the submission MUST still proceed — a profile hiccup never
+    blocks it. The fixed fallback id in these tests is "7" (setUp).
+    """
+
+    def _to_confirm(self, uid, *, score=96, ktp=_KTP):
+        with _Ctx(_flow_patches(score=score, ktp=ktp)):
+            _run(gs.maybe_handle(uid, "saya mau ajukan izin pemakaian tanah"))
+            _run(gs.handle_inbound_documents(uid, [_doc()]))
+            _run(gs._process_collected_documents(gs._sessions[uid]))
+        self.assertEqual(gs._sessions[uid].stage, gs.Stage.CONFIRM)
+
+    @staticmethod
+    def _submission_client():
+        mc = MagicMock()
+        mc.is_configured.return_value = True
+        mc.create_request = AsyncMock(return_value={
+            "ok": True, "configured": True, "request_id": 555, "ticket": "000088002"})
+        return mc
+
+    def _submit_with_profile(self, uid, profile_client):
+        """AFFIRM-submit `uid` with the submission client stubbed and the profile
+        client patched to `profile_client`; return (reply, submission_mock)."""
+        sub = self._submission_client()
+        with patch("services.submission_intent.classify_confirm_intent",
+                   new=AsyncMock(return_value="AFFIRM")), \
+             patch("services.siap_submission_client.get_siap_submission_client",
+                   return_value=sub), \
+             patch("services.siap_profile_client.get_siap_profile_client",
+                   return_value=profile_client), \
+             patch("services.officer_bridge.notify_officer_of_submission",
+                   new=AsyncMock(return_value=True)):
+            r = _run(gs.maybe_handle(uid, "ya saya yakin"))
+        return r, sub
+
+    def test_valid_nik_uses_returned_profile_id(self):
+        # _KTP carries a valid 16-digit NIK + name → the profile client is called
+        # and its RETURNED profile_id (99123) is bound, NOT the fixed "7".
+        self._to_confirm("wa-700")
+        pc = MagicMock()
+        pc.is_configured.return_value = True
+        pc.upsert_profile = AsyncMock(return_value={
+            "ok": True, "configured": True, "profile_id": 99123, "created": True})
+        r, sub = self._submit_with_profile("wa-700", pc)
+        self.assertIn("000088002", r)
+        pc.upsert_profile.assert_awaited_once()
+        # The NIK + name we read flow into the upsert call.
+        _, kwargs = pc.upsert_profile.call_args
+        self.assertEqual(kwargs["identity_number"], _KTP["nik"])
+        self.assertEqual(kwargs["full_name"], _KTP["name"])
+        # create_request is bound to the RESOLVED id, not the fixed "7".
+        sub.create_request.assert_awaited_once()
+        _, sub_kwargs = sub.create_request.call_args
+        self.assertEqual(sub_kwargs["profile_id"], 99123)
+
+    def test_missing_nik_falls_back_to_fixed_profile(self):
+        # NIK absent on the session at submit time → the profile client is NOT
+        # called; create_request is bound to the fixed fallback "7". A KTP with
+        # no NIK never reaches CONFIRM on its own (missing-required-field gate),
+        # so we drive to CONFIRM normally then strip the NIK before AFFIRM.
+        self._to_confirm("wa-701")
+        gs._sessions["wa-701"].fields.pop("nik", None)
+        pc = MagicMock()
+        pc.is_configured.return_value = True
+        pc.upsert_profile = AsyncMock()
+        r, sub = self._submit_with_profile("wa-701", pc)
+        self.assertIn("000088002", r)
+        pc.upsert_profile.assert_not_awaited()
+        sub.create_request.assert_awaited_once()
+        _, sub_kwargs = sub.create_request.call_args
+        self.assertEqual(sub_kwargs["profile_id"], 7)
+
+    def test_invalid_nik_falls_back_to_fixed_profile(self):
+        # A malformed NIK on the session (not 16 digits) → the profile client is
+        # NOT called (rejected by the caller's local guard); fall back to "7".
+        self._to_confirm("wa-701b")
+        gs._sessions["wa-701b"].fields["nik"] = "12345"  # too short
+        pc = MagicMock()
+        pc.is_configured.return_value = True
+        pc.upsert_profile = AsyncMock()
+        r, sub = self._submit_with_profile("wa-701b", pc)
+        self.assertIn("000088002", r)
+        pc.upsert_profile.assert_not_awaited()
+        sub.create_request.assert_awaited_once()
+        _, sub_kwargs = sub.create_request.call_args
+        self.assertEqual(sub_kwargs["profile_id"], 7)
+
+    def test_non_ascii_nik_falls_back_to_fixed_profile(self):
+        # A NIK of 16 full-width numerals ("３３…") passes str.isdigit() but is
+        # NOT ASCII [0-9]{16} → the caller's ASCII guard rejects it, the profile
+        # client is NEVER called, and create_request binds the fixed "7".
+        self._to_confirm("wa-701c")
+        fullwidth = "３３７４０１２３４５６７８９０１"  # 16 full-width digits
+        self.assertTrue(fullwidth.isdigit())        # would slip the old gate
+        gs._sessions["wa-701c"].fields["nik"] = fullwidth
+        pc = MagicMock()
+        pc.is_configured.return_value = True
+        pc.upsert_profile = AsyncMock()
+        r, sub = self._submit_with_profile("wa-701c", pc)
+        self.assertIn("000088002", r)               # submission still proceeds
+        pc.upsert_profile.assert_not_awaited()      # NEVER sent
+        sub.create_request.assert_awaited_once()
+        _, sub_kwargs = sub.create_request.call_args
+        self.assertEqual(sub_kwargs["profile_id"], 7)
+
+    def test_profile_upsert_raising_falls_back_and_still_submits(self):
+        # FIX 3: upsert_profile only guarantees no-raise for httpx timeout/
+        # RequestError — any OTHER exception (here a ValueError) must be caught
+        # so it never aborts the submission. Fall back to the fixed "7".
+        self._to_confirm("wa-704")
+        pc = MagicMock()
+        pc.is_configured.return_value = True
+        pc.upsert_profile = AsyncMock(side_effect=ValueError("unexpected"))
+        r, sub = self._submit_with_profile("wa-704", pc)
+        self.assertIn("000088002", r)               # submission still proceeds
+        pc.upsert_profile.assert_awaited_once()
+        sub.create_request.assert_awaited_once()
+        _, sub_kwargs = sub.create_request.call_args
+        self.assertEqual(sub_kwargs["profile_id"], 7)
+
+    def test_upsert_error_falls_back_to_fixed_profile(self):
+        # The profile client is called but returns ok:false → fall back to "7".
+        self._to_confirm("wa-702")
+        pc = MagicMock()
+        pc.is_configured.return_value = True
+        pc.upsert_profile = AsyncMock(return_value={
+            "ok": False, "configured": True, "profile_id": None, "created": None,
+            "note": "SIAP merespon dengan HTTP 500."})
+        r, sub = self._submit_with_profile("wa-702", pc)
+        self.assertIn("000088002", r)          # submission still proceeds
+        pc.upsert_profile.assert_awaited_once()
+        sub.create_request.assert_awaited_once()
+        _, sub_kwargs = sub.create_request.call_args
+        self.assertEqual(sub_kwargs["profile_id"], 7)
+
+    def test_unconfigured_profile_client_falls_back_to_fixed_profile(self):
+        # Profile client not configured → never called; fall back to "7".
+        self._to_confirm("wa-703")
+        pc = MagicMock()
+        pc.is_configured.return_value = False
+        pc.upsert_profile = AsyncMock()
+        r, sub = self._submit_with_profile("wa-703", pc)
+        self.assertIn("000088002", r)
+        pc.upsert_profile.assert_not_awaited()
+        sub.create_request.assert_awaited_once()
+        _, sub_kwargs = sub.create_request.call_args
+        self.assertEqual(sub_kwargs["profile_id"], 7)
+
+
 class TestDegradeGracefully(_GuidedFlowBase):
 
     def test_submission_client_not_configured(self):
