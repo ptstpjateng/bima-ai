@@ -238,16 +238,23 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "5. Jawab ringkas, dalam Bahasa Indonesia formal, dan langsung ke "
     "inti — petugas sedang bekerja cepat di antrean berkas.\n\n"
     "=== MELIHAT / MENGIRIM DOKUMEN — SELALU PANGGIL send_document ===\n"
-    "Ketika petugas ingin MELIHAT / LIHAT / LIAT / BUKA / KIRIM / TAMPILKAN "
-    "sebuah dokumen — baik permintaan umum ('dokumen yang diupload', 'berkas "
-    "yang dikirim') MAUPUN dengan menyebut nama ('surat permohonan', 'surat "
-    "permohonannya', 'KTP', 'desain kapal', 'proposal') — Anda WAJIB memanggil "
-    "`send_document` dengan referensi dokumen tersebut. "
+    "Ketika petugas ingin MELIHAT / LIHAT / LIAT / BUKA / KIRIM / TAMPILKAN / "
+    "TUNJUKAN / TUNJUKKAN sebuah dokumen — baik permintaan umum ('dokumen yang "
+    "diupload', 'berkas yang dikirim') MAUPUN dengan menyebut nama ('surat "
+    "permohonan', 'surat permohonannya', 'KTP', 'desain kapal', 'gambar rancang "
+    "bangun kapal', 'SIUP'/'NIB', 'proposal') — Anda WAJIB memanggil "
+    "`send_document` dengan referensi dokumen tersebut PERSIS seperti kata "
+    "petugas (mis. 'tunjukan dokumen desain kapal' → send_document('desain "
+    "kapal'); 'gambar rancang bangun kapal' → send_document('gambar rancang "
+    "bangun kapal')). Nama sinonim (desain kapal = gambar rancang bangun; NIB = "
+    "SIUP) sudah dicocokkan otomatis oleh tool — JANGAN menyerah menebak "
+    "namanya. "
     "Bedakan dari `get_doc_summary` (hanya MERINGKAS isi): bila petugas minta "
     "MELIHAT/MENERIMA berkasnya, itu `send_document`. "
     "Bila nama dokumen ambigu atau ada beberapa yang cocok, panggil "
     "`send_document` dengan padanan terbaik. "
-    "JANGAN mengembalikan giliran kosong atau menjawab 'tidak bisa'; "
+    "JANGAN mengembalikan giliran kosong atau menjawab 'tidak bisa'/'tidak "
+    "ditemukan' tanpa memanggil `send_document` lebih dulu; "
     "SATU-SATUNYA prosa tanpa tool yang diizinkan adalah pertanyaan singkat "
     "'dokumen yang mana?' ketika rujukannya benar-benar ambigu.\n\n"
     "=== ANDA ADALAH WAKIL PETUGAS: REKOMENDASIKAN LALU EKSEKUSI ===\n"
@@ -322,6 +329,29 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "jawab jujur: berkas dikirim sebagai lampiran WhatsApp — unduh lalu buka di "
     "Word / Google Docs / WPS; tawarkan untuk mengirim ulang atau mengirim "
     "salinan PDF untuk dibaca. JANGAN mengarang bahwa draf ada di SIAP.\n\n"
+    "=== ISI FORMULIR ISIAN DI SIAP (fill_siap_form) — SK DIBUAT SIAP DARI FORM INI ===\n"
+    "Ada DUA hal berbeda; JANGAN tertukar:\n"
+    "  - `draft_sk` = draf BANTU (PDF/.docx) yang dikirim ke chat; TIDAK tersimpan "
+    "di SIAP.\n"
+    "  - `fill_siap_form` = MENGISI Formulir Isian permohonan LANGSUNG di SIAP "
+    "(field teks + lampiran berkas ke slotnya). SIAP MEMBUAT SK dari formulir "
+    "yang terisi ini. Jadi bila petugas ingin 'menyiapkan SK di SIAP' atau "
+    "'mengisi datanya di SIAP', itu `fill_siap_form`.\n"
+    "Panggil `fill_siap_form` (tanpa argumen, tanpa konfirmasi — ini menyiapkan "
+    "isian, bukan keputusan) ketika petugas meminta 'isikan formulirnya', 'isi "
+    "Formulir Isian', 'isi form permohonannya', 'lengkapi datanya di SIAP', "
+    "'siapkan SK-nya di SIAP', atau SETELAH review positif dan petugas siap "
+    "menyetujui. Tool mengisi HANYA dari sumber nyata dan MEMBEDAKAN provenance — "
+    "sampaikan PERSIS seperti hasil tool: (a) 'dari data resmi SIAP' untuk "
+    "profil/data permohonan (terpercaya), (b) 'dibaca dari dokumen unggahan — "
+    "mohon diperiksa' untuk hasil OCR (bisa keliru), dan (c) field kosong yang "
+    "harus dilengkapi petugas. JANGAN pernah menyatakan sebuah field terisi bila "
+    "tool menandainya kosong; BIMA TIDAK menebak. Setelah memanggil tool, "
+    "sampaikan langkah petugas: buka Formulir Isian di SIAP, PERIKSA isian "
+    "(terutama yang dibaca dari dokumen), lengkapi yang kosong, lalu klik Simpan — "
+    "SK akan dibuat SIAP dari formulir itu. Bila tool gagal/integrasi mati, "
+    "sampaikan jujur agar petugas mengisi sendiri di SIAP; JANGAN mengaku sudah "
+    "mengisi bila belum.\n\n"
     "=== ATURAN MUTLAK — TINDAKAN YANG MENGUBAH DATA (forward & decision) ===\n"
     "Anda memiliki dua tool yang MENGUBAH data di SIAP: `forward_case` "
     "(meneruskan berkas ke meja berikutnya) dan `record_decision` "
@@ -734,16 +764,12 @@ def _digest_summary_for_ref(doc_ref: str) -> Optional[str]:
     if not digest:
         return None
 
-    ref = _norm_ref(doc_ref)
     match: Optional[dict[str, Any]] = None
-    if ref:
+    if _norm_ref(doc_ref):
+        # Alias-aware match (shared with the send fallback) so "gambar rancang
+        # bangun kapal" summarises the "Desain_Kapal" digest entry too.
         for entry in digest:
-            labels = (
-                _norm_ref(entry.get("detected_type")),
-                _norm_ref(entry.get("claimed_type")),
-                _norm_ref(entry.get("filename")),
-            )
-            if any(lbl and (ref == lbl or ref in lbl or lbl in ref) for lbl in labels):
+            if _digest_entry_matches_ref(entry, doc_ref):
                 match = entry
                 break
     # A single-document submission: honour a summary request even without a
@@ -868,26 +894,96 @@ async def get_doc_summary(doc_ref: str = "", file_id: str = "") -> str:
     )
 
 
+# File extensions stripped off a filename label before matching, so the
+# officer's "desain kapal" resolves the upload "Desain_Kapal.pdf" (the trailing
+# ".pdf" would otherwise block an exact/whole-word match). Kept to the document
+# types SIAP accepts for an APPLICANT-UPLOAD.
+_DOC_EXTENSIONS = re.compile(r"\.(pdf|jpe?g|png|docx?|rtf|tiff?|webp|heic)$", re.IGNORECASE)
+
+
 def _norm_ref(s: Any) -> str:
-    """Space/underscore-agnostic, case-insensitive label normaliser. Shared by
-    the doc-ref resolver and the digest fallback so "surat pesanan",
-    "Surat_Pesanan", and "SURAT  PESANAN" all collapse to one form."""
-    return re.sub(r"[\s_]+", " ", str(s or "")).strip().lower()
+    """Space/underscore-agnostic, extension-stripped, case-insensitive label
+    normaliser. Shared by the doc-ref resolver and the digest fallback so
+    "surat pesanan", "Surat_Pesanan", "SURAT  PESANAN", and the filename
+    "Desain_Kapal.pdf" all collapse to one comparable form (the last dropping
+    its ".pdf" so a request by NAME resolves the FILE)."""
+    s = _DOC_EXTENSIONS.sub("", str(s or ""))
+    return re.sub(r"[\s_]+", " ", s).strip().lower()
+
+
+# Document-reference ALIAS map (rehearsal fix). An officer says "gambar rancang
+# bangun kapal" or "desain kapal" for the same upload SIAP labels "Desain_Kapal"
+# / the requirement calls "Desain Kapal"; "NIB" and "izin usaha" both mean the
+# SIUP upload; and so on. Each entry maps a canonical token → the phrases that
+# mean it. We canonicalise BOTH the officer's ref and each doc label to this
+# token before comparing, so a request by REQUIREMENT LABEL or by FILENAME both
+# resolve regardless of the exact words. Longest phrases first per row so a
+# specific phrase wins over a shorter substring of it.
+_DOC_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("desain_kapal", (
+        "gambar rancang bangun kapal", "gambar rancang bangun",
+        "rancang bangun kapal", "rancang bangun", "desain kapal", "desain",
+    )),
+    ("siup", (
+        "siup oss", "surat izin usaha perikanan", "izin usaha perikanan",
+        "izin usaha", "siup", "nib",
+    )),
+    ("surat_permohonan", ("surat permohonan", "permohonan")),
+    # No bare "api" alias — as a 3-char phrase it substring-matched common
+    # Indonesian words (Rekapitulasi, Persiapan, rapi…) via `_canonical_doc_key`
+    # and could mis-resolve the doc-view to the spesifikasi doc. The multi-word
+    # phrases carry the real signal.
+    ("spesifikasi_alat_tangkap", (
+        "spesifikasi alat tangkap", "spesifikasi", "alat tangkap",
+    )),
+    ("persetujuan_nama_kapal", (
+        "persetujuan nama kapal", "nama kapal", "srt kapal", "surat kapal",
+    )),
+    ("pakta_integritas", ("pakta integritas", "pakta")),
+    ("surat_pesanan", ("surat pesanan", "kontrak", "pesanan")),
+    ("ktp", ("kartu tanda penduduk", "ktp")),
+)
+
+
+def _canonical_doc_key(s: Any) -> Optional[str]:
+    """Canonicalise a normalised label/ref to its alias token, or None.
+
+    Returns the canonical token (e.g. "desain_kapal") when the normalised text
+    CONTAINS one of that token's alias phrases — so "gambar rancang bangun
+    kapal", "desain kapal", and the filename "Desain_Kapal.pdf" all canonicalise
+    to "desain_kapal", making the officer's synonym resolve the actual upload.
+    None when no alias group matches (the caller then falls back to the plain
+    normalised match)."""
+    norm = _norm_ref(s)
+    if not norm:
+        return None
+    for canon, phrases in _DOC_ALIAS_GROUPS:
+        for phrase in phrases:
+            if phrase and phrase in norm:
+                return canon
+    return None
 
 
 def _resolve_doc_ref(ctx: dict, doc_ref: str) -> Optional[str]:
-    """Resolve a human `doc_ref` ("KTP", "Surat Pesanan", a filename fragment)
-    OR a literal file_id to a file_id present in the in-session doc context.
+    """Resolve a human `doc_ref` ("KTP", "Surat Pesanan", "gambar rancang bangun
+    kapal", a filename fragment) OR a literal file_id to a file_id present in the
+    in-session doc context.
 
-    Matching is case-insensitive and tolerant of the label formatting the
-    validator uses (underscores in detected/claimed types, e.g. "Surat_Pesanan"
-    vs the officer's "surat pesanan"). Precedence (most specific → least):
+    Matching is case-insensitive, extension-stripped, and tolerant of the label
+    formatting the validator uses (underscores in detected/claimed types, e.g.
+    "Surat_Pesanan" vs the officer's "surat pesanan") AND of SYNONYMS (via the
+    `_DOC_ALIAS_GROUPS` map — "desain kapal" / "gambar rancang bangun kapal" /
+    "rancang bangun" all resolve the same "Desain_Kapal" upload; "NIB" / "izin
+    usaha" resolve the SIUP upload). Precedence (most specific → least):
       1. exact file_id key,
-      2. exact type-label equality — detected_type (what BIMA READ the doc to
+      2. ALIAS match — the ref and a doc label (detected/claimed/filename)
+         canonicalise to the SAME alias token. This is the rehearsal fix: a
+         request by requirement LABEL or by FILENAME both resolve.
+      3. exact type-label equality — detected_type (what BIMA READ the doc to
          be) OR claimed_type (what the citizen DECLARED) equals the ref. Detected
          is tried first: "KTP" must resolve even when the citizen mislabelled the
          upload, which is exactly a case the officer is reviewing.
-      3. filename substring, then type-label substring (detected then claimed).
+      4. filename substring, then type-label substring (detected then claimed).
     Returns the file_id on a hit, or None when nothing matches.
 
     `detected_type` is present when the bridge cross-referenced the read digest
@@ -905,13 +1001,28 @@ def _resolve_doc_ref(ctx: dict, doc_ref: str) -> Optional[str]:
     if not ref:
         return None
 
-    # 2) Exact type-label equality — detected first (BIMA's read), then claimed.
+    # 2) ALIAS match (rehearsal fix). Canonicalise the ref; if it names a known
+    #    document, resolve the doc whose detected/claimed/filename canonicalises
+    #    to the SAME token — so "gambar rancang bangun kapal" and "desain kapal"
+    #    both find "Desain_Kapal.pdf" whether the doc is labelled by requirement
+    #    or only carries a filename. Filename first (most specific), then labels.
+    ref_canon = _canonical_doc_key(doc_ref)
+    if ref_canon is not None:
+        for fid, doc in ctx.items():
+            if _canonical_doc_key(doc.get("filename")) == ref_canon:
+                return fid
+        for label_key in ("detected_type", "claimed_type"):
+            for fid, doc in ctx.items():
+                if _canonical_doc_key(doc.get(label_key)) == ref_canon:
+                    return fid
+
+    # 3) Exact type-label equality — detected first (BIMA's read), then claimed.
     for label_key in ("detected_type", "claimed_type"):
         for fid, doc in ctx.items():
             if _norm_ref(doc.get(label_key)) == ref:
                 return fid
 
-    # 3) Substring match — filename first (most specific), then type labels.
+    # 4) Substring match — filename first (most specific), then type labels.
     for fid, doc in ctx.items():
         if ref in _norm_ref(doc.get("filename")):
             return fid
@@ -924,6 +1035,28 @@ def _resolve_doc_ref(ctx: dict, doc_ref: str) -> Optional[str]:
     return None
 
 
+def _digest_entry_matches_ref(entry: dict, doc_ref: str) -> bool:
+    """True if a read-digest entry matches `doc_ref` — by alias synonym OR by
+    the plain normalised label overlap. Shared by the digest send + summary
+    fallbacks so both agree on what documents exist, and both honour the same
+    synonym map as `_resolve_doc_ref` (so "gambar rancang bangun kapal" matches
+    the "Desain_Kapal" digest entry too)."""
+    ref = _norm_ref(doc_ref)
+    if not ref:
+        return False
+    ref_canon = _canonical_doc_key(doc_ref)
+    if ref_canon is not None:
+        for key in ("detected_type", "claimed_type", "filename"):
+            if _canonical_doc_key(entry.get(key)) == ref_canon:
+                return True
+    labels = (
+        _norm_ref(entry.get("detected_type")),
+        _norm_ref(entry.get("claimed_type")),
+        _norm_ref(entry.get("filename")),
+    )
+    return any(lbl and (ref == lbl or ref in lbl or lbl in ref) for lbl in labels)
+
+
 def _bytes_gone_message_for_ref(doc_ref: str) -> Optional[str]:
     """When a send/view ref doesn't resolve in the (bytes-carrying) doc context
     but DOES match the retained read-digest, return an honest "we read it, the
@@ -933,16 +1066,10 @@ def _bytes_gone_message_for_ref(doc_ref: str) -> Optional[str]:
     digest = _documents_digest_from_ctx()
     if not digest:
         return None
-    ref = _norm_ref(doc_ref)
-    if not ref:
+    if not _norm_ref(doc_ref):
         return None
     for entry in digest:
-        labels = (
-            _norm_ref(entry.get("detected_type")),
-            _norm_ref(entry.get("claimed_type")),
-            _norm_ref(entry.get("filename")),
-        )
-        if any(lbl and (ref == lbl or ref in lbl or lbl in ref) for lbl in labels):
+        if _digest_entry_matches_ref(entry, doc_ref):
             label = (
                 str(entry.get("filename") or "").strip()
                 or str(entry.get("detected_type") or "").strip()
@@ -1295,6 +1422,493 @@ async def draft_sk() -> str:
         "di chat ini — tidak tersimpan di SIAP. Dokumen final diterbitkan "
         "ber-TTE oleh SIAP saat berkas disetujui."
     )
+
+
+# ---------------------------------------------------------------------------
+# fill_siap_form — write the REAL Formulir Isian on SIAP (text + file slots),
+# so the officer only VERIFIES + clicks Simpan and SIAP generates the SK from it.
+#
+# Unlike draft_sk (a BIMA-authored aid sent into chat, never stored in SIAP),
+# this tool upserts SIAP's ptsp.form_value row through the form-value endpoint.
+# It REUSES the #80 no-hallucination fill engine
+# (siap_templates.resolve_fill_data) for the TEXT fields — profile-sourced +
+# Vision-sourced + never-fabricated — and maps the request's APPLICANT-UPLOAD
+# docs to the form's FLE file slots by their BIMA doc-type label / filename.
+# ---------------------------------------------------------------------------
+
+# The Formulir-Isian TEXT field keys for the vessel/PKPP applicant form. These
+# are the SAME key names the SK template uses ([data.KEY]), so the #80 engine's
+# classify_placeholder_key already routes them: nama_pemohon/alamat → PROFILE,
+# the vessel/permit/letter fields → VISION, jenis_pengadaan → CASE (licence
+# name). We pass this exact set to resolve_fill_data so ONLY real reads land in
+# the form; anything unread is omitted (never fabricated). Not a per-licence
+# hardcode of VALUES — just the field NAMES this applicant form declares.
+_FORM_TEXT_FIELD_KEYS: tuple[str, ...] = (
+    "jenis_pengadaan",
+    "tgl_srt_permohonan",
+    "perihal_surat_perm",
+    "no_siup",
+    "tgl_siup",
+    "nama_pemohon",
+    "alamat",
+    "nama_kapal",
+    "thn_bangun",
+    "tipe",
+    "alat",
+    "bahan",
+    "gt",
+    "galangan",
+)
+
+# The 8 FLE file slots on the PKPP applicant form → the alias phrases that
+# identify the matching APPLICANT-UPLOAD doc (by its BIMA doc-type label or
+# filename). Each doc is classified into AT MOST one slot; an unmatched doc is
+# skipped (never forced into a slot). Aliases are matched space/underscore-
+# agnostic + case-insensitive against the doc's detected_type, claimed_type, and
+# filename (via `_norm_ref`, the same normaliser send_document uses). Ordered
+# most-specific-first WITHIN each slot; SIUP is checked before the bare "surat
+# permohonan" so "surat izin usaha" never lands in up_permohonan.
+_FORM_FILE_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("up_ktp", ("ktp", "kartu tanda penduduk")),
+    ("up_pakta_integritas", ("pakta integritas", "pakta")),
+    # NB: no bare "oss" alias — as a 3-char token it substring-matched unrelated
+    # labels ("Grosse Akta") and mis-slotted the wrong file into the SIUP slot.
+    # "siup"/"nib"/"izin usaha" already cover this slot fully.
+    ("up_siup_oss", ("siup", "nib", "izin usaha")),
+    ("up_gambar_rancang_bangun", (
+        "desain kapal", "gambar rancang bangun kapal", "gambar rancang bangun",
+        "rancang bangun", "desain",
+    )),
+    ("up_kontrak", ("surat pesanan", "kontrak", "pesanan")),
+    # NB: no bare "api" alias (Alat Penangkap Ikan) — as a 3-char token it
+    # substring-matched common Indonesian words (Rekapitulasi, Persiapan, rapi…)
+    # and mis-slotted the wrong file into the Spesifikasi slot. The scorer's
+    # detected_type label "Spesifikasi Alat Tangkap" carries the real signal.
+    ("up_spesifikasi", (
+        "spesifikasi alat tangkap", "spesifikasi", "alat tangkap",
+    )),
+    ("up_srt_kapal", (
+        "persetujuan nama kapal", "nama kapal", "surat kapal", "srt kapal",
+    )),
+    # Surat Permohonan LAST so the more specific SIUP/pesanan/kapal slots claim
+    # their docs first — a bare "permohonan" catch-all shouldn't outrank them.
+    ("up_permohonan", ("surat permohonan", "permohonan")),
+)
+
+# Human labels for the file slots, for the officer-facing note.
+_FORM_SLOT_LABELS: dict[str, str] = {
+    "up_ktp": "KTP",
+    "up_pakta_integritas": "Pakta Integritas",
+    "up_siup_oss": "SIUP/NIB",
+    "up_permohonan": "Surat Permohonan",
+    "up_gambar_rancang_bangun": "Desain Kapal",
+    "up_kontrak": "Surat Pesanan",
+    "up_spesifikasi": "Spesifikasi Alat Tangkap",
+    "up_srt_kapal": "Persetujuan Nama Kapal",
+}
+
+
+def _doc_labels(doc: dict) -> tuple[str, ...]:
+    """The normalised labels a doc can be matched on: BIMA's read (detected),
+    the citizen's claim, and the filename. Mirrors send_document/_resolve_doc_ref
+    so the slot match agrees with what the officer can 'lihat'."""
+    return (
+        _norm_ref(doc.get("detected_type")),
+        _norm_ref(doc.get("claimed_type")),
+        _norm_ref(doc.get("filename")),
+    )
+
+
+# The officer doc-context keys the document-API loader emits for an APPLICANT-
+# UPLOAD row: `siap:doc:{file_id}` (officer_bridge._load_siap_documents source
+# b). ONLY these carry the real ptsp.files.file_id the form-value endpoint can
+# copy into a slot (the endpoint requires stereotype=APPLICANT-UPLOAD). The
+# other doc-context source — `siap:req:{req_id}` (profile_requirements) — is NOT
+# an APPLICANT-UPLOAD file and CANNOT be attached to a slot, so those are skipped
+# for the form-file mapping (the officer attaches them by hand if needed).
+_SIAP_DOC_FILE_ID = re.compile(r"^siap:doc:(\d+)$")
+
+
+def _applicant_upload_file_id(ctx_key: Any) -> Optional[int]:
+    """Return the real SIAP APPLICANT-UPLOAD file_id for a doc-context key, or
+    None. Parses `siap:doc:{id}` (the document-API source, the only one the
+    form-value endpoint accepts) and also tolerates a bare integer key (e.g. a
+    future loader / a test). A `siap:req:{id}` profile-requirements key returns
+    None — it is not an attachable APPLICANT-UPLOAD file."""
+    s = str(ctx_key or "")
+    m = _SIAP_DOC_FILE_ID.match(s)
+    if m:
+        return int(m.group(1))
+    # Bare integer key (defensive — not the current bridge shape, but harmless).
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _label_tokens(normalized_label: str) -> tuple[str, ...]:
+    """Split a normalised label into alphanumeric tokens (drops separators like
+    spaces, underscores, dots, dashes). "spesifikasi alat tangkap" → ("spesifikasi",
+    "alat", "tangkap"); "siup-oss.pdf" (already norm→"siup oss") → ("siup","oss")."""
+    return tuple(t for t in re.split(r"[^a-z0-9]+", normalized_label) if t)
+
+
+def _alias_matches_label(norm_alias: str, normalized_label: str) -> bool:
+    """WHOLE-TOKEN alias match: the alias (tokenised) must appear as a CONTIGUOUS
+    token-subsequence of the label (tokenised). So the short alias "nib" matches
+    the word "nib" but never a substring inside a longer word ("Grosse", "rapi");
+    a multi-word alias ("alat tangkap", "surat pesanan", "gambar rancang bangun")
+    still matches as a contiguous run of label tokens. This replaces the previous
+    substring containment (`alias in label`) that over-matched short aliases."""
+    alias_toks = _label_tokens(norm_alias)
+    if not alias_toks:
+        return False
+    label_toks = _label_tokens(normalized_label)
+    n, m = len(label_toks), len(alias_toks)
+    if m > n:
+        return False
+    # Slide the alias token-run over the label tokens; match on a contiguous run.
+    for i in range(n - m + 1):
+        if label_toks[i:i + m] == alias_toks:
+            return True
+    return False
+
+
+def _doc_display_name(doc: dict, ctx_key: Any) -> str:
+    """The best human name for a doc in an officer note — filename, else the
+    detected/claimed type, else the ctx key."""
+    return (
+        str(doc.get("filename") or "").strip()
+        or str(doc.get("detected_type") or "").strip()
+        or str(doc.get("claimed_type") or "").strip()
+        or str(ctx_key)
+    )
+
+
+def _map_docs_to_slots(
+    documents: dict,
+) -> tuple[dict[str, int], list[str], list[str]]:
+    """Classify each attachable APPLICANT-UPLOAD doc into ITS form file slot.
+
+    `documents` is the copilot `_doc_context` shape
+    ({ctx_key: {filename, detected_type, claimed_type, content, ...}}). For each
+    slot (in `_FORM_FILE_SLOTS` order — most-specific slots first) we take the
+    FIRST unclaimed doc whose detected/claimed/filename label matches one of the
+    slot's alias phrases as a WHOLE-TOKEN run (see `_alias_matches_label` — a
+    short alias like "nib" matches the word "nib" but never a substring inside a
+    longer word, so "Grosse Akta" no longer mis-slots into the SIUP slot). A doc
+    is used for at most one slot; a slot matches at most one doc. Only CONFIDENT
+    matches are mapped — an unmatched doc is left out (never forced into a slot).
+
+    The slot value must be the real SIAP `ptsp.files.file_id` (the form-value
+    endpoint copies the APPLICANT-UPLOAD by id), NOT the doc-context KEY —
+    which is `siap:doc:{file_id}` for the document-API source. We extract that id
+    via `_applicant_upload_file_id`; a doc whose key is a profile-requirements
+    `siap:req:{id}` (not an APPLICANT-UPLOAD file) yields no id and CANNOT be
+    attached through this endpoint — it is recorded in `unattachable` (so the
+    officer is told to lampirkan it by hand) rather than silently dropped.
+
+    Returns `(files, mapped_labels, unattachable)`:
+      * files        — {slot_name: siap_file_id} for the SIAP form-value call.
+      * mapped_labels — human "SlotLabel ← doc-name" lines for the officer note.
+      * unattachable  — human "SlotLabel ← doc-name" lines for recognised docs
+                        that matched a slot but have no attachable file_id.
+    """
+    files: dict[str, int] = {}
+    mapped_labels: list[str] = []
+    unattachable: list[str] = []
+    if not documents or not isinstance(documents, dict):
+        return files, mapped_labels, unattachable
+
+    used_keys: set = set()
+    for slot, aliases in _FORM_FILE_SLOTS:
+        norm_aliases = tuple(_norm_ref(a) for a in aliases)
+        for ctx_key, doc in documents.items():
+            if ctx_key in used_keys:
+                continue
+            labels = _doc_labels(doc)
+            hit = any(
+                any(_alias_matches_label(alias, lbl) for lbl in labels if lbl)
+                for alias in norm_aliases
+            )
+            if not hit:
+                continue
+            # Resolve the REAL SIAP file_id — the endpoint copies the upload by
+            # id, so the slot value must be that id, not the ctx key. A doc that
+            # isn't an attachable APPLICANT-UPLOAD (profile_requirements source)
+            # yields None: it MATCHED but can't be attached, so record it for the
+            # officer note and keep scanning this slot for an attachable doc.
+            siap_file_id = _applicant_upload_file_id(ctx_key)
+            if siap_file_id is None:
+                unattachable.append(
+                    f"{_FORM_SLOT_LABELS.get(slot, slot)} ← "
+                    f"{_doc_display_name(doc, ctx_key)}"
+                )
+                used_keys.add(ctx_key)  # don't re-consider this doc for other slots
+                continue
+            files[slot] = siap_file_id
+            used_keys.add(ctx_key)
+            mapped_labels.append(
+                f"{_FORM_SLOT_LABELS.get(slot, slot)} ← "
+                f"{_doc_display_name(doc, ctx_key)}"
+            )
+            break  # this slot is filled; move to the next slot
+
+    return files, mapped_labels, unattachable
+
+
+async def fill_siap_form() -> str:
+    """FILL the request's SIAP **Formulir Isian** — its text fields AND its file
+    slots — then guide the officer to VERIFY. SIAP generates the SK FROM that
+    filled form, so this is the write that actually feeds SIAP's SK generator
+    (draft_sk stays the separate BIMA-authored PDF/.docx aid).
+
+    Called when the officer asks to fill/isi the form, prepare the SK, "isikan
+    formulirnya", or after a positive review. It:
+      1. Resolves the case: request_id + license_id + profile_id (from the SK
+         context bound to the session) + the applicant Formulir-Isian form_id
+         (siap_db.get_applicant_form_id(license_id) — DISCOVERED, not hardcoded;
+         it walks license_approval_step_form → forms filtered to the applicant
+         form, excluding the Penomoran form).
+      2. Extracts the TEXT field values REUSING the #80 no-hallucination engine
+         (siap_templates.resolve_fill_data): profile-sourced (nama_pemohon,
+         alamat) from person_profile via profile_id; Vision-sourced (no_siup,
+         nama_kapal, gt, …) read off the submitted docs; jenis_pengadaan from
+         the licence name. ONLY real reads are included — blanks are omitted,
+         never fabricated. Provenance (profile/case vs Vision) is kept so the
+         note can flag which values were OCR'd and need eyeballing.
+      3. Maps the APPLICANT-UPLOAD docs to the form's FLE file slots by doc-type
+         label / filename (KTP→up_ktp, SIUP/NIB→up_siup_oss, …); only confident
+         matches are attached.
+      4. Calls the form-value endpoint via siap_form_client.upsert_form.
+         BEST-EFFORT: on any failure it returns an honest message — never
+         crashes the turn.
+      5. Returns a provenance-split note: which fields came from official SIAP
+         data vs. were read off documents (mohon diperiksa), which files went to
+         which slot, which fields it could NOT fill, and a clear instruction to
+         verify the Formulir Isian in SIAP and click Simpan (SK is generated by
+         SIAP from that form). Includes the officer edit-page link.
+    """
+    sk = _sk_context.get()
+    if not sk or not isinstance(sk, dict):
+        return (
+            "Formulir Isian belum bisa saya isikan di jalur ini: konteks berkas "
+            "(izin & pemohon) tidak tersedia pada sesi. Pada alur chat petugas, "
+            "formulir diisi otomatis dari data resmi SIAP."
+        )
+
+    license_id = sk.get("license_id")
+    ticket = sk.get("ticket")
+    profile_id = sk.get("profile_id")
+
+    if not license_id:
+        return (
+            "Formulir Isian belum bisa diisi: ID izin (license_id) tidak "
+            "diketahui untuk berkas ini, sehingga formulir pemohon di SIAP "
+            "tidak dapat ditemukan. Silakan isi Formulir Isian langsung di SIAP."
+        )
+
+    try:
+        from services import siap_templates as st
+        from services import siap_tools as stools
+        from services import siap_db as sdb
+        from services.siap_form_client import get_siap_form_client
+    except Exception:  # pragma: no cover — module import guard
+        return (
+            "Formulir Isian belum bisa diisi: modul integrasi formulir SIAP "
+            "tidak tersedia di server ini. Silakan isi langsung di SIAP."
+        )
+
+    # 1) Resolve request_id (needed for BOTH the form-value call and the case
+    #    meta) and the applicant form_id (discovered, not hardcoded).
+    request_id: Optional[int] = None
+    try:
+        if ticket:
+            request_id = await stools.siap_resolve_request_id(str(ticket))
+    except Exception:
+        logger.exception("fill_siap_form: request_id resolve failed | ticket bound")
+        request_id = None
+    if request_id is None:
+        return (
+            "Formulir Isian belum bisa diisi: nomor permohonan (request_id) "
+            "tidak dapat ditemukan di SIAP untuk tiket ini. Silakan isi "
+            "Formulir Isian langsung di SIAP."
+        )
+
+    form_id: Optional[int] = None
+    try:
+        form_id = await sdb.get_applicant_form_id(int(license_id))
+    except Exception:
+        logger.exception(
+            "fill_siap_form: form_id resolve failed | license_id=%s", license_id
+        )
+        form_id = None
+    if form_id is None:
+        return (
+            "Formulir Isian belum bisa diisi: formulir pemohon (Formulir Isian) "
+            "untuk izin ini tidak dapat ditemukan di SIAP. Silakan isi langsung "
+            "di SIAP."
+        )
+
+    # 2) TEXT fields — REUSE the #80 engine so nothing is fabricated. Gather the
+    #    same real data handles draft_sk uses: profile (identity), case meta +
+    #    licence name (jenis_pengadaan/ticket), and the in-session docs (Vision).
+    documents = _doc_context.get() or {}
+
+    profile: dict = {}
+    if profile_id is not None:
+        try:
+            profile = await sdb.get_person_profile_properties(int(profile_id))
+        except Exception:
+            logger.exception("fill_siap_form: profile read failed | profile_id set")
+            profile = {}
+
+    license_name = sk.get("license_name")
+    case_meta: dict = {}
+    try:
+        case_meta = await sdb.get_request_case_meta(int(request_id))
+        if not license_name:
+            license_name = await sdb.get_license_name(int(license_id))
+    except Exception:
+        logger.exception(
+            "fill_siap_form: case-meta read failed | license_id=%s", license_id
+        )
+
+    try:
+        data, classes = await st.resolve_fill_data(
+            list(_FORM_TEXT_FIELD_KEYS),
+            profile=profile,
+            case_meta=case_meta or ({"ticket": ticket} if ticket else None),
+            license_name=license_name,
+            documents=documents,
+            run_vision=True,
+        )
+    except Exception:
+        logger.exception(
+            "fill_siap_form: field extraction failed | license_id=%s", license_id
+        )
+        # Degrade to files-only rather than crash; still best-effort.
+        data, classes = {}, {}
+
+    # Split provenance so the note can flag Vision reads (probabilistic) apart
+    # from official DB reads (authoritative) — never present an OCR value as a
+    # DB fact. A key in `data` is a real read; a key absent from `data` is a
+    # blank the officer completes.
+    filled_official = [
+        k for k in _FORM_TEXT_FIELD_KEYS
+        if str(data.get(k) or "").strip()
+        and classes.get(k) in (st.SOURCE_PROFILE, st.SOURCE_CASE)
+    ]
+    filled_vision = [
+        k for k in _FORM_TEXT_FIELD_KEYS
+        if str(data.get(k) or "").strip() and classes.get(k) == st.SOURCE_VISION
+    ]
+    blank_fields = [
+        k for k in _FORM_TEXT_FIELD_KEYS if not str(data.get(k) or "").strip()
+    ]
+
+    # 3) FILE slots — map the APPLICANT-UPLOAD docs to their slots (confident
+    #    matches only). SIAP copies each by file_id server-side. `unattachable`
+    #    holds recognised docs that matched a slot but have no attachable file_id
+    #    (a profile-requirements `siap:req:{id}` source) — we surface them so the
+    #    officer knows to lampirkan them by hand instead of them vanishing.
+    files, mapped_labels, unattachable = _map_docs_to_slots(documents)
+    unattachable_note = (
+        " " + "; ".join(unattachable)
+        + " dikenali tetapi tidak dapat dilampirkan otomatis — mohon lampirkan "
+        "manual di SIAP."
+        if unattachable else ""
+    )
+
+    # 4) WRITE — best-effort. On any failure, return an honest message; never
+    #    crash the officer turn.
+    client = get_siap_form_client()
+    if not client.is_configured():
+        # No SIAP form seam on this env — tell the officer what BIMA WOULD have
+        # filled and to do it by hand, with the edit link. Still useful.
+        official_labels = ", ".join(_pretty_field_label(k) for k in filled_official) or "(tidak ada)"
+        vision_labels = ", ".join(_pretty_field_label(k) for k in filled_vision) or "(tidak ada)"
+        slot_lines = "; ".join(mapped_labels) or "(tidak ada yang cocok otomatis)"
+        return (
+            "Integrasi pengisian Formulir Isian SIAP belum aktif pada lingkungan "
+            "ini, jadi belum bisa saya tuliskan otomatis. Silakan isi Formulir "
+            "Isian langsung di SIAP. Sebagai bantuan, nilai yang BIMA baca: "
+            f"dari data resmi SIAP — {official_labels}; "
+            f"dibaca dari dokumen unggahan (mohon diperiksa) — {vision_labels}. "
+            f"Dokumen untuk slot berkas: {slot_lines}.{unattachable_note} "
+            + _siap_edit_link_line(request_id)
+        )
+
+    try:
+        result = await client.upsert_form(
+            request_id=int(request_id),
+            form_id=int(form_id),
+            fields=data,
+            files=files,
+        )
+    except Exception:  # pragma: no cover — client never raises, defence-in-depth
+        logger.exception(
+            "fill_siap_form: upsert_form raised | request_id=%s form_id=%s",
+            request_id, form_id,
+        )
+        result = {"ok": False, "note": "Terjadi kendala saat menghubungi SIAP."}
+
+    official_labels = ", ".join(_pretty_field_label(k) for k in filled_official) or "(tidak ada)"
+    vision_labels = ", ".join(_pretty_field_label(k) for k in filled_vision) or "(tidak ada)"
+    blank_labels = ", ".join(_pretty_field_label(k) for k in blank_fields) or "(tidak ada)"
+    slot_lines = "; ".join(mapped_labels) or "(tidak ada yang cocok otomatis)"
+
+    logger.info(
+        "fill_siap_form | request_id=%s form_id=%s | ok=%s | official=%d "
+        "vision=%d blank=%d files=%d | http=%s",
+        request_id, form_id, result.get("ok"),
+        len(filled_official), len(filled_vision), len(blank_fields),
+        len(files), result.get("http_status"),
+    )
+
+    if not result.get("ok"):
+        # Honest failure — the officer completes the form in SIAP. Still report
+        # what BIMA read so the officer can copy it in, and the edit link.
+        note = str(result.get("note") or "SIAP menolak permintaan pengisian formulir.")
+        return (
+            f"Maaf, Formulir Isian belum berhasil saya isikan otomatis. {note} "
+            "Silakan isi/lengkapi Formulir Isian langsung di SIAP. Nilai yang "
+            f"BIMA baca — dari data resmi SIAP: {official_labels}; dibaca dari "
+            f"dokumen unggahan (mohon diperiksa): {vision_labels}. "
+            f"Dokumen untuk slot berkas: {slot_lines}.{unattachable_note} "
+            + _siap_edit_link_line(request_id)
+        )
+
+    # SUCCESS — report what was written, split by provenance, and steer the
+    # officer to VERIFY + Simpan. SK is generated by SIAP from this form.
+    fields_written = result.get("fields_set") or list(data.keys())
+    files_written = result.get("files_attached") or list(files.keys())
+    return (
+        "Formulir Isian sudah saya isikan di SIAP dan siap Anda periksa. "
+        f"Terisi dari DATA RESMI SIAP (profil pemohon & data permohonan): "
+        f"{official_labels}. "
+        f"DIBACA DARI DOKUMEN UNGGAHAN — MOHON DIPERIKSA karena hasil pembacaan "
+        f"bisa keliru: {vision_labels}. "
+        f"Berkas dilampirkan ke slot: {slot_lines}.{unattachable_note} "
+        f"Field yang belum terisi (mohon dilengkapi petugas): {blank_labels}. "
+        f"({len(fields_written)} field & {len(files_written)} berkas tertulis.) "
+        "Langkah Anda: buka Formulir Isian permohonan ini di SIAP, PERIKSA "
+        "setiap isian (terutama yang dibaca dari dokumen), lengkapi yang kosong, "
+        "lalu klik Simpan. SK akan dibuat SIAP dari formulir itu. "
+        + _siap_edit_link_line(request_id)
+    )
+
+
+def _siap_edit_link_line(request_id: Optional[int]) -> str:
+    """One-line officer edit-page link for the request, or a blank string.
+
+    Reuses SIAP_SIGNING_URL_BASE (the SIAP Filament admin base) with the
+    daftar-permohonans edit route. Best-effort — a missing request_id yields no
+    link line rather than a broken URL."""
+    if request_id is None:
+        return ""
+    url = f"{_SIAP_SIGNING_BASE}/admin/daftar-permohonans/{int(request_id)}/edit"
+    return f"Buka Formulir Isian di SIAP: {url}"
 
 
 def compare_field(doc_a: dict, doc_b: dict, field: str) -> dict:
@@ -2064,6 +2678,29 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "fill_siap_form",
+        "description": (
+            "ISIKAN Formulir Isian permohonan LANGSUNG di SIAP — field teks DAN "
+            "lampiran berkas ke slot-slotnya — lalu pandu petugas MEMERIKSA. "
+            "SIAP membuat SK dari formulir yang terisi ini, jadi tool inilah yang "
+            "menyiapkan data untuk SK di SIAP (berbeda dari draft_sk yang hanya "
+            "mengirim draf PDF/.docx bantu ke chat). Gunakan saat petugas minta "
+            "'isikan formulirnya', 'isi Formulir Isian', 'isi form permohonan', "
+            "'siapkan/isikan data untuk SK di SIAP', atau setelah review positif "
+            "dan petugas siap menyetujui. Mengisi HANYA dari sumber nyata: profil "
+            "pemohon SIAP + data permohonan + hasil baca dokumen unggahan "
+            "(dibedakan mana yang perlu diperiksa); field yang tidak terbaca "
+            "dibiarkan kosong (tidak pernah dikarang) untuk dilengkapi petugas. "
+            "BUKAN tindakan keputusan — hanya menyiapkan isian formulir, jadi "
+            "TIDAK perlu konfirmasi. Tidak butuh argumen — konteks izin, "
+            "permohonan, & pemohon sudah terikat ke sesi."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "compare_field",
         "description": (
             "Bandingkan satu field di antara dua dokumen yang sudah "
@@ -2283,6 +2920,7 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "get_doc_summary": get_doc_summary,
     "send_document": send_document,
     "draft_sk": draft_sk,
+    "fill_siap_form": fill_siap_form,
     "compare_field": compare_field,
     "compare_identity": compare_identity,
     "cite_regulation": cite_regulation,
@@ -2310,6 +2948,7 @@ _OFFICER_TOOL_NAMES = frozenset({
     "get_doc_summary",
     "send_document",
     "draft_sk",
+    "fill_siap_form",
     "compare_field",
     "compare_identity",
     "cite_regulation",

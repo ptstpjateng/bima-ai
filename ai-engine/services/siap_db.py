@@ -793,3 +793,94 @@ async def get_license_name(license_id: int) -> Optional[str]:
     except Exception:  # pragma: no cover — defensive
         logger.exception("get_license_name failed (returning None) | license_id=%s", license_id)
         return None
+
+
+# ===========================================================================
+# get_applicant_form_id — resolve a licence's APPLICANT "Formulir Isian" form.
+#
+# A licence's forms live behind
+#   license -> license_approval_step -> license_approval_step_form -> forms
+# (the SAME join SIAP's License::GetLicenseRequestForm walks). A licence has
+# SEVERAL forms across its steps — the applicant's Formulir Isian, and separate
+# officer/system forms such as the "Penomoran" numbering form. We must fill ONLY
+# the APPLICANT one; stamping the Penomoran form would be wrong and, per the
+# form-value endpoint's form_id-belongs-to-licence guard, a different write
+# entirely.
+#
+# SIAP itself discriminates the applicant form with the filter in
+# License::GetLicenseRequestFormPemohon: `forms.code LIKE '%Form Pemohon%'`
+# (the Penomoran form's code does NOT match). We mirror that EXACTLY (ILIKE for
+# case-insensitivity), then pick the lowest form_id deterministically so a
+# licence with more than one applicant form is stable. This is a data-driven
+# read — no hardcoded per-licence form_id (PKPP 459 → 560 is discovered here,
+# not baked in). Read-only; the form code/name are non-PII.
+# ===========================================================================
+
+# license_id → the APPLICANT "Formulir Isian" form_id. Walks the same join as
+# License::GetLicenseRequestForm and filters to the applicant form the way
+# License::GetLicenseRequestFormPemohon does (forms.code ILIKE '%Form Pemohon%').
+# DISTINCT + lowest form_id so a multi-step licence that references the same
+# applicant form on several steps still yields one deterministic id.
+_SQL_APPLICANT_FORM_ID = """
+    SELECT f.form_id
+      FROM ptsp.license_approval_step s
+      JOIN ptsp.license_approval_step_form sf
+            ON sf.approval_step_id = s.approval_step_id
+      JOIN ptsp.forms f
+            ON f.form_id = sf.form_id
+     WHERE s.license_id = $1
+       AND f.code ILIKE '%Form Pemohon%'
+     ORDER BY f.form_id
+     LIMIT 1
+"""
+
+
+async def get_applicant_form_id(license_id: int) -> Optional[int]:
+    """Return the APPLICANT Formulir-Isian `form_id` for a licence, or None.
+
+    Resolves the applicant input form via
+    license_approval_step -> license_approval_step_form -> forms, filtered to
+    `forms.code ILIKE '%Form Pemohon%'` — SIAP's own discriminator for the
+    applicant form (License::GetLicenseRequestFormPemohon), which excludes the
+    officer/system "Penomoran" numbering form. Picks the lowest form_id so the
+    result is deterministic for a licence that references the form on several
+    steps.
+
+    Generic across licences — for PKPP (license 459) this returns 560 by
+    DISCOVERY, not a hardcode. NEVER raises: a miss / DB error / unconfigured DB
+    returns None so the caller (fill_siap_form) degrades to an honest "form not
+    resolvable" message rather than filling the wrong form. Non-PII; the
+    license_id + resolved form_id are the only things logged.
+    """
+    if not is_siap_db_configured():
+        logger.info(
+            "get_applicant_form_id: SIAP DB not configured | license_id=%s",
+            license_id,
+        )
+        return None
+    try:
+        lid = int(license_id)
+    except (TypeError, ValueError):
+        logger.warning("get_applicant_form_id: bad license_id=%r", license_id)
+        return None
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_APPLICANT_FORM_ID, lid)
+        if row is None or row["form_id"] is None:
+            logger.info(
+                "get_applicant_form_id: no applicant form found | license_id=%s",
+                lid,
+            )
+            return None
+        form_id = int(row["form_id"])
+        logger.info(
+            "get_applicant_form_id | license_id=%s | form_id=%s", lid, form_id
+        )
+        return form_id
+    except Exception:  # pragma: no cover — defensive; never break the officer path
+        logger.exception(
+            "get_applicant_form_id failed (returning None) | license_id=%s",
+            license_id,
+        )
+        return None
