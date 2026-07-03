@@ -664,3 +664,132 @@ async def get_submission_doc_refs(profile_id: int) -> list[dict]:
     except Exception:  # pragma: no cover — defensive
         logger.exception("get_submission_doc_refs failed (returning empty) | profile_id=%s", pid)
         return []
+
+
+# ===========================================================================
+# Applicant profile read ([[Generalize copilot SK/output-doc from real data]])
+#
+# The generic output-template fill engine (services/siap_templates.py) resolves
+# an APPLICANT-identity placeholder key (nama_pemohon, alamat, nik, no_hp, …)
+# from the request's REAL ptsp.person_profile.properties JSONB — the same
+# structured source SIAP itself uses on the Rekomtek preview surface, and the
+# same key set SIAP's person-profile upsert accepts (see
+# siap_profile_client._OPTIONAL_FIELDS). This read replaces the earlier PKPP
+# path where identity was carried in the copilot session; grounding directly on
+# person_profile makes ANY licence's applicant fields fill deterministically
+# with no hallucination — every value is a literal column read.
+#
+# Read-only by contract (parameterised SELECT + the read-only-transaction pool
+# guard). NEVER raises — a miss / DB error / unconfigured DB returns {} so the
+# fill engine simply leaves those placeholders blank. PII (the property VALUES)
+# is NEVER logged — only the profile_id and the count of keys.
+# ===========================================================================
+
+# profile_id → the raw person_profile.properties JSONB (as text, parsed by the
+# caller). The whole JSONB is returned so the fill engine can read ANY key the
+# template needs (full_name, address, identity_number, phone, email, …) without
+# this module knowing the template's key set in advance.
+_SQL_PERSON_PROFILE = """
+    SELECT properties
+      FROM ptsp.person_profile
+     WHERE profile_id = $1
+     LIMIT 1
+"""
+
+
+async def get_person_profile_properties(profile_id: int) -> dict:
+    """Return the applicant's `ptsp.person_profile.properties` as a dict.
+
+    This is the authoritative APPLICANT-identity source for the generic
+    output-template fill engine (full_name, address, identity_number, phone,
+    email, gender, birth_place/birth_date, nationality, regency/sub_district/
+    village, identity_type, nip, position_name — the SIAP profile key set).
+
+    NEVER raises — returns {} on any error / miss / unconfigured DB, so a
+    template placeholder that would have drawn from the profile simply renders
+    blank. The property VALUES are PII and are NEVER logged (only the count of
+    keys); the profile_id is not itself PII.
+    """
+    if not is_siap_db_configured():
+        logger.info(
+            "get_person_profile_properties: SIAP DB not configured | profile_id=%s",
+            profile_id,
+        )
+        return {}
+    try:
+        pid = int(profile_id)
+    except (TypeError, ValueError):
+        logger.warning("get_person_profile_properties: bad profile_id=%r", profile_id)
+        return {}
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_PERSON_PROFILE, pid)
+        if row is None or row["properties"] is None:
+            logger.info(
+                "get_person_profile_properties: profile not found | profile_id=%s", pid
+            )
+            return {}
+        raw = row["properties"]
+        # asyncpg returns a JSONB column as a str (no codec registered) or,
+        # with a codec, as a dict. Handle both; a str is parsed with json.
+        if isinstance(raw, str):
+            import json
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "get_person_profile_properties: properties not valid JSON | "
+                    "profile_id=%s", pid,
+                )
+                return {}
+        elif isinstance(raw, dict):
+            parsed = raw
+        else:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        # Never log the values — only how many keys were read.
+        logger.info(
+            "get_person_profile_properties | profile_id=%s keys=%d", pid, len(parsed)
+        )
+        return parsed
+    except Exception:  # pragma: no cover — defensive; never break the officer path
+        logger.exception(
+            "get_person_profile_properties failed (returning empty) | profile_id=%s",
+            profile_id,
+        )
+        return {}
+
+
+# license_id → the licence NAME (for placeholder keys like nama_izin, and to
+# parse jenis_pengadaan). Read-only; the licence name is non-PII.
+_SQL_LICENSE_NAME = """
+    SELECT name
+      FROM ptsp.license
+     WHERE license_id = $1
+     LIMIT 1
+"""
+
+
+async def get_license_name(license_id: int) -> Optional[str]:
+    """Return `ptsp.license.name` for a licence id, or None on any miss/error.
+
+    The authoritative licence-name source for case-derived placeholders
+    (`nama_izin`, and `jenis_pengadaan` parsing). NEVER raises."""
+    if not is_siap_db_configured():
+        return None
+    try:
+        lid = int(license_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_LICENSE_NAME, lid)
+        if row is None or row["name"] is None:
+            return None
+        return str(row["name"]).strip() or None
+    except Exception:  # pragma: no cover — defensive
+        logger.exception("get_license_name failed (returning None) | license_id=%s", license_id)
+        return None

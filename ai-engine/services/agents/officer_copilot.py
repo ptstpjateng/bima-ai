@@ -284,14 +284,20 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "saat berkas disetujui di tahap akhir — BUKAN oleh Anda. Anda hanya "
     "MENDRAFTKAN SK (lihat draft_sk) dan MEREKOMENDASIKAN; jangan pernah "
     "mengaku 'menerbitkan' atau 'menandatangani' SK.\n\n"
-    "=== DRAF SK (draft_sk) — DITAWARKAN SETELAH REVIEW POSITIF ===\n"
+    "=== DRAF DOKUMEN OUTPUT (draft_sk) — DITAWARKAN SETELAH REVIEW POSITIF ===\n"
     "Ketika validasi positif (skor tinggi, tidak ada temuan critical/high) dan "
-    "petugas condong menyetujui, TAWARKAN untuk mendraftkan SK dari template "
-    "resmi SIAP: mis. 'Berkas layak. Mau saya draftkan SK-nya?'. Saat petugas "
-    "meminta 'draftkan SK' / 'buat surat persetujuan', panggil `draft_sk` "
-    "(tanpa argumen, tanpa konfirmasi — ini hanya draf, bukan tindakan tulis). "
-    "Sampaikan field mana yang terisi otomatis dan mana yang masih kosong "
-    "sesuai hasil tool, agar petugas melengkapinya.\n"
+    "petugas condong menyetujui, TAWARKAN untuk mendraftkan dokumen output dari "
+    "template resmi SIAP: mis. 'Berkas layak. Mau saya draftkan SK-nya?'. Saat "
+    "petugas meminta 'draftkan SK' / 'buat surat persetujuan' / 'buat "
+    "rekomendasi', panggil `draft_sk` (tanpa argumen, tanpa konfirmasi — ini "
+    "hanya draf, bukan tindakan tulis). Tool memilih SENDIRI dokumen yang tepat "
+    "untuk MEJA saat ini (Rekomendasi Teknis di meja teknis, Surat Keputusan di "
+    "meja tanda tangan) dan mengisinya dari DATA RESMI (profil pemohon SIAP, "
+    "data permohonan, serta dokumen unggahan). Sampaikan PERSIS field mana yang "
+    "terisi otomatis dan mana yang masih kosong SESUAI hasil tool, agar petugas "
+    "melengkapinya. JANGAN pernah menyatakan sebuah field terisi bila hasil tool "
+    "menandainya kosong — field kosong memang harus diisi tangan oleh petugas; "
+    "BIMA TIDAK menebak nilainya.\n"
     "ARTI 'DRAFT' DALAM KONTEKS REVIEW: bila petugas mengatakan 'draft', "
     "'buatkan draftnya', 'buat draf', 'buatkan draft nya dulu' TANPA penjelas, "
     "maksudnya adalah DRAF SK — panggil `draft_sk` — KECUALI bila BIMA baru saja "
@@ -1035,18 +1041,36 @@ _SK_ALL_KEYS: tuple[str, ...] = (
 )
 
 
+# Pretty-print a placeholder key for the officer's filled/blank note when we
+# have no curated label (generic path — ANY licence). Uses the curated PKPP
+# labels when present, else Title-Cases the snake_case key.
+def _pretty_field_label(key: str) -> str:
+    if key in _SK_FIELD_LABELS:
+        return _SK_FIELD_LABELS[key]
+    return (key or "").replace("_", " ").strip().title() or key
+
+
 async def draft_sk() -> str:
-    """DRAFT the PKPP approval letter (Surat Keputusan / Persetujuan) for the
-    case in session, using SIAP's OWN template, and send it to the officer as an
-    editable .docx.
+    """DRAFT the correct SIAP output document (Rekomendasi Teknis or Surat
+    Keputusan) for the case in session AT ITS CURRENT STEP, using SIAP's OWN
+    template, filled from REAL data, and send it to the officer as a PDF (to
+    read) + editable .docx (to edit).
 
     This is a DRAFTING aid, not a SIAP write — SIAP issues the final SK ber-TTE
-    at approval. So it is NOT confirmation-gated. It fetches the
-    LICENSE-RECOMMEND template for the case's licence, fills the identity fields
-    from the case, runs one best-effort Vision pass over the submission docs for
-    the vessel/permit fields, leaves the rest blank, queues the .docx for
-    out-of-band delivery on the officer's channel, and returns a note listing
-    which fields it filled vs left blank so the officer knows what to complete.
+    at approval. So it is NOT confirmation-gated.
+
+    GENERALIZED (task #80) — works for ANY licence, not just PKPP:
+      1. PER-STEP: choose the output stereotype the CURRENT desk calls for
+         (LICENSE-RECOMMEND at the technical/review desk, LICENSE-SK at the
+         signing desk) via siap_get_step_output_template; fall back to whichever
+         fillable template the licence has and SAY so.
+      2. DISCOVER the fetched template's `[data.KEY]` keys dynamically.
+      3. FILL each key from a REAL source — person_profile.properties (via the
+         request profile_id), the license_request/license/step case meta, or ONE
+         best-effort Vision pass over the submission docs. Anything unresolved
+         (SIAP-issued number/date, or simply unreadable) is LEFT BLANK — never
+         guessed.
+      4. Report filled-vs-blank so the officer completes the blanks.
 
     Degrades gracefully (no license_id / template missing / Vision fails /
     python-docx absent) to an honest message — never raises, never a dead-end.
@@ -1054,61 +1078,124 @@ async def draft_sk() -> str:
     sk = _sk_context.get()
     if not sk or not isinstance(sk, dict):
         return (
-            "Draf SK belum bisa dibuat di jalur ini: konteks berkas (izin & "
-            "identitas pemohon) tidak tersedia pada sesi. Pada alur chat "
-            "petugas, draf SK dibuat otomatis dari template resmi SIAP."
+            "Draf dokumen belum bisa dibuat di jalur ini: konteks berkas (izin & "
+            "pemohon) tidak tersedia pada sesi. Pada alur chat petugas, draf "
+            "dibuat otomatis dari template resmi SIAP."
         )
     license_id = sk.get("license_id")
     if not license_id:
         return (
-            "Draf SK belum bisa dibuat: ID izin (license_id) tidak diketahui "
-            "untuk berkas ini, sehingga template SK resmi SIAP tidak dapat "
-            "ditemukan. Silakan terbitkan SK langsung di SIAP."
+            "Draf dokumen belum bisa dibuat: ID izin (license_id) tidak "
+            "diketahui untuk berkas ini, sehingga template resmi SIAP tidak "
+            "dapat ditemukan. Silakan terbitkan dokumen langsung di SIAP."
         )
 
     try:
         from services import siap_templates as st
+        from services import siap_tools as stools
+        from services import siap_db as sdb
     except Exception:  # pragma: no cover — module import guard
         return (
-            "Draf SK belum bisa dibuat: modul template dokumen tidak tersedia "
-            "di server ini."
+            "Draf dokumen belum bisa dibuat: modul template dokumen tidak "
+            "tersedia di server ini."
         )
 
     documents = _doc_context.get() or {}
+    ticket = sk.get("ticket")
+    is_final_step = bool(sk.get("is_final_step"))
+
     try:
-        data = await st.build_sk_data(
-            applicant_name=sk.get("applicant_name"),
-            alamat=sk.get("alamat"),
-            license_name=sk.get("license_name"),
-            documents=documents,
+        # 1) PER-STEP output-template selection (Rekomtek vs SK by the desk).
+        tmpl = await stools.siap_get_step_output_template(
+            int(license_id),
+            is_final_step=is_final_step,
+            step_stereotype=sk.get("step_stereotype"),
         )
-        rendered = await st.render_sk_docx(
-            license_id, data, ticket=sk.get("ticket"),
+    except Exception:
+        logger.exception("draft_sk: step-template lookup failed | license_id=%s", license_id)
+        tmpl = {"found": False}
+
+    if not tmpl.get("found"):
+        return (
+            "Template dokumen resmi SIAP untuk izin ini belum tersedia/terunduh, "
+            "jadi draf otomatis belum bisa dibuat. Dokumen final tetap "
+            "diterbitkan oleh SIAP saat berkas disetujui."
+        )
+
+    internal = tmpl.get("internal_filename")
+    doc_kind = tmpl.get("doc_kind") or "dokumen"
+    doc_label = {"sk": "Surat Keputusan (SK)", "rekomendasi": "Rekomendasi Teknis"}.get(
+        doc_kind, "dokumen"
+    )
+    out_prefix = {"sk": "SK", "rekomendasi": "Rekomtek"}.get(doc_kind, "Dokumen")
+    if not internal or not str(internal).lower().endswith(".docx"):
+        # A template exists but is not a fillable .docx (legacy .doc/.rtf or the
+        # ${key} SK docx BIMA can't fill). Be honest rather than draft nothing.
+        return (
+            f"Template {doc_label} untuk izin ini ada di SIAP, tetapi belum "
+            "dalam format yang bisa BIMA isi otomatis (bukan .docx isian). "
+            "Silakan susun/terbitkan dokumen langsung di SIAP."
+        )
+
+    # 2) Fetch REAL data handles (all read-only, all degrade to empty).
+    profile: dict = {}
+    profile_id = sk.get("profile_id")
+    if profile_id is not None:
+        try:
+            profile = await sdb.get_person_profile_properties(int(profile_id))
+        except Exception:
+            logger.exception("draft_sk: profile read failed | profile_id set")
+            profile = {}
+
+    case_meta: dict = {}
+    license_name = sk.get("license_name")
+    request_id = None
+    try:
+        # Prefer the ticket-scoped case meta so ticket/step are authoritative.
+        if ticket:
+            request_id = await stools.siap_resolve_request_id(str(ticket))
+        if request_id is not None:
+            case_meta = await sdb.get_request_case_meta(int(request_id))
+        if not license_name:
+            license_name = await sdb.get_license_name(int(license_id))
+    except Exception:
+        logger.exception("draft_sk: case-meta read failed | license_id=%s", license_id)
+
+    # 3) GENERIC render — discover keys, resolve from real sources, fill.
+    try:
+        rendered = await st.render_output_docx(
+            internal_filename=internal,
+            profile=profile,
+            case_meta=case_meta or ({"ticket": ticket} if ticket else None),
+            license_name=license_name,
+            documents=documents,
+            ticket=ticket,
+            out_prefix=out_prefix,
         )
     except Exception:
         logger.exception("draft_sk: render failed | license_id=%s", license_id)
         return (
-            "Maaf, terjadi kendala saat menyusun draf SK. SK resmi tetap dapat "
-            "diterbitkan langsung di SIAP saat berkas disetujui."
+            "Maaf, terjadi kendala saat menyusun draf dokumen. Dokumen resmi "
+            "tetap dapat diterbitkan langsung di SIAP saat berkas disetujui."
         )
 
     if rendered is None:
         return (
-            "Template SK resmi SIAP untuk izin ini belum tersedia/terunduh, "
-            "jadi draf otomatis belum bisa dibuat. SK final tetap diterbitkan "
-            "ber-TTE oleh SIAP saat berkas disetujui."
+            f"Template {doc_label} resmi SIAP untuk izin ini belum "
+            "tersedia/terunduh, jadi draf otomatis belum bisa dibuat. Dokumen "
+            "final tetap diterbitkan oleh SIAP saat berkas disetujui."
         )
 
-    docx_bytes, filename = rendered
+    docx_bytes, filename, data, classes = rendered
 
-    # Which of the 16 keys we actually filled vs left blank (from the same data
-    # map render used). The officer needs to know what to complete by hand.
-    filled = [k for k in _SK_ALL_KEYS if str(data.get(k) or "").strip()]
-    blank = [k for k in _SK_ALL_KEYS if not str(data.get(k) or "").strip()]
+    # 4) Filled vs blank — computed from the DISCOVERED keys (any licence), not
+    # a fixed 16-key list. A key present in `classes` but with no value in
+    # `data` is a blank the officer must complete.
+    all_keys = list(classes.keys())
+    filled = [k for k in all_keys if str(data.get(k) or "").strip()]
+    blank = [k for k in all_keys if not str(data.get(k) or "").strip()]
 
     # Queue the rendered .docx for out-of-band delivery on the officer channel.
-    # Reuse the same send queue as send_document, but carry the bytes inline
-    # (this file is generated here, not one of the in-session upload docs).
     queue = _docs_to_send_context.get()
     if isinstance(queue, list):
         queue.append({
@@ -1124,18 +1211,17 @@ async def draft_sk() -> str:
 
     # ALSO produce a read-only PDF of the SAME filled content and queue it, so
     # the officer can PREVIEW the draft inline on WhatsApp — .docx does not
-    # preview reliably there (the rehearsal ".docx tidak bisa dibuka" dead-end).
-    # Pure-Python (fpdf2, already a dependency); best-effort — a None just means
-    # we ship the .docx alone, and the narration only mentions the PDF when it
-    # actually rendered. PDF = untuk dibaca, .docx = untuk diedit.
+    # preview reliably there. Pure-Python (fpdf2); best-effort.
     pdf_sent = False
     try:
-        pdf_view = st.render_pdf_view_from_docx(docx_bytes, ticket=sk.get("ticket"))
+        pdf_view = st.render_pdf_view_from_docx(docx_bytes, ticket=ticket)
     except Exception:  # pragma: no cover — render_pdf_view already guards
         logger.exception("draft_sk: PDF view render raised | license_id=%s", license_id)
         pdf_view = None
     if pdf_view is not None and isinstance(queue, list):
-        pdf_bytes, pdf_name = pdf_view
+        pdf_bytes, _pdf_name = pdf_view
+        # Name the PDF after the docx so the pair reads as one document.
+        pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
         queue.append({
             "filename": pdf_name,
             "content": pdf_bytes,
@@ -1143,30 +1229,45 @@ async def draft_sk() -> str:
         })
         pdf_sent = True
 
-    filled_labels = ", ".join(_SK_FIELD_LABELS.get(k, k) for k in filled) or "(tidak ada)"
-    blank_labels = ", ".join(_SK_FIELD_LABELS.get(k, k) for k in blank) or "(tidak ada)"
+    filled_labels = ", ".join(_pretty_field_label(k) for k in filled) or "(tidak ada)"
+    blank_labels = ", ".join(_pretty_field_label(k) for k in blank) or "(tidak ada)"
     logger.info(
-        "draft_sk | license_id=%s | filled=%d blank=%d | pdf_view=%s",
-        license_id, len(filled), len(blank), pdf_sent,
+        "draft_sk | license_id=%s | kind=%s fell_back=%s | keys=%d filled=%d "
+        "blank=%d | pdf_view=%s",
+        license_id, doc_kind, tmpl.get("fell_back"), len(all_keys),
+        len(filled), len(blank), pdf_sent,
     )
+
+    # If the step called for a different stereotype than what we could fill,
+    # tell the officer honestly which document was drafted.
+    fallback_note = ""
+    if tmpl.get("fell_back"):
+        want = "SK" if tmpl.get("preferred_stereotype") == "LICENSE-SK" else "Rekomendasi Teknis"
+        fallback_note = (
+            f"Catatan: tahap ini sebetulnya menghasilkan {want}, namun template "
+            f"yang bisa BIMA isi otomatis adalah {doc_label} — itulah yang saya "
+            "draftkan. "
+        )
+
     delivery = (
-        f"Draf SK sudah saya siapkan dari template resmi SIAP dan saya kirim "
-        f"dalam dua berkas: PDF untuk dibaca/dipratinjau ({filename.rsplit('.', 1)[0]}"
+        f"Draf {doc_label} sudah saya siapkan dari template resmi SIAP dan saya "
+        f"kirim dalam dua berkas: PDF untuk dibaca/dipratinjau ({filename.rsplit('.', 1)[0]}"
         f".pdf) dan .docx untuk diedit ({filename}). "
         if pdf_sent
         else (
-            f"Draf SK sudah saya siapkan dari template resmi SIAP dan saya kirim "
-            f"sebagai berkas .docx yang bisa diedit ({filename}). Bila .docx sulit "
-            "dibuka, unduh lalu buka di Word / Google Docs / WPS. "
+            f"Draf {doc_label} sudah saya siapkan dari template resmi SIAP dan "
+            f"saya kirim sebagai berkas .docx yang bisa diedit ({filename}). Bila "
+            ".docx sulit dibuka, unduh lalu buka di Word / Google Docs / WPS. "
         )
     )
     return (
-        delivery
-        + f"Terisi otomatis: {filled_labels}. "
+        fallback_note
+        + delivery
+        + f"Terisi otomatis dari data resmi: {filled_labels}. "
         + f"Masih kosong (mohon dilengkapi petugas): {blank_labels}. "
         + "Catatan: draf ini berkas bantu dari BIMA yang dikirim sebagai lampiran "
-        "di chat ini — tidak tersimpan di SIAP. SK final diterbitkan ber-TTE oleh "
-        "SIAP saat berkas disetujui."
+        "di chat ini — tidak tersimpan di SIAP. Dokumen final diterbitkan "
+        "ber-TTE oleh SIAP saat berkas disetujui."
     )
 
 
@@ -1917,15 +2018,19 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
     {
         "name": "draft_sk",
         "description": (
-            "Buatkan DRAF Surat Keputusan / Surat Persetujuan (SK) izin dari "
-            "template RESMI SIAP, terisi otomatis dari data berkas, lalu kirim "
-            "ke petugas sebagai berkas .docx yang bisa diedit. Gunakan saat "
-            "petugas meminta 'draftkan SK', 'buat surat persetujuan', "
-            "'siapkan surat keputusan', atau setelah hasil validasi positif "
-            "dan petugas siap menyetujui. BUKAN tindakan menulis ke SIAP — ini "
-            "hanya draf bantu; SK final tetap diterbitkan ber-TTE oleh SIAP "
-            "saat berkas disetujui, jadi TIDAK perlu konfirmasi. Tidak butuh "
-            "argumen — konteks izin & pemohon sudah terikat ke sesi."
+            "Buatkan DRAF dokumen output resmi (Rekomendasi Teknis ATAU Surat "
+            "Keputusan/SK) yang TEPAT untuk meja saat ini, dari template RESMI "
+            "SIAP, terisi otomatis dari DATA RESMI (profil pemohon SIAP, data "
+            "permohonan, dokumen unggahan), lalu kirim ke petugas sebagai PDF "
+            "(untuk dibaca) + .docx (untuk diedit). Berlaku untuk SEMUA jenis "
+            "izin, bukan hanya PPKP — tool memilih sendiri dokumen & mengisi "
+            "field sesuai template izin itu. Gunakan saat petugas meminta "
+            "'draftkan SK', 'buat surat persetujuan', 'buat rekomendasi', "
+            "'siapkan surat keputusan', atau setelah validasi positif dan "
+            "petugas siap menyetujui. BUKAN tindakan menulis ke SIAP — hanya "
+            "draf bantu; dokumen final tetap diterbitkan ber-TTE oleh SIAP saat "
+            "berkas disetujui, jadi TIDAK perlu konfirmasi. Tidak butuh argumen "
+            "— konteks izin, langkah, & pemohon sudah terikat ke sesi."
         ),
         "parameters": {
             "type": "object",

@@ -345,6 +345,488 @@ def fill_docx_placeholders(docx_bytes: bytes, data: dict[str, Any]) -> bytes:
     return out.getvalue()
 
 
+# ===========================================================================
+# GENERIC output-template fill engine
+# ([[Generalize copilot SK/output-doc from real data]] — task #80.)
+#
+# The PKPP path above (build_sk_data + _SK_*_KEYS) hardcodes ONE licence's 16
+# `[data.KEY]` keys. Every SIAP licence has a DIFFERENT placeholder SET (11–36
+# keys observed). So this engine drives the fill DATA-FIRST:
+#
+#   1. DISCOVER the template's `[data.KEY]` keys dynamically from the real
+#      fetched docx (run-aware — same JOINED-paragraph read fill_docx_placeholders
+#      uses, so a token shattered across runs is still found).
+#   2. RESOLVE each discovered key through a data-source resolver: a key-name
+#      classifier routes it to the REAL person_profile.properties, the real
+#      license_request/license/step case meta, ONE best-effort Vision pass over
+#      the submission docs, or LEAVES IT BLANK.
+#   3. Feed the resolved {key: value} map to `fill_docx_placeholders`, which
+#      renders any absent/empty key as the `………………` blank fill line.
+#
+# THE NO-HALLUCINATION CONTRACT (structural, not prose):
+#   The resolver ONLY ever puts a key into the data map when it read a value
+#   from a real source (a profile column, a case DB row, or text literally on a
+#   submitted document). A key it cannot ground is simply NOT added → the
+#   renderer emits it as a blank fill line the officer completes by hand. There
+#   is no branch that fabricates, defaults, or guesses a value. SIAP-issued
+#   values (SK number, penetapan/TTE date) are classified BLANK on purpose.
+# ===========================================================================
+
+
+def discover_placeholder_keys(docx_bytes: bytes) -> list[str]:
+    """Return the ordered, de-duplicated set of `[data.KEY]` keys present in a
+    template docx — run-aware (a token split across runs is still found because
+    we read the JOINED paragraph/cell text, exactly like fill_docx_placeholders).
+
+    Never raises to the caller's flow beyond a python-docx import error (which
+    the orchestrator guards). Returns [] for a template with no tokens."""
+    from docx import Document  # lazy: only needed when actually discovering
+
+    doc = Document(io.BytesIO(docx_bytes))
+    seen: set[str] = set()
+    keys: list[str] = []
+    for paragraph in _iter_block_paragraphs(doc):
+        text = paragraph.text
+        if "[data." not in text:
+            continue
+        for m in _PLACEHOLDER_RE.finditer(text):
+            key = m.group(1)
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
+
+
+# --- Source classification: which real source a placeholder key draws from ---
+#
+# Four classes:
+#   PROFILE  — an APPLICANT-identity attribute → person_profile.properties.
+#   CASE     — a request/licence/step attribute → get_request_case_meta / DB.
+#   VISION   — a value that lives ONLY inside an uploaded document.
+#   BLANK    — SIAP-issued (SK/registration number, penetapan/TTE date) OR
+#              unresolvable → always the blank fill line, never sourced.
+#
+# The classifier is a data-driven key→profile-field map with sensible key-name
+# heuristics, so a NEW licence template works with NO code change: a key that
+# names an applicant attribute resolves from the profile; a key that names a
+# case attribute from the case meta; a SIAP-issued key stays blank; anything
+# else falls to Vision (best-effort) and, failing that, blank.
+
+SOURCE_PROFILE = "profile"
+SOURCE_CASE = "case"
+SOURCE_VISION = "vision"
+SOURCE_BLANK = "blank"
+
+# Applicant-identity placeholder-key → person_profile.properties field.
+# Covers the exact key names seen across the investigated templates plus common
+# synonyms. The person_profile key set is siap_profile_client._OPTIONAL_FIELDS
+# + full_name + identity_number (see that module). Every mapping is to a REAL
+# profile column — no derived/guessed values.
+_PROFILE_KEY_MAP: dict[str, str] = {
+    # name
+    "nama_pemohon": "full_name",
+    "nama": "full_name",
+    "full_name": "full_name",
+    "atas_nama": "full_name",
+    "atas_nama_perusahaan": "full_name",
+    # address
+    "alamat": "address",
+    "alamat_pemohon": "address",
+    "alamat_perusahaan": "address",
+    "address": "address",
+    # NIK / identity number
+    "nik": "identity_number",
+    "no_ktp": "identity_number",
+    "nomor_ktp": "identity_number",
+    "identity_number": "identity_number",
+    # phone
+    "no_hp": "mobile_phone",
+    "nomor_hp": "mobile_phone",
+    "hp": "mobile_phone",
+    "telepon": "phone",
+    "telp": "phone",
+    "no_telp": "phone",
+    "nomor_telepon": "phone",
+    "phone": "phone",
+    "mobile_phone": "mobile_phone",
+    # email
+    "email": "email",
+    # occupation / position
+    "pekerjaan_pemohon": "position_name",
+    "jabatan": "position_name",
+    "pekerjaan": "position_name",
+    "position_name": "position_name",
+    # nip (for officials-as-applicants)
+    "nip": "nip",
+    # birth
+    "tempat_lahir": "birth_place",
+    "tgl_lahir": "birth_date",
+    "tanggal_lahir": "birth_date",
+    # locality
+    "kabupaten": "regency",
+    "kab_kota": "regency",
+    "kecamatan": "sub_district",
+    "kelurahan": "village",
+    "desa": "village",
+}
+
+# Substring heuristics for PROFILE keys the exact map misses (a new template
+# that names a field slightly differently). Ordered longest-first so a more
+# specific hint wins. Each maps a key-name substring → profile field.
+_PROFILE_KEY_HINTS: tuple[tuple[str, str], ...] = (
+    ("nama_pemohon", "full_name"),
+    ("alamat", "address"),
+    ("pekerjaan", "position_name"),
+    ("jabatan", "position_name"),
+    ("email", "email"),
+)
+
+# Case-derived placeholder key → the get_request_case_meta field (or a
+# well-known derivation). Values come from real license_request / license / step
+# rows. `jenis_pengadaan` is derived deterministically from the licence NAME.
+# Only keys whose value is a real case attribute belong here.
+_CASE_KEY_TICKET = ("no_tiket", "nomor_tiket", "ticket", "ticket_num", "no_tiket_permohonan")
+_CASE_KEY_LICENSE_NAME = ("nama_izin", "nama_perizinan", "jenis_izin", "nama_bidang", "bidang_izin")
+_CASE_KEY_JENIS_PENGADAAN = ("jenis_pengadaan",)
+
+# SIAP-ISSUED placeholder keys → ALWAYS blank (class d). These are only knowable
+# at issuance (the SK/registration number, the penetapan/TTE date, the QR/
+# barcode, the signing official's block). NEVER sourced. Matched by exact key OR
+# a substring hint so a new template's issuance field is also caught.
+_BLANK_KEY_EXACT = frozenset({
+    "no_ppkp", "no_sk", "nomor_sk", "no_rekom", "nomor_rekom", "no_pertek",
+    "nomor_rekomtek", "no_persetujuan", "rekom_tgl_penetapan", "tgl_penetapan",
+    "mulai_tanggal_sk", "sampai_tanggal_sk", "masa_berlaku", "tgl_berlaku",
+    "tgl_hbs_berlaku", "qrcode_signed", "ttd_gbr", "no_reg", "nomor_reg",
+})
+_BLANK_KEY_HINTS: tuple[str, ...] = (
+    "penetapan", "qrcode", "ttd_", "_signed", "tgl_terbit", "nomor_surat_keputusan",
+)
+
+
+def classify_placeholder_key(key: str) -> str:
+    """Route a `[data.KEY]` key to its real data source class.
+
+    Returns one of SOURCE_PROFILE / SOURCE_CASE / SOURCE_VISION / SOURCE_BLANK.
+
+    Resolution ladder (STOP at first hit) — mirrors the no-hallucination
+    contract:
+      1. SIAP-issued (SK/reg number, penetapan/TTE date, QR/signature) → BLANK.
+      2. applicant identity (exact map, then substring hint) → PROFILE.
+      3. case attribute (ticket / licence name / jenis_pengadaan) → CASE.
+      4. else → VISION (best-effort; a Vision miss renders blank anyway).
+    Case/profile before Vision so a value we can read deterministically is never
+    left to a probabilistic OCR pass."""
+    k = (key or "").strip().lower()
+    if not k:
+        return SOURCE_BLANK
+    # 1) SIAP-issued → never sourced.
+    if k in _BLANK_KEY_EXACT or any(h in k for h in _BLANK_KEY_HINTS):
+        return SOURCE_BLANK
+    # 2) applicant identity → profile.
+    if k in _PROFILE_KEY_MAP:
+        return SOURCE_PROFILE
+    for hint, _field in _PROFILE_KEY_HINTS:
+        if hint in k:
+            return SOURCE_PROFILE
+    # 3) case attribute → case meta / DB.
+    if (k in _CASE_KEY_TICKET or k in _CASE_KEY_LICENSE_NAME
+            or k in _CASE_KEY_JENIS_PENGADAAN):
+        return SOURCE_CASE
+    # 4) doc-only → Vision.
+    return SOURCE_VISION
+
+
+def _profile_field_for_key(key: str) -> Optional[str]:
+    """The person_profile.properties field a PROFILE key draws from, or None."""
+    k = (key or "").strip().lower()
+    if k in _PROFILE_KEY_MAP:
+        return _PROFILE_KEY_MAP[k]
+    for hint, field in _PROFILE_KEY_HINTS:
+        if hint in k:
+            return field
+    return None
+
+
+def _resolve_profile_value(key: str, profile: dict) -> str:
+    """Read a PROFILE placeholder value from the real person_profile.properties.
+    Returns '' when the field is absent/empty (→ blank fill line). Never guesses.
+    """
+    if not profile or not isinstance(profile, dict):
+        return ""
+    field = _profile_field_for_key(key)
+    if not field:
+        return ""
+    val = profile.get(field)
+    if val is None:
+        return ""
+    return str(val).strip()
+
+
+def _resolve_case_value(key: str, case: Optional[dict], license_name: Optional[str]) -> str:
+    """Read a CASE placeholder value from the real case meta. Returns '' when it
+    cannot be sourced (→ blank). `case` is the get_request_case_meta dict;
+    `license_name` is the resolved ptsp.license.name."""
+    k = (key or "").strip().lower()
+    case = case or {}
+    if k in _CASE_KEY_TICKET:
+        return str(case.get("ticket") or "").strip()
+    if k in _CASE_KEY_LICENSE_NAME:
+        return str(license_name or "").strip()
+    if k in _CASE_KEY_JENIS_PENGADAAN:
+        return _jenis_pengadaan_from_license(license_name)
+    return ""
+
+
+# Generic Vision extraction: for VISION-classified keys we ask Gemini to read
+# ONLY the requested keys off the best submission doc, returning "" for anything
+# not literally visible. The schema is BUILT DYNAMICALLY from the discovered
+# keys, so there is no per-licence hardcode — a new template's doc-only fields
+# are extracted by their own key names. Human-ish descriptions help the model;
+# the key name itself is the contract.
+_VISION_KEY_DESCRIPTIONS: dict[str, str] = {
+    "nama_kapal": "Nama kapal perikanan.",
+    "gt": "Ukuran/tonase kapal (Gross Tonnage), angka saja bila ada.",
+    "bahan": "Bahan kasko kapal (Kayu/Fiberglass/Besi/Baja).",
+    "thn_bangun": "Tahun pembuatan/pembangunan kapal.",
+    "alat": "Alat penangkap ikan yang digunakan.",
+    "galangan": "Nama/alamat galangan atau tukang pembuat kapal.",
+    "no_siup": "Nomor SIUP (Surat Izin Usaha Perikanan).",
+    "tgl_siup": "Tanggal terbit SIUP.",
+    "tgl_srt_permohonan": "Tanggal surat permohonan pemohon.",
+    "tgl_surat_permohonan": "Tanggal surat permohonan pemohon.",
+    "tgl_surat_perm": "Tanggal surat permohonan pemohon.",
+    "no_surat_perm": "Nomor surat permohonan pemohon.",
+    "nomor_surat_permohonan": "Nomor surat permohonan pemohon.",
+    "tipe": "Tipe/jenis kapal.",
+    "perihal_surat_perm": "Perihal/subjek surat permohonan.",
+    "perihal_surat_perm_": "Perihal/subjek surat permohonan.",
+    "luas_tanah": "Luas tanah/lahan (dalam m2 bila ada).",
+    "status_tanah": "Status kepemilikan tanah.",
+    "jenis_tanah": "Jenis tanah/peruntukan.",
+    "batas_tanah": "Batas-batas tanah.",
+    "no_siup_": "Nomor SIUP.",
+    "peruntukan": "Peruntukan/penggunaan yang dimohonkan.",
+    "no_pertek_perm": "Nomor pertek pada surat permohonan.",
+}
+
+
+def _vision_description_for_key(key: str) -> str:
+    """A short Indonesian description to guide Vision for one key. Falls back to
+    a generic 'read this field off the document, empty if not visible' line so
+    an UNKNOWN doc-only key on a new template is still extracted by its name."""
+    k = (key or "").strip().lower()
+    if k in _VISION_KEY_DESCRIPTIONS:
+        return _VISION_KEY_DESCRIPTIONS[k]
+    pretty = k.replace("_", " ")
+    return (
+        f"Nilai '{pretty}' persis seperti tertulis pada dokumen. "
+        "Kosongkan bila tidak terlihat."
+    )
+
+
+_GENERIC_VISION_PROMPT = (
+    "Anda asisten petugas perizinan. Dari dokumen permohonan terlampir (surat "
+    "permohonan, izin usaha, spesifikasi/berkas teknis), ambil HANYA data yang "
+    "benar-benar TERTULIS di dokumen untuk setiap field yang diminta. Untuk "
+    "field yang tidak terlihat, kembalikan string kosong. JANGAN mengarang — "
+    "hanya yang terbaca."
+)
+
+
+async def _extract_vision_fields(
+    vision_keys: list[str], documents: Optional[dict]
+) -> dict[str, str]:
+    """Run ONE best-effort Gemini Vision pass over the submission docs to pull
+    the VISION-classified keys. Schema is built from `vision_keys` so it is
+    licence-agnostic. Returns {key: value} for the non-empty reads only, or {}
+    when Vision is unconfigured / fails / there are no bytes / no vision keys.
+    NEVER raises. Bytes never logged.
+
+    `documents` is the copilot `_doc_context` shape:
+      {file_id: {"filename","mime_type","content","claimed_type","detected_type"}}
+    """
+    if not vision_keys or not documents or not isinstance(documents, dict):
+        return {}
+    try:
+        from services.gemini_vision import extract_structured, is_configured
+    except Exception:  # pragma: no cover — vision module import guard
+        return {}
+    if not is_configured():
+        logger.info("generic Vision extract: Gemini Vision not configured")
+        return {}
+
+    docs_with_bytes = [d for d in documents.values() if d.get("content")]
+    if not docs_with_bytes:
+        return {}
+
+    def _label(d: dict) -> str:
+        return " ".join(
+            str(d.get(k) or "") for k in ("detected_type", "claimed_type", "filename")
+        ).lower()
+
+    preferred = next(
+        (d for d in docs_with_bytes
+         if any(w in _label(d) for w in
+                ("permohonan", "siup", "kapal", "izin usaha", "spesifikasi", "teknis"))),
+        docs_with_bytes[0],
+    )
+
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            k: {"type": "string", "description": _vision_description_for_key(k)}
+            for k in vision_keys
+        },
+        "required": [],
+    }
+
+    try:
+        parsed = await extract_structured(
+            image_bytes=preferred["content"],
+            mime_type=preferred.get("mime_type", "application/octet-stream"),
+            prompt=_GENERIC_VISION_PROMPT,
+            response_schema=schema,
+        )
+    except Exception:  # pragma: no cover — extract_structured already guards
+        logger.exception("generic Vision extract raised (degrading to blanks)")
+        return {}
+    if not parsed or not isinstance(parsed, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in vision_keys:
+        val = str(parsed.get(key) or "").strip()
+        if val:
+            out[key] = val
+    logger.info("generic Vision extract | requested=%d filled=%d", len(vision_keys), len(out))
+    return out
+
+
+async def resolve_fill_data(
+    keys: list[str],
+    *,
+    profile: Optional[dict] = None,
+    case_meta: Optional[dict] = None,
+    license_name: Optional[str] = None,
+    documents: Optional[dict] = None,
+    run_vision: bool = True,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve a template's discovered placeholder keys to a fill-data map from
+    REAL sources only.
+
+    Given the discovered `keys` and the real data handles (person_profile
+    `profile` dict, `case_meta` from get_request_case_meta, resolved
+    `license_name`, in-session `documents`), classify each key and source it:
+      - PROFILE → person_profile.properties (deterministic)
+      - CASE    → case meta / licence name (deterministic)
+      - VISION  → ONE best-effort Gemini Vision pass over the docs (`run_vision`)
+      - BLANK   → never sourced (SIAP-issued or unresolvable)
+
+    Returns `(data, classes)`:
+      * `data`   — {key: value} with ONLY the keys that resolved to a NON-EMPTY
+        real value. Feed straight to fill_docx_placeholders; every absent key
+        renders as the blank fill line.
+      * `classes` — {key: source_class} for EVERY discovered key (for the
+        officer-facing filled-vs-blank note). A key present in `classes` but
+        absent from `data` is a blank the officer completes.
+
+    NEVER raises — a source miss just yields a blank for that key. No value is
+    ever fabricated: the resolver adds a key to `data` only after reading it from
+    a real source.
+    """
+    classes: dict[str, str] = {}
+    data: dict[str, str] = {}
+    vision_keys: list[str] = []
+
+    for key in keys:
+        cls = classify_placeholder_key(key)
+        classes[key] = cls
+        if cls == SOURCE_PROFILE:
+            val = _resolve_profile_value(key, profile or {})
+            if val:
+                data[key] = val
+        elif cls == SOURCE_CASE:
+            val = _resolve_case_value(key, case_meta, license_name)
+            if val:
+                data[key] = val
+        elif cls == SOURCE_VISION:
+            vision_keys.append(key)
+        # SOURCE_BLANK: deliberately not sourced.
+
+    if run_vision and vision_keys:
+        vision = await _extract_vision_fields(vision_keys, documents)
+        for key, val in vision.items():
+            if val:
+                data[key] = val
+
+    logger.info(
+        "resolve_fill_data | keys=%d profile=%d case=%d vision_req=%d filled=%d",
+        len(keys),
+        sum(1 for c in classes.values() if c == SOURCE_PROFILE),
+        sum(1 for c in classes.values() if c == SOURCE_CASE),
+        len(vision_keys),
+        len(data),
+    )
+    return data, classes
+
+
+async def render_output_docx(
+    *,
+    internal_filename: Optional[str],
+    profile: Optional[dict] = None,
+    case_meta: Optional[dict] = None,
+    license_name: Optional[str] = None,
+    documents: Optional[dict] = None,
+    ticket: Optional[str] = None,
+    out_prefix: str = "Dokumen",
+) -> Optional[tuple[bytes, str, dict[str, str], dict[str, str]]]:
+    """Generic output-template renderer for ANY licence.
+
+    Fetch the fillable `.docx` at `internal_filename`, DISCOVER its `[data.KEY]`
+    keys, resolve them from REAL sources (profile / case / Vision), fill, and
+    return `(docx_bytes, filename, data, classes)` where `data` is the map that
+    was filled and `classes` is the per-key source classification (both power
+    the officer's filled-vs-blank note). Returns None on any miss (disabled, no
+    template, not a .docx, 404, python-docx absent, fill error) so the caller
+    degrades gracefully. Never raises.
+    """
+    if not _ENABLED:
+        return None
+    if not internal_filename or not str(internal_filename).lower().endswith(".docx"):
+        logger.info("render_output_docx: template not a fillable .docx | file=%s",
+                    internal_filename)
+        return None
+
+    raw = await fetch_template_bytes(internal_filename)
+    if not raw:
+        return None
+
+    try:
+        keys = discover_placeholder_keys(raw)
+    except Exception:
+        logger.exception("render_output_docx: placeholder discovery failed")
+        return None
+
+    data, classes = await resolve_fill_data(
+        keys,
+        profile=profile,
+        case_meta=case_meta,
+        license_name=license_name,
+        documents=documents,
+    )
+
+    try:
+        filled = fill_docx_placeholders(raw, data)
+    except Exception:
+        logger.exception("render_output_docx: fill failed")
+        return None
+
+    safe_ticket = re.sub(r"\W", "", str(ticket or "")) or "draft"
+    safe_prefix = re.sub(r"\W+", "_", str(out_prefix or "Dokumen")).strip("_") or "Dokumen"
+    filename = f"{safe_prefix}_{safe_ticket}.docx"
+    return filled, filename, data, classes
+
+
 # ---------------------------------------------------------------------------
 # Hand-built DOCX for the legacy .doc Surat Permohonan PPKP (SIAP stores it as
 # .doc, which python-docx cannot open and we refuse to ship LibreOffice for).

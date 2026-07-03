@@ -220,75 +220,114 @@ class TestSendDocumentTool(unittest.TestCase):
 
 
 class TestDraftSkTool(unittest.TestCase):
-    """draft_sk — the officer deputy renders SIAP's PKPP approval-letter (SK)
-    template, queues the .docx for delivery, and narrates filled vs blank
-    fields. NOT confirmation-gated; degrades gracefully on every miss."""
+    """draft_sk (generalized, task #80) — the officer deputy selects the RIGHT
+    SIAP output template for the current step, fills it generically from REAL
+    data (profile + case + Vision), queues PDF + .docx, and narrates filled vs
+    blank fields. NOT confirmation-gated; degrades gracefully on every miss.
 
-    def _stub_siap_templates(self, *, rendered, data=None, pdf_view="_default"):
-        """Install a fake services.siap_templates whose build_sk_data returns
-        `data`, render_sk_docx returns `rendered` ((bytes, name) or None), and
-        render_pdf_view_from_docx returns `pdf_view`.
+    We stub the three real modules draft_sk resolves via `from services import
+    …`: siap_templates (render_output_docx + render_pdf_view_from_docx),
+    siap_tools (siap_get_step_output_template + siap_resolve_request_id), and
+    siap_db (get_person_profile_properties + get_request_case_meta +
+    get_license_name). Attributes are patched on the ALREADY-IMPORTED module
+    objects and restored after each run, so a sibling suite is not poisoned."""
 
-        `pdf_view` default "_default" mirrors the real PDF view path: it derives
-        a (pdf_bytes, "<stem>.pdf") tuple from whatever `rendered` produced, so a
-        successful .docx render also yields a PDF view copy (the P3 fix). Pass
-        `pdf_view=None` to simulate a PDF-render miss (ships .docx alone).
+    def _stub_modules(
+        self,
+        *,
+        template=None,          # siap_get_step_output_template return dict
+        rendered="_auto",       # render_output_docx return tuple / None
+        data=None,              # the {key: value} data map render "filled"
+        classes=None,          # the {key: source_class} classification
+        profile=None,           # get_person_profile_properties return dict
+        pdf_view="_default",    # render_pdf_view_from_docx return / None
+        docx_name="SK_000123456.docx",
+        docx_bytes=b"PK\x03\x04docxbytes",
+    ):
+        import services.siap_templates as st_mod
+        import services.siap_tools as stools_mod
+        import services.siap_db as sdb_mod
 
-        draft_sk resolves the module via `from services import siap_templates`,
-        which reads the ATTRIBUTE on the already-imported `services` package —
-        not sys.modules — so we patch both, and record the originals so
-        _run_draft can restore them (avoids poisoning a sibling suite that ran
-        the REAL siap_templates first, e.g. test_siap_templates in-process)."""
-        import services as _services_pkg
+        _data = dict(data if data is not None else {})
+        _classes = dict(classes if classes is not None else {})
+        _tmpl = template if template is not None else {
+            "found": True, "license_id": 459, "stereotype": "LICENSE-RECOMMEND",
+            "preferred_stereotype": "LICENSE-RECOMMEND", "fell_back": False,
+            "internal_filename": "master/ULID.docx", "doc_kind": "rekomendasi",
+            "file_name": "Surat PKPP V2.docx",
+        }
+        calls: dict = {}
 
-        mod = types.ModuleType("services.siap_templates")
-        _data = data if data is not None else {}
-
-        async def _build_sk_data(*, applicant_name, alamat, license_name, documents):
-            mod._build_args = {
-                "applicant_name": applicant_name, "alamat": alamat,
-                "license_name": license_name, "documents": documents,
+        # --- siap_tools ---
+        async def _step_template(license_id, *, is_final_step=False, step_stereotype=None):
+            calls["step_template"] = {
+                "license_id": license_id, "is_final_step": is_final_step,
+                "step_stereotype": step_stereotype,
             }
-            return dict(_data)
+            return dict(_tmpl)
 
-        async def _render_sk_docx(license_id, d, *, ticket=None):
-            mod._render_args = {"license_id": license_id, "ticket": ticket, "data": d}
+        async def _resolve_request_id(ticket):
+            calls["resolve_request_id"] = ticket
+            return 777
+
+        # --- siap_db ---
+        async def _get_profile(profile_id):
+            calls["get_profile"] = profile_id
+            return dict(profile if profile is not None else {})
+
+        async def _get_case_meta(request_id):
+            calls["get_case_meta"] = request_id
+            return {"found": True, "ticket": "000123456", "request_id": request_id}
+
+        async def _get_license_name(license_id):
+            calls["get_license_name"] = license_id
+            return "Pengadaan Kapal (Pembangunan)"
+
+        # --- siap_templates ---
+        async def _render_output_docx(*, internal_filename, profile, case_meta,
+                                       license_name, documents, ticket, out_prefix):
+            calls["render_output_docx"] = {
+                "internal_filename": internal_filename, "profile": profile,
+                "case_meta": case_meta, "license_name": license_name,
+                "documents": documents, "ticket": ticket, "out_prefix": out_prefix,
+            }
+            if rendered == "_auto":
+                fname = f"{out_prefix}_{(ticket or 'draft')}.docx"
+                return (docx_bytes, fname, _data, _classes)
             return rendered
 
-        def _render_pdf_view(docx_bytes, *, ticket=None):
-            mod._pdf_args = {"docx_bytes": docx_bytes, "ticket": ticket}
+        def _render_pdf_view(docx_bytes_in, *, ticket=None):
+            calls["pdf"] = {"docx_bytes": docx_bytes_in, "ticket": ticket}
             if pdf_view == "_default":
-                # Mirror the real path: a .docx render yields a PDF view copy.
-                if rendered is None:
-                    return None
-                _, docx_name = rendered
-                stem = docx_name.rsplit(".", 1)[0]
-                return b"%PDF-fake-view", f"{stem}.pdf"
+                return b"%PDF-fake-view", f"view_{ticket or 'draft'}.pdf"
             return pdf_view
 
-        mod.build_sk_data = _build_sk_data
-        mod.render_sk_docx = _render_sk_docx
-        mod.render_pdf_view_from_docx = _render_pdf_view
-        self._old_st_mod = sys.modules.get("services.siap_templates")
-        self._old_st_attr = getattr(_services_pkg, "siap_templates", None)
-        sys.modules["services.siap_templates"] = mod
-        setattr(_services_pkg, "siap_templates", mod)
-        return mod
+        # Record + patch.
+        self._patched = []
 
-    def _restore_siap_templates(self):
-        import services as _services_pkg
-        if getattr(self, "_old_st_mod", None) is not None:
-            sys.modules["services.siap_templates"] = self._old_st_mod
-        else:
-            sys.modules.pop("services.siap_templates", None)
-        if getattr(self, "_old_st_attr", None) is not None:
-            setattr(_services_pkg, "siap_templates", self._old_st_attr)
-        elif hasattr(_services_pkg, "siap_templates"):
-            delattr(_services_pkg, "siap_templates")
+        def _patch(mod, attr, value):
+            self._patched.append((mod, attr, getattr(mod, attr, None), hasattr(mod, attr)))
+            setattr(mod, attr, value)
 
-    def _run_draft(self, *, sk_ctx, doc_ctx=None, rendered=None, data=None,
-                   pdf_view="_default"):
-        self._stub_siap_templates(rendered=rendered, data=data, pdf_view=pdf_view)
+        _patch(stools_mod, "siap_get_step_output_template", _step_template)
+        _patch(stools_mod, "siap_resolve_request_id", _resolve_request_id)
+        _patch(sdb_mod, "get_person_profile_properties", _get_profile)
+        _patch(sdb_mod, "get_request_case_meta", _get_case_meta)
+        _patch(sdb_mod, "get_license_name", _get_license_name)
+        _patch(st_mod, "render_output_docx", _render_output_docx)
+        _patch(st_mod, "render_pdf_view_from_docx", _render_pdf_view)
+        return calls
+
+    def _restore(self):
+        for mod, attr, old, existed in reversed(getattr(self, "_patched", [])):
+            if existed:
+                setattr(mod, attr, old)
+            elif hasattr(mod, attr):
+                delattr(mod, attr)
+        self._patched = []
+
+    def _run_draft(self, *, sk_ctx, doc_ctx=None, **stub_kwargs):
+        self._stub_modules(**stub_kwargs)
         sk_token = oc._sk_context.set(sk_ctx)
         doc_token = oc._doc_context.set(doc_ctx)
         queue: list = []
@@ -299,7 +338,7 @@ class TestDraftSkTool(unittest.TestCase):
             oc._sk_context.reset(sk_token)
             oc._doc_context.reset(doc_token)
             oc._docs_to_send_context.reset(send_token)
-            self._restore_siap_templates()
+            self._restore()
         return out, queue
 
     def _sk_ctx(self):
@@ -307,67 +346,68 @@ class TestDraftSkTool(unittest.TestCase):
             "license_id": 459, "ticket": "000123456",
             "license_name": "Pengadaan Kapal (Pembangunan)",
             "applicant_name": "CASMO", "alamat": "Jl. Laut No. 1",
+            "profile_id": 42, "is_final_step": False,
+            "step_stereotype": "SURVEY-LAPANGAN",
         }
 
     def test_renders_and_queues_docx_with_filled_and_blank_report(self):
-        # 3 identity fields filled, the rest blank → BOTH the editable .docx and
-        # a read-only PDF view copy (P3) are queued inline, and the note reports
-        # both field sets.
+        # 3 fields filled from real sources, 2 blank → BOTH the editable .docx
+        # and a read-only PDF view copy are queued inline, and the note reports
+        # both field sets — using DISCOVERED keys, not a fixed 16-key list.
         data = {"nama_pemohon": "CASMO", "alamat": "Jl. Laut No. 1",
                 "jenis_pengadaan": "Pembangunan"}
+        classes = {
+            "nama_pemohon": "profile", "alamat": "profile",
+            "jenis_pengadaan": "case", "nama_kapal": "vision",
+            "no_ppkp": "blank",
+        }
         out, queue = self._run_draft(
-            sk_ctx=self._sk_ctx(),
-            rendered=(b"PK\x03\x04docxbytes", "SK_PPKP_000123456.docx"),
-            data=data,
-        )
-        # Queued as INLINE dicts (generated bytes), not file_id strings: the
-        # .docx (edit copy) plus the .pdf (read/preview copy).
+            sk_ctx=self._sk_ctx(), data=data, classes=classes)
+        # Queued as INLINE dicts (generated bytes): the .docx + the .pdf.
         self.assertEqual(len(queue), 2)
         self.assertTrue(all(isinstance(q, dict) for q in queue))
+        names = {q["filename"] for q in queue}
+        self.assertIn("Rekomtek_000123456.docx", names)
+        self.assertIn("Rekomtek_000123456.pdf", names)
         by_name = {q["filename"]: q for q in queue}
-        self.assertIn("SK_PPKP_000123456.docx", by_name)
-        self.assertIn("SK_PPKP_000123456.pdf", by_name)
-        self.assertEqual(by_name["SK_PPKP_000123456.docx"]["content"], b"PK\x03\x04docxbytes")
         self.assertEqual(
-            by_name["SK_PPKP_000123456.docx"]["mime_type"],
+            by_name["Rekomtek_000123456.docx"]["mime_type"],
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
-        self.assertEqual(by_name["SK_PPKP_000123456.pdf"]["mime_type"], "application/pdf")
+        self.assertEqual(by_name["Rekomtek_000123456.pdf"]["mime_type"], "application/pdf")
         self.assertIn("docx", out.lower())
         self.assertIn("pdf", out.lower())
         # Filled fields surfaced (human labels).
         self.assertIn("Nama Pemohon", out)
         self.assertIn("Jenis Pengadaan", out)
-        # Blank fields also surfaced so the officer completes them.
+        # Blank fields also surfaced so the officer completes them (a discovered
+        # key with no curated label is Title-Cased).
         self.assertIn("Nama Kapal", out)
         self.assertIn("No. PPKP", out)
-        # It never claims to ISSUE the SK — the deputy drafts + recommends.
+        # It never claims to ISSUE the doc — the deputy drafts + recommends.
         self.assertIn("TTE", out)
-        # P3: the note states the draft is NOT in SIAP (kills the hallucination).
+        # The note states the draft is NOT in SIAP (kills the hallucination).
         self.assertIn("tidak tersimpan di SIAP", out)
 
     def test_pdf_view_render_miss_ships_docx_alone(self):
-        # If the PDF view render misses (fpdf2 absent / render error), the tool
-        # still ships the editable .docx and never dead-ends.
         data = {"nama_pemohon": "CASMO"}
+        classes = {"nama_pemohon": "profile"}
         out, queue = self._run_draft(
-            sk_ctx=self._sk_ctx(),
-            rendered=(b"PKxx", "SK_PPKP_000123456.docx"),
-            data=data,
-            pdf_view=None,
-        )
+            sk_ctx=self._sk_ctx(), data=data, classes=classes, pdf_view=None)
         self.assertEqual(len(queue), 1)
-        self.assertEqual(queue[0]["filename"], "SK_PPKP_000123456.docx")
+        self.assertTrue(queue[0]["filename"].endswith(".docx"))
         self.assertIn("docx", out.lower())
-        # Honest recovery wording present even without a PDF copy.
         self.assertIn("word", out.lower())
         self.assertIn("tidak tersimpan di SIAP", out)
 
-    def test_passes_case_context_to_builder(self):
-        # Capture the module reference so we can assert what the tool handed the
-        # builder/renderer (the deputy must thread licence + identity + docs).
-        m = self._stub_siap_templates(
-            rendered=(b"PKxx", "n.docx"), data={"nama_pemohon": "CASMO"})
+    def test_grounds_on_real_profile_and_case(self):
+        # The deputy must thread the REAL data handles into the generic renderer:
+        # profile_id → profile props, ticket → request_id → case meta, plus docs.
+        calls = self._stub_modules(
+            data={"nama_pemohon": "CASMO"},
+            classes={"nama_pemohon": "profile"},
+            profile={"full_name": "CASMO", "address": "Jl. Laut No. 1"},
+        )
         sk_token = oc._sk_context.set(self._sk_ctx())
         doc_token = oc._doc_context.set(
             {"doc-1": {"content": b"x", "mime_type": "application/pdf"}})
@@ -378,14 +418,72 @@ class TestDraftSkTool(unittest.TestCase):
             oc._sk_context.reset(sk_token)
             oc._doc_context.reset(doc_token)
             oc._docs_to_send_context.reset(send_token)
-            self._restore_siap_templates()
-        self.assertEqual(m._build_args["applicant_name"], "CASMO")
-        self.assertEqual(m._build_args["alamat"], "Jl. Laut No. 1")
-        self.assertEqual(m._build_args["license_name"], "Pengadaan Kapal (Pembangunan)")
-        # The in-session doc bytes are handed to the builder for the Vision pass.
-        self.assertIn("doc-1", m._build_args["documents"])
-        self.assertEqual(m._render_args["license_id"], 459)
-        self.assertEqual(m._render_args["ticket"], "000123456")
+            self._restore()
+        # Per-step template lookup keyed on license + step signals.
+        self.assertEqual(calls["step_template"]["license_id"], 459)
+        self.assertEqual(calls["step_template"]["is_final_step"], False)
+        self.assertEqual(calls["step_template"]["step_stereotype"], "SURVEY-LAPANGAN")
+        # Real profile read by profile_id.
+        self.assertEqual(calls["get_profile"], 42)
+        # Case meta resolved from the ticket.
+        self.assertEqual(calls["resolve_request_id"], "000123456")
+        # The generic renderer received the real profile + docs.
+        r = calls["render_output_docx"]
+        self.assertEqual(r["profile"]["full_name"], "CASMO")
+        self.assertIn("doc-1", r["documents"])
+        self.assertEqual(r["internal_filename"], "master/ULID.docx")
+
+    def test_final_step_selects_sk_and_reports_kind(self):
+        # At the signing desk (is_final_step) the tool asks for the SK template
+        # and narrates it as a Surat Keputusan.
+        ctx = self._sk_ctx()
+        ctx["is_final_step"] = True
+        ctx["step_stereotype"] = "TTE"
+        calls = self._stub_modules(
+            template={
+                "found": True, "license_id": 459, "stereotype": "LICENSE-SK",
+                "preferred_stereotype": "LICENSE-SK", "fell_back": False,
+                "internal_filename": "master/SK.docx", "doc_kind": "sk",
+            },
+            data={"nama_pemohon": "CASMO"},
+            classes={"nama_pemohon": "profile"},
+        )
+        sk_token = oc._sk_context.set(ctx)
+        send_token = oc._docs_to_send_context.set([])
+        try:
+            out = _run(oc.draft_sk())
+        finally:
+            oc._sk_context.reset(sk_token)
+            oc._docs_to_send_context.reset(send_token)
+            self._restore()
+        self.assertEqual(calls["step_template"]["is_final_step"], True)
+        self.assertIn("Surat Keputusan", out)
+
+    def test_fallback_stereotype_reported_honestly(self):
+        # Step wants SK but only a fillable Rekomendasi exists → the note says
+        # so, rather than silently drafting the wrong doc.
+        calls = self._stub_modules(
+            template={
+                "found": True, "license_id": 507, "stereotype": "LICENSE-RECOMMEND",
+                "preferred_stereotype": "LICENSE-SK", "fell_back": True,
+                "internal_filename": "master/REK.docx", "doc_kind": "rekomendasi",
+            },
+            data={"nama_pemohon": "CASMO"},
+            classes={"nama_pemohon": "profile"},
+        )
+        ctx = self._sk_ctx()
+        ctx["is_final_step"] = True
+        sk_token = oc._sk_context.set(ctx)
+        send_token = oc._docs_to_send_context.set([])
+        try:
+            out = _run(oc.draft_sk())
+        finally:
+            oc._sk_context.reset(sk_token)
+            oc._docs_to_send_context.reset(send_token)
+            self._restore()
+        self.assertIn("Rekomendasi", out)
+        # The honest fallback note is present.
+        self.assertIn("sebetulnya menghasilkan", out.lower())
 
     def test_no_sk_context_degrades_not_dead_end(self):
         sk_token = oc._sk_context.set(None)
@@ -402,18 +500,42 @@ class TestDraftSkTool(unittest.TestCase):
     def test_no_license_id_degrades(self):
         ctx = self._sk_ctx()
         ctx["license_id"] = None
-        out, queue = self._run_draft(sk_ctx=ctx, rendered=None)
+        out, queue = self._run_draft(sk_ctx=ctx)
         self.assertEqual(queue, [])
         self.assertIn("license_id", out.lower())
 
-    def test_render_none_reports_template_unavailable(self):
-        # Template 404 / not synced → render_sk_docx None → honest message,
-        # nothing queued, never a crash.
+    def test_template_not_found_reports_unavailable(self):
+        # No output template for the licence → honest message, nothing queued.
         out, queue = self._run_draft(
-            sk_ctx=self._sk_ctx(), rendered=None, data={"nama_pemohon": "CASMO"})
+            sk_ctx=self._sk_ctx(),
+            template={"found": False, "note": "no template"},
+        )
         self.assertEqual(queue, [])
         self.assertIn("template", out.lower())
-        self.assertIn("tte", out.lower())
+
+    def test_render_none_reports_template_unavailable(self):
+        # render_output_docx None (404 / not synced) → honest message, nothing
+        # queued, never a crash.
+        out, queue = self._run_draft(
+            sk_ctx=self._sk_ctx(), rendered=None,
+            data={"nama_pemohon": "CASMO"}, classes={"nama_pemohon": "profile"})
+        self.assertEqual(queue, [])
+        self.assertIn("template", out.lower())
+
+    def test_non_docx_template_reports_not_fillable(self):
+        # Template exists but is a legacy .doc/.rtf (or ${key} SK docx) → the
+        # tool says it can't fill it automatically, never drafts an empty doc.
+        out, queue = self._run_draft(
+            sk_ctx=self._sk_ctx(),
+            template={
+                "found": True, "license_id": 25, "stereotype": "LICENSE-SK",
+                "preferred_stereotype": "LICENSE-SK", "fell_back": False,
+                "internal_filename": "master/LEGACY.rtf", "doc_kind": "sk",
+            },
+        )
+        self.assertEqual(queue, [])
+        low = out.lower()
+        self.assertIn("belum dalam format", low)
 
 
 class TestDraftSkWiring(unittest.TestCase):

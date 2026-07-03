@@ -291,6 +291,14 @@ class OfficerCaseSession:
     request_id: Optional[int] = None
     license_id: Optional[int] = None
     license_name: Optional[str] = None
+    # The applicant's SIAP profile id — the authoritative source for the generic
+    # output-doc fill engine's APPLICANT-identity placeholders (nama_pemohon,
+    # alamat, nik, …) read from ptsp.person_profile.properties. Carried so
+    # draft_sk can ground identity on real profile columns for ANY licence.
+    profile_id: Optional[int] = None
+    # The current step's own `stereotype` (TTE / SURVEY-LAPANGAN / …) — a
+    # secondary signal for per-step output-template selection (Rekomtek vs SK).
+    step_stereotype: Optional[str] = None
     # Applicant identity for the SK draft (draft_sk). The officer is authorized
     # to see these; they go into the SK docx but are NEVER logged / masked here.
     applicant_name: Optional[str] = None
@@ -397,6 +405,8 @@ def _encode_officer_session(sess: OfficerCaseSession) -> str:
         "request_id": sess.request_id,
         "license_id": sess.license_id,
         "license_name": sess.license_name,
+        "profile_id": sess.profile_id,
+        "step_stereotype": sess.step_stereotype,
         "applicant_name": sess.applicant_name,
         "alamat": sess.alamat,
         "validation": sess.validation,
@@ -431,6 +441,8 @@ def _decode_officer_session(blob: str) -> OfficerCaseSession:
         request_id=raw.get("request_id"),
         license_id=raw.get("license_id"),
         license_name=raw.get("license_name"),
+        profile_id=raw.get("profile_id"),
+        step_stereotype=raw.get("step_stereotype"),
         applicant_name=raw.get("applicant_name"),
         alamat=raw.get("alamat"),
         validation=raw.get("validation"),
@@ -867,7 +879,9 @@ async def load_case_from_siap(
         request_id=int(request_id),
         license_id=meta.get("license_id"),
         license_name=None,          # not needed for the copilot's SIAP tools
-        applicant_name=None,        # copilot reads identity from docs, grounded
+        profile_id=meta.get("profile_id"),  # grounds draft_sk identity on profile
+        step_stereotype=meta.get("stereotype"),  # per-step template selection
+        applicant_name=None,        # copilot reads identity from profile, grounded
         alamat=None,
         validation=None,            # SIAP holds no BIMA score
         documents=documents,
@@ -1379,6 +1393,12 @@ async def maybe_handle_officer_reply(
                 "license_name": sess.license_name,
                 "applicant_name": sess.applicant_name,
                 "alamat": sess.alamat,
+                # Generic step-aware output-doc drafting: profile_id grounds the
+                # applicant-identity placeholders on the REAL person_profile;
+                # is_final_step + step_stereotype select Rekomtek vs SK.
+                "profile_id": sess.profile_id,
+                "is_final_step": sess.is_final_step,
+                "step_stereotype": sess.step_stereotype,
             },
         )
     except Exception:
