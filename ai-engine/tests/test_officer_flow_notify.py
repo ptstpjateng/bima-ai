@@ -90,8 +90,17 @@ class _FakeConn:
         self.s = scenario
 
     async def fetchrow(self, sql, *args):
+        # get_request_case_meta reads license_request (profile_id/license_id/
+        # approval_step_id/ticket) — distinguish from resolve_step_officers'
+        # request query by the selected `profile_id` column.
+        if "FROM ptsp.license_request" in sql and "profile_id" in sql:
+            return self.s.get("case_request_row")
         if "FROM ptsp.license_request" in sql:
             return self.s.get("request_row")
+        # get_request_case_meta's step+max query (CROSS JOIN LATERAL) vs
+        # resolve_step_officers' plain approval-step query.
+        if "FROM ptsp.license_approval_step" in sql and "max_sort_order" in sql:
+            return self.s.get("step_max_row")
         if "FROM ptsp.license_approval_step" in sql:
             return self.s.get("step_row")
         if "FROM public.roles" in sql:
@@ -101,6 +110,8 @@ class _FakeConn:
     async def fetch(self, sql, *args):
         if "FROM scmcoresystem.tblroleizin" in sql:
             return self.s.get("officer_rows", [])
+        if "FROM ptsp.profile_requirements" in sql:
+            return self.s.get("doc_rows", [])
         if "FROM public.users u" in sql:  # officer directory
             return self.s.get("directory_rows", [])
         raise AssertionError(f"unexpected fetch SQL: {sql[:60]}")
@@ -540,6 +551,109 @@ class TestOfficerCacheWarm(unittest.TestCase):
             _run(ob.warm_officer_cache())  # must not raise
         # Last-known set preserved.
         self.assertEqual(ob._officer_cache, {"6285117557091"})
+
+
+# ---------------------------------------------------------------------------
+# SIAP-grounded case reads (get_request_case_meta / get_submission_doc_refs)
+# ---------------------------------------------------------------------------
+
+
+class TestRequestCaseMeta(unittest.TestCase):
+    def test_resolves_step_and_flags_final(self):
+        scenario = {
+            "case_request_row": {
+                "profile_id": 321, "license_id": 459,
+                "approval_step_id": 5099, "ticket": "000077591",
+            },
+            # current sort_order == max → LAST step
+            "step_max_row": {
+                "current_sort_order": 4, "group_id": 12,
+                "stereotype": "LICENSE-RECOMMEND", "max_sort_order": 4,
+            },
+            "role_row": {"name": "Kepala Dinas"},
+        }
+        with _install_pool(scenario):
+            out = _run(siap_db.get_request_case_meta(900))
+        self.assertTrue(out["found"])
+        self.assertEqual(out["profile_id"], 321)
+        self.assertEqual(out["license_id"], 459)
+        self.assertEqual(out["ticket"], "000077591")
+        self.assertTrue(out["is_final_step"])
+        self.assertEqual(out["owner_desk"], "Kepala Dinas")
+        self.assertEqual(out["stereotype"], "LICENSE-RECOMMEND")
+
+    def test_intermediate_step_is_not_final(self):
+        scenario = {
+            "case_request_row": {
+                "profile_id": 1, "license_id": 459,
+                "approval_step_id": 5001, "ticket": "000000123",
+            },
+            "step_max_row": {
+                "current_sort_order": 1, "group_id": 6,
+                "stereotype": None, "max_sort_order": 4,
+            },
+            "role_row": {"name": "Petugas SKPD"},
+        }
+        with _install_pool(scenario):
+            out = _run(siap_db.get_request_case_meta(901))
+        self.assertTrue(out["found"])
+        self.assertFalse(out["is_final_step"])
+
+    def test_missing_request_returns_safe_empty(self):
+        scenario = {"case_request_row": None}
+        with _install_pool(scenario):
+            out = _run(siap_db.get_request_case_meta(902))
+        self.assertFalse(out["found"])
+        self.assertIsNone(out["ticket"])
+
+    def test_unconfigured_db_returns_empty(self):
+        with patch.object(siap_db, "is_siap_db_configured", lambda: False):
+            out = _run(siap_db.get_request_case_meta(1))
+        self.assertFalse(out["found"])
+
+    def test_db_error_never_raises(self):
+        broken = AsyncMock(side_effect=RuntimeError("siap down"))
+        with patch.multiple(
+            siap_db,
+            is_siap_db_configured=lambda: True,
+            get_siap_pool=broken,
+        ):
+            out = _run(siap_db.get_request_case_meta(5))
+        self.assertFalse(out["found"])
+
+
+class TestSubmissionDocRefs(unittest.TestCase):
+    def test_returns_only_rows_with_a_file(self):
+        scenario = {
+            "doc_rows": [
+                {"requirements_id": 10, "file_ref": "berkas/ktp.pdf",
+                 "req_status": "OK", "requirement_name": "Fotokopi KTP"},
+                # A blank file_ref must be dropped (SQL guards, but the loader
+                # also strips defensively).
+                {"requirements_id": 11, "file_ref": "  ",
+                 "req_status": None, "requirement_name": "NIB"},
+            ],
+        }
+        with _install_pool(scenario):
+            out = _run(siap_db.get_submission_doc_refs(321))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["requirement_name"], "Fotokopi KTP")
+        self.assertEqual(out[0]["file_ref"], "berkas/ktp.pdf")
+
+    def test_empty_when_no_docs(self):
+        with _install_pool({"doc_rows": []}):
+            out = _run(siap_db.get_submission_doc_refs(321))
+        self.assertEqual(out, [])
+
+    def test_db_error_never_raises(self):
+        broken = AsyncMock(side_effect=RuntimeError("down"))
+        with patch.multiple(
+            siap_db,
+            is_siap_db_configured=lambda: True,
+            get_siap_pool=broken,
+        ):
+            out = _run(siap_db.get_submission_doc_refs(321))
+        self.assertEqual(out, [])
 
 
 if __name__ == "__main__":

@@ -403,3 +403,222 @@ def _normalize_msisdn(raw: Optional[str]) -> str:
     if digits.startswith("62"):
         return digits
     return "62" + digits
+
+
+# ===========================================================================
+# SIAP-grounded case loading ([[BIMA Multi-step Officer Copilot]])
+#
+# The multi-step officer copilot must let ANY next-step officer read ALL the
+# submission documents and ALL the prior-step notes for a request STRAIGHT FROM
+# SIAP — not from the citizen's in-memory session (which only the FIRST officer
+# ever saw). These reads assemble that case context.
+#
+# Submission-doc join (confirmed against [[SIAP API Inventory]] §Half-2):
+#   ptsp.license_request (request_id PK) --profile_id--> ptsp.person_profile
+#   ptsp.profile_requirements (keyed by profile_id) holds the applicant's
+#     per-requirement uploads: `profile_requirements_files` is the storage key
+#     (served at {SIAP_STORAGE_BASE}/storage/<file>), `requirements_id` links to
+#     ptsp.requirements.name (the human requirement label, e.g. "Fotokopi KTP").
+# So a request's uploaded docs are: request → profile_id → profile_requirements
+#   JOIN requirements. The bytes are fetched on demand from Beta storage by
+#   services.siap_templates.fetch_submission_file_bytes.
+#
+# Step / last-step detection:
+#   The request's CURRENT step is license_request.approval_step_id. Its
+#   sort_order + the MAX(sort_order) across the license's steps tell us whether
+#   this is the LAST (SK-signing / Kepala Dinas) desk. A `stereotype` on the
+#   step (e.g. LICENSE-RECOMMEND / a signing marker) is captured too when
+#   present — the exact terminal marker is environment-specific, so we treat
+#   "current sort_order == max sort_order" as the authoritative last-step signal
+#   and expose stereotype as a secondary hint.
+#
+# Failure model: NEVER raise. Every function returns a safe empty/None result
+# on any error / unconfigured SIAP DB so a SIAP hiccup degrades the officer
+# surface to an honest "tidak tersedia di SIAP" rather than crashing a reply.
+# PII (file names / applicant fields) is never logged.
+# ===========================================================================
+
+# request_id → (profile_id, license_id, approval_step_id, ticket)
+_SQL_REQUEST_CASE = """
+    SELECT profile_id,
+           license_id,
+           approval_step_id,
+           properties ->> 'ticket' AS ticket
+      FROM ptsp.license_request
+     WHERE request_id = $1
+     LIMIT 1
+"""
+
+# All requirement uploads for an applicant profile. `profile_requirements_files`
+# is the storage key (may be a bare file name or a relative path); we return it
+# raw and let the fetch layer sanitise. `requirements.name` is the human label
+# the officer recognises ("Fotokopi KTP", "NIB"). Rows with no file are dropped
+# by the caller (a requirement can exist unfulfilled).
+_SQL_PROFILE_REQUIREMENT_FILES = """
+    SELECT pr.requirements_id,
+           pr.profile_requirements_files AS file_ref,
+           pr.status AS req_status,
+           r.name AS requirement_name
+      FROM ptsp.profile_requirements pr
+      LEFT JOIN ptsp.requirements r
+             ON r.requirements_id = pr.requirements_id
+     WHERE pr.profile_id = $1
+       AND pr.profile_requirements_files IS NOT NULL
+       AND btrim(pr.profile_requirements_files) <> ''
+     ORDER BY pr.requirements_id
+"""
+
+# The request's current step (sort_order/group_id/stereotype) PLUS the maximum
+# sort_order across the whole license's workflow, so the caller can decide if
+# the current step is the LAST one. Two params: approval_step_id, license_id.
+_SQL_STEP_WITH_MAX = """
+    SELECT s.sort_order        AS current_sort_order,
+           s.group_id          AS group_id,
+           s.stereotype        AS stereotype,
+           mx.max_sort_order   AS max_sort_order
+      FROM ptsp.license_approval_step s
+      CROSS JOIN LATERAL (
+            SELECT MAX(sort_order) AS max_sort_order
+              FROM ptsp.license_approval_step
+             WHERE license_id = $2
+      ) mx
+     WHERE s.approval_step_id = $1
+     LIMIT 1
+"""
+
+
+def _empty_case_meta() -> dict:
+    """Safe default when the request/step cannot be read from SIAP."""
+    return {
+        "found": False,
+        "request_id": None,
+        "profile_id": None,
+        "license_id": None,
+        "approval_step_id": None,
+        "ticket": None,
+        "current_sort_order": None,
+        "max_sort_order": None,
+        "is_final_step": False,
+        "group_id": None,
+        "stereotype": None,
+        "owner_desk": None,
+    }
+
+
+async def get_request_case_meta(request_id: int) -> dict:
+    """Resolve a request's identity + step position from SIAP.
+
+    Returns a dict (see `_empty_case_meta`) with `found`, the profile/license/
+    step ids, the SIAP `ticket`, the current step's `sort_order`/`stereotype`/
+    owning `group_id`, the license's `max_sort_order`, and a derived
+    `is_final_step` (current_sort_order == max_sort_order). NEVER raises — a
+    miss / DB error returns the safe empty meta so the caller degrades to an
+    honest "not in SIAP" reply. PII is never logged.
+    """
+    result = _empty_case_meta()
+    if not is_siap_db_configured():
+        logger.info("get_request_case_meta: SIAP DB not configured | request_id=%s", request_id)
+        return result
+    try:
+        rid = int(request_id)
+    except (TypeError, ValueError):
+        logger.warning("get_request_case_meta: bad request_id=%r", request_id)
+        return result
+
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            req = await conn.fetchrow(_SQL_REQUEST_CASE, rid)
+            if req is None:
+                logger.info("get_request_case_meta: request not found | request_id=%s", rid)
+                return result
+            result["request_id"] = rid
+            result["profile_id"] = req["profile_id"]
+            result["license_id"] = req["license_id"]
+            result["approval_step_id"] = req["approval_step_id"]
+            result["ticket"] = req["ticket"]
+
+            step_id = req["approval_step_id"]
+            license_id = req["license_id"]
+            if step_id is not None and license_id is not None:
+                step = await conn.fetchrow(_SQL_STEP_WITH_MAX, step_id, license_id)
+                if step is not None:
+                    cur = step["current_sort_order"]
+                    mx = step["max_sort_order"]
+                    result["current_sort_order"] = cur
+                    result["max_sort_order"] = mx
+                    result["group_id"] = step["group_id"]
+                    result["stereotype"] = step["stereotype"]
+                    # Authoritative last-step signal: the current desk is the
+                    # one with the highest sort_order in the license's workflow.
+                    result["is_final_step"] = (
+                        cur is not None and mx is not None and cur >= mx
+                    )
+                    if step["group_id"] is not None:
+                        role = await conn.fetchrow(_SQL_ROLE_NAME, step["group_id"])
+                        result["owner_desk"] = (role["name"] if role else None)
+            result["found"] = True
+
+        logger.info(
+            "get_request_case_meta | request_id=%s license_id=%s step=%s "
+            "sort=%s/%s final=%s stereotype=%s",
+            rid, result["license_id"], result["approval_step_id"],
+            result["current_sort_order"], result["max_sort_order"],
+            result["is_final_step"], result["stereotype"],
+        )
+        return result
+    except Exception:  # pragma: no cover — defensive; never break the officer path
+        logger.exception("get_request_case_meta failed (returning empty) | request_id=%s", rid)
+        return _empty_case_meta()
+
+
+async def get_submission_doc_refs(profile_id: int) -> list[dict]:
+    """Return the applicant's uploaded requirement files from SIAP.
+
+    Each entry: {"requirements_id", "requirement_name", "file_ref", "status"}
+    where `file_ref` is the storage key (fetched by
+    services.siap_templates.fetch_submission_file_bytes). NEVER raises — returns
+    [] on any error / unconfigured DB. File names are NOT logged (they may echo
+    the applicant's name); only the count is.
+
+    SCOPING LIMITATION (known): ptsp.profile_requirements is keyed by
+    profile_id + requirements_id ONLY — it has NO request_id/approval_step_id
+    column — so these files are pooled per APPLICANT, not per request. For a
+    citizen who filed more than one license request, this returns every
+    requirement file on the profile, which may include a different request's
+    attachments (this mirrors SIAP's own per-profile requirement model). It is
+    NOT an issue for BIMA-created requests: those carry their docs behind the
+    per-request document API (siap_document_client), and profile_requirements is
+    empty for them — the officer loader's source (b) is request-scoped and
+    authoritative there. Tightening source (a) to a request would require
+    joining the license's applicable requirements (license_requirements by
+    license_id); tracked as a follow-up, not done here.
+    """
+    if not is_siap_db_configured():
+        logger.info("get_submission_doc_refs: SIAP DB not configured | profile_id=%s", profile_id)
+        return []
+    try:
+        pid = int(profile_id)
+    except (TypeError, ValueError):
+        logger.warning("get_submission_doc_refs: bad profile_id=%r", profile_id)
+        return []
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_PROFILE_REQUIREMENT_FILES, pid)
+        docs: list[dict] = []
+        for r in rows:
+            file_ref = (r["file_ref"] or "").strip()
+            if not file_ref:
+                continue
+            docs.append({
+                "requirements_id": r["requirements_id"],
+                "requirement_name": (r["requirement_name"] or "").strip() or None,
+                "file_ref": file_ref,
+                "status": r["req_status"],
+            })
+        logger.info("get_submission_doc_refs | profile_id=%s docs=%d", pid, len(docs))
+        return docs
+    except Exception:  # pragma: no cover — defensive
+        logger.exception("get_submission_doc_refs failed (returning empty) | profile_id=%s", pid)
+        return []

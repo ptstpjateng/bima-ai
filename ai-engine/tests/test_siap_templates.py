@@ -13,6 +13,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -394,6 +395,59 @@ class TestRenderSkDocx(unittest.IsolatedAsyncioTestCase):
         finally:
             self._unpatch()
         self.assertIsNone(res)
+
+
+@unittest.skipUnless(_DEPS_OK, "python-docx/httpx not installed")
+class TestFetchSubmissionFileBytes(unittest.IsolatedAsyncioTestCase):
+    """fetch_submission_file_bytes — officer copilot pulls a citizen upload from
+    Beta storage, reusing the hardened fetch_template_bytes GET. Verifies the
+    verbatim-then-prefixed candidate order and graceful None on total miss."""
+
+    async def test_verbatim_hit_returns_bytes_without_prefix_attempt(self):
+        seen: list[str] = []
+
+        async def fake_fetch(path):
+            seen.append(path)
+            return b"PDFDATA"  # first candidate hits
+
+        with patch.object(st, "fetch_template_bytes", new=fake_fetch):
+            out = await st.fetch_submission_file_bytes("berkas/2026/ktp.pdf")
+        self.assertEqual(out, b"PDFDATA")
+        # Verbatim tried first; a hit short-circuits before the prefixed one.
+        self.assertEqual(seen, ["berkas/2026/ktp.pdf"])
+
+    async def test_falls_back_to_public_prefix_on_first_miss(self):
+        seen: list[str] = []
+
+        async def fake_fetch(path):
+            seen.append(path)
+            return b"OK" if path.startswith("app/public/") else None
+
+        with patch.object(st, "fetch_template_bytes", new=fake_fetch):
+            out = await st.fetch_submission_file_bytes("berkas/x.pdf")
+        self.assertEqual(out, b"OK")
+        self.assertEqual(seen, ["berkas/x.pdf", "app/public/berkas/x.pdf"])
+
+    async def test_none_when_all_candidates_miss(self):
+        async def fake_fetch(path):
+            return None
+
+        with patch.object(st, "fetch_template_bytes", new=fake_fetch):
+            out = await st.fetch_submission_file_bytes("berkas/gone.pdf")
+        self.assertIsNone(out)
+
+    async def test_empty_ref_returns_none_without_fetch(self):
+        called = False
+
+        async def fake_fetch(path):
+            nonlocal called
+            called = True
+            return b"x"
+
+        with patch.object(st, "fetch_template_bytes", new=fake_fetch):
+            out = await st.fetch_submission_file_bytes("")
+        self.assertIsNone(out)
+        self.assertFalse(called)
 
 
 if __name__ == "__main__":

@@ -221,6 +221,7 @@ class _GuidedFlowBase(unittest.TestCase):
     def setUp(self):
         gs._sessions.clear()
         gs._debounce_tasks.clear()
+        gs._upload_tasks.clear()
         os.environ["BIMA_GUIDED_SUBMISSION_ENABLED"] = "true"
         os.environ["GUIDED_SUBMISSION_PROFILE_ID"] = "7"
         os.environ["GUIDED_SUBMISSION_DEMO_PACKET"] = ""
@@ -229,6 +230,7 @@ class _GuidedFlowBase(unittest.TestCase):
     def tearDown(self):
         gs._sessions.clear()
         gs._debounce_tasks.clear()
+        gs._upload_tasks.clear()
         for k in ("BIMA_GUIDED_SUBMISSION_ENABLED", "GUIDED_SUBMISSION_PROFILE_ID",
                   "GUIDED_SUBMISSION_DEMO_PACKET", "GUIDED_SUBMISSION_DEBOUNCE_SECONDS"):
             os.environ.pop(k, None)
@@ -510,6 +512,131 @@ class TestDegradeGracefully(_GuidedFlowBase):
             r = _run(gs.maybe_handle(uid, "ya"))
         self.assertIn("belum aktif", r)
         self.assertIn("belum terkirim", r)
+
+
+class TestBestEffortDocUpload(_GuidedFlowBase):
+    """After a successful submit, the citizen's docs are pushed to SIAP via the
+    document client — STRICTLY best-effort and now FIRE-AND-FORGET: the citizen's
+    success reply returns WITHOUT awaiting the upload (a slow SIAP can't stall the
+    WhatsApp confirmation), the upload never changes / fails the submit result,
+    exceptions are swallowed, and a not-configured client is a silent no-op.
+
+    Because the upload is detached via `asyncio.create_task`, these tests drive
+    the final AFFIRM submit AND drain the spawned `_upload_tasks` inside ONE event
+    loop (a bare `_run` would close its loop before the task ever ran). The base
+    setUp/tearDown already clear `_upload_tasks`.
+    """
+
+    async def _drain_upload_tasks(self):
+        """Await every detached doc-upload task so post-reply assertions can see
+        the upload's effect. Mirrors what the real event loop does after the
+        handler returns — the citizen reply is NOT gated on this."""
+        # Copy: the done-callback discards from the live set as tasks finish.
+        pending = list(gs._upload_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _submit_with_doc_client(self, uid, doc_client, *, request_id=555,
+                                ticket="000088002", drain=True):
+        """Drive uid to CONFIRM, then AFFIRM-submit with the submission client
+        succeeding and `doc_client` installed as the document client. Returns
+        (reply, reply_before_drain_upload_await_count). When `drain` is True the
+        detached upload tasks are awaited (in the SAME loop) after the reply."""
+        with _Ctx(_flow_patches(score=96)):
+            _run(gs.maybe_handle(uid, "saya mau ajukan izin pemakaian tanah"))
+            _run(gs.handle_inbound_documents(uid, [_doc("doc-1"), _doc("doc-2")]))
+            _run(gs._process_collected_documents(gs._sessions[uid]))
+        self.assertEqual(gs._sessions[uid].stage, gs.Stage.CONFIRM)
+
+        mc = MagicMock()
+        mc.is_configured.return_value = True
+        mc.create_request = AsyncMock(return_value={
+            "ok": True, "configured": True,
+            "request_id": request_id, "ticket": ticket})
+
+        async def _submit_then_drain():
+            r = await gs.maybe_handle(uid, "ya lanjut")
+            # FIRE-AND-FORGET INVARIANT: the reply is produced BEFORE the upload
+            # has been awaited — at this point the detached task exists but the
+            # citizen already has their ticket.
+            awaited_before = doc_client.upload_document.await_count
+            if drain:
+                await self._drain_upload_tasks()
+            return r, awaited_before
+
+        with patch("services.submission_intent.classify_confirm_intent",
+                   new=AsyncMock(return_value="AFFIRM")), \
+             patch("services.siap_submission_client.get_siap_submission_client",
+                   return_value=mc), \
+             patch("services.siap_document_client.get_siap_document_client",
+                   return_value=doc_client), \
+             patch("services.officer_bridge.notify_officer_of_submission",
+                   new=AsyncMock(return_value=True)):
+            r, awaited_before = _run(_submit_then_drain())
+        return r, awaited_before
+
+    def test_docs_uploaded_to_siap_on_submit(self):
+        doc_client = MagicMock()
+        doc_client.is_configured.return_value = True
+        doc_client.upload_document = AsyncMock(return_value={
+            "ok": True, "configured": True, "file_id": 1, "note": ""})
+        r, awaited_before = self._submit_with_doc_client("wa-800", doc_client)
+        # Citizen still gets the ticket, unaffected by the upload side-channel.
+        self.assertIn("000088002", r)
+        # FIRE-AND-FORGET: the reply came back BEFORE the upload was awaited.
+        self.assertEqual(awaited_before, 0)
+        # But the detached task DID run and uploaded one file per collected doc,
+        # keyed by the numeric request_id.
+        self.assertEqual(doc_client.upload_document.await_count, 2)
+        for call in doc_client.upload_document.await_args_list:
+            self.assertEqual(call.kwargs["request_id"], 555)
+
+    def test_upload_scheduled_as_detached_task(self):
+        # A task IS scheduled (fire-and-forget), not awaited inline: BEFORE the
+        # detached task is drained, exactly one upload task is tracked and the
+        # citizen already has their reply.
+        doc_client = MagicMock()
+        doc_client.is_configured.return_value = True
+        # Block the upload so it can't complete during the reply turn.
+        started = asyncio.Event()
+
+        async def _slow_upload(**kwargs):
+            started.set()
+            await asyncio.sleep(0.05)
+            return {"ok": True, "configured": True, "file_id": 1, "note": ""}
+
+        doc_client.upload_document = AsyncMock(side_effect=_slow_upload)
+        r, awaited_before = self._submit_with_doc_client(
+            "wa-803", doc_client, drain=True)
+        self.assertIn("000088002", r)
+        # The reply did not wait on the (slow) upload.
+        self.assertEqual(awaited_before, 0)
+        # After draining, the slow upload completed (2 docs).
+        self.assertEqual(doc_client.upload_document.await_count, 2)
+
+    def test_upload_exception_does_not_change_submit_result(self):
+        # The document client raises on EVERY upload — the citizen must still
+        # get the exact same success message; the submit is not failed/delayed,
+        # and the detached task swallows the crash (no unretrieved-exception).
+        doc_client = MagicMock()
+        doc_client.is_configured.return_value = True
+        doc_client.upload_document = AsyncMock(side_effect=RuntimeError("boom"))
+        r, _awaited_before = self._submit_with_doc_client("wa-801", doc_client)
+        self.assertIn("000088002", r)
+        self.assertIn("track/000088002", r)
+        self.assertFalse(_run(gs.has_active_session("wa-801")))
+        # It DID try (best-effort, in the detached task), and the crash was
+        # swallowed — no task lingers in the tracking set.
+        self.assertEqual(doc_client.upload_document.await_count, 2)
+        self.assertEqual(len(gs._upload_tasks), 0)
+
+    def test_upload_noop_when_doc_client_not_configured(self):
+        doc_client = MagicMock()
+        doc_client.is_configured.return_value = False
+        doc_client.upload_document = AsyncMock()
+        r, _awaited_before = self._submit_with_doc_client("wa-802", doc_client)
+        self.assertIn("000088002", r)
+        doc_client.upload_document.assert_not_awaited()
 
 
 class TestCancel(_GuidedFlowBase):

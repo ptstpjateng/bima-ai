@@ -29,7 +29,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -1003,6 +1003,476 @@ class TestDeputyPromptGrounding(unittest.TestCase):
         # And never claims BIMA issues/signs the SK.
         low = self._P.lower()
         self.assertIn("bukan oleh anda", low)
+
+    def test_prompt_forbids_hallucination_with_siap_language(self):
+        # Anti-hallucination reinforcement: must instruct to say the datum is
+        # not available in SIAP rather than invent it.
+        self.assertIn("tidak tersedia di SIAP", self._P)
+
+
+# ===========================================================================
+# SIAP-grounded case loader ([[Multi-step Officer Copilot]])
+# ===========================================================================
+
+
+class TestSkSignUrl(unittest.TestCase):
+    """_build_sk_sign_url — the env-configurable SIAP signing magic-link."""
+
+    def test_default_template_uses_ticket(self):
+        url = ob._build_sk_sign_url(request_id=42, ticket="123")
+        self.assertIsNotNone(url)
+        # ticket zero-padded to 9 digits.
+        self.assertIn("000000123", url)
+
+    def test_custom_template_with_request_id(self):
+        with patch.object(
+            ob, "_SK_SIGN_URL_TEMPLATE",
+            "https://siap.example/sk/{request_id}/sign",
+        ):
+            url = ob._build_sk_sign_url(request_id=77, ticket="000000123")
+        self.assertEqual(url, "https://siap.example/sk/77/sign")
+
+    def test_none_when_required_field_missing(self):
+        # Template needs request_id but none supplied → None, not a broken URL.
+        with patch.object(
+            ob, "_SK_SIGN_URL_TEMPLATE",
+            "https://siap.example/sk/{request_id}/sign",
+        ):
+            url = ob._build_sk_sign_url(request_id=None, ticket="123")
+        self.assertIsNone(url)
+
+    def test_none_when_template_blank(self):
+        with patch.object(ob, "_SK_SIGN_URL_TEMPLATE", ""):
+            url = ob._build_sk_sign_url(request_id=1, ticket="1")
+        self.assertIsNone(url)
+
+
+def _install_siap_case(meta, docs=None, doc_bytes=b"FILEBYTES"):
+    """Patch the SIAP reads load_case_from_siap depends on."""
+    return patch.multiple(
+        "services.siap_db",
+        get_request_case_meta=AsyncMock(return_value=meta),
+        get_submission_doc_refs=AsyncMock(return_value=docs or []),
+    )
+
+
+class TestLoadCaseFromSiap(unittest.TestCase):
+    def setUp(self):
+        ob._sessions.clear()
+
+    def _meta(self, **over):
+        base = {
+            "found": True, "request_id": 900, "profile_id": 321,
+            "license_id": 459, "approval_step_id": 5001, "ticket": "000077591",
+            "current_sort_order": 1, "max_sort_order": 4, "is_final_step": False,
+            "group_id": 6, "stereotype": None, "owner_desk": "Petugas SKPD",
+        }
+        base.update(over)
+        return base
+
+    def test_assembles_docs_and_ticket_from_siap(self):
+        docs = [{"requirements_id": 10, "requirement_name": "Fotokopi KTP",
+                 "file_ref": "berkas/ktp.pdf", "status": "OK"}]
+        with _install_siap_case(self._meta(), docs=docs):
+            with patch(
+                "services.siap_templates.fetch_submission_file_bytes",
+                new=AsyncMock(return_value=b"KTPBYTES"),
+            ):
+                sess = _run(ob.load_case_from_siap(900))
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess.ticket, "000077591")
+        self.assertEqual(sess.request_id, 900)
+        self.assertEqual(sess.license_id, 459)
+        self.assertFalse(sess.is_final_step)
+        # Doc keyed by requirement, bytes threaded into the copilot doc-context.
+        self.assertIn("siap:req:10", sess.documents)
+        self.assertEqual(sess.documents["siap:req:10"]["content"], b"KTPBYTES")
+        self.assertEqual(sess.documents["siap:req:10"]["filename"], "Fotokopi KTP")
+        # No BIMA validator score exists in SIAP → validation absent (honest).
+        self.assertIsNone(sess.validation)
+
+    def test_final_step_flag_propagates(self):
+        with _install_siap_case(self._meta(is_final_step=True, current_sort_order=4)):
+            sess = _run(ob.load_case_from_siap(900))
+        self.assertTrue(sess.is_final_step)
+
+    def test_none_when_request_unresolvable_in_siap(self):
+        # No hallucination: if SIAP can't identify the request, return None
+        # rather than an empty/faked case.
+        with _install_siap_case({"found": False, "ticket": None}):
+            sess = _run(ob.load_case_from_siap(900))
+        self.assertIsNone(sess)
+
+    def test_doc_with_unfetchable_bytes_is_skipped_not_faked(self):
+        docs = [{"requirements_id": 10, "requirement_name": "KTP",
+                 "file_ref": "berkas/gone.pdf", "status": "OK"}]
+        with _install_siap_case(self._meta(), docs=docs):
+            with patch(
+                "services.siap_templates.fetch_submission_file_bytes",
+                new=AsyncMock(return_value=None),   # storage miss
+            ):
+                sess = _run(ob.load_case_from_siap(900))
+        # Never surface a doc BIMA couldn't actually read.
+        self.assertEqual(sess.documents, {})
+
+
+class TestNextStepNotify(unittest.TestCase):
+    def setUp(self):
+        ob._sessions.clear()
+        ob._officer_cache = set()
+
+    def _meta(self, **over):
+        base = {
+            "found": True, "request_id": 900, "profile_id": 321,
+            "license_id": 459, "approval_step_id": 5002, "ticket": "000077591",
+            "current_sort_order": 2, "max_sort_order": 4, "is_final_step": False,
+            "group_id": 7, "stereotype": None, "owner_desk": "Kabid",
+        }
+        base.update(over)
+        return base
+
+    def test_advance_notifies_next_desk_officer(self):
+        env = {"BIMA_OFFICER_NOTIFY_ENABLED": "true"}
+        resolution = {
+            "wa_active": True, "is_applicant_step": False,
+            "officer_whatsapps": ["628111222333"], "group_id": 7, "sort_order": 2,
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch(
+                "services.siap_db.resolve_step_officers",
+                new=AsyncMock(return_value=resolution),
+            ):
+                with _install_siap_case(self._meta()):
+                    with patch.object(
+                        ob, "_send_officer_notify", new=AsyncMock(return_value=True)
+                    ) as notify:
+                        sent = _run(ob.notify_next_step(900))
+        self.assertTrue(sent)
+        notify.assert_awaited_once()
+        # A fresh SIAP-grounded session was registered for the next officer.
+        self.assertIn("628111222333", ob._sessions)
+        self.assertEqual(ob._sessions["628111222333"].ticket, "000077591")
+        # And that officer is now recognizable on their first reply.
+        self.assertIn("628111222333", ob._officer_cache)
+
+    def test_last_step_sends_magic_link_not_forward_brief(self):
+        env = {"BIMA_OFFICER_NOTIFY_ENABLED": "true"}
+        resolution = {
+            "wa_active": True, "is_applicant_step": False,
+            "officer_whatsapps": ["628444555666"], "group_id": 12, "sort_order": 4,
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch(
+                "services.siap_db.resolve_step_officers",
+                new=AsyncMock(return_value=resolution),
+            ):
+                with _install_siap_case(self._meta(is_final_step=True, current_sort_order=4)):
+                    with patch.object(
+                        ob, "_send_officer_notify", new=AsyncMock(return_value=True)
+                    ) as forward_notify, patch.object(
+                        ob, "_send_final_step_notify", new=AsyncMock(return_value=True)
+                    ) as final_notify:
+                        sent = _run(ob.notify_next_step(900))
+        self.assertTrue(sent)
+        # LAST step → signing handoff, NOT the forward brief.
+        final_notify.assert_awaited_once()
+        forward_notify.assert_not_awaited()
+        self.assertTrue(ob._sessions["628444555666"].is_final_step)
+
+    def test_no_next_officer_is_noop(self):
+        env = {"BIMA_OFFICER_NOTIFY_ENABLED": "true"}
+        resolution = {
+            "wa_active": False, "is_applicant_step": True,
+            "officer_whatsapps": [], "group_id": 99, "sort_order": 0,
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch(
+                "services.siap_db.resolve_step_officers",
+                new=AsyncMock(return_value=resolution),
+            ):
+                sent = _run(ob.notify_next_step(900))
+        self.assertFalse(sent)
+
+    def test_suppressed_when_flag_off(self):
+        with patch.dict("os.environ", {"BIMA_OFFICER_NOTIFY_ENABLED": "false"}, clear=False):
+            sent = _run(ob.notify_next_step(900))
+        self.assertFalse(sent)
+
+
+class TestAdvanceDetection(unittest.TestCase):
+    """_case_advanced — forward / approved advance the chain; reject does not."""
+
+    def _call(self, name, args, ok=True):
+        preview = '{"executed": true, "ok": %s}' % ("true" if ok else "false")
+        return [{"name": name, "args": args, "result_preview": preview}]
+
+    def test_confirmed_forward_advances(self):
+        self.assertTrue(ob._case_advanced(self._call("forward_case", {"confirmed": True})))
+
+    def test_confirmed_approved_advances(self):
+        self.assertTrue(ob._case_advanced(
+            self._call("record_decision", {"confirmed": True, "decision": "approved"})
+        ))
+
+    def test_confirmed_rejected_does_not_advance(self):
+        # Reject routes BACK a desk — no next-step notify.
+        self.assertFalse(ob._case_advanced(
+            self._call("record_decision", {"confirmed": True, "decision": "rejected"})
+        ))
+
+    def test_draft_does_not_advance(self):
+        self.assertFalse(ob._case_advanced(self._call("forward_case", {"confirmed": False})))
+
+    def test_failed_write_does_not_advance(self):
+        self.assertFalse(ob._case_advanced(
+            self._call("forward_case", {"confirmed": True}, ok=False)
+        ))
+
+
+class TestFinalStepMode(unittest.TestCase):
+    """The last-step session drives the copilot in signature mode (signing
+    handoff, no forward/write tools)."""
+
+    def setUp(self):
+        ob._sessions.clear()
+
+    def test_final_step_session_uses_signature_mode(self):
+        env = {
+            "BIMA_OFFICER_NOTIFY_ENABLED": "true",
+            "BIMA_OFFICER_WA_PHONE": "628999000111",
+            "BIMA_OFFICER_TG_CHAT": "",
+        }
+        # Arm a final-step session directly.
+        sess = ob.OfficerCaseSession(
+            channel_id="628999000111", channel=ob.CHANNEL_WHATSAPP,
+            ticket="000077591", request_id=900, license_id=459,
+            is_final_step=True,
+        )
+        _run(ob._put_session(sess))
+
+        copilot = type("C", (), {})()
+        chat_mock = AsyncMock(return_value={
+            "reply": "SK siap ditandatangani.",
+            "tool_calls": [], "history": [],
+        })
+        copilot.chat = chat_mock
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(oc, "get_copilot", return_value=copilot):
+                _run(ob.maybe_handle_officer_reply(
+                    channel=ob.CHANNEL_WHATSAPP,
+                    channel_id="628999000111",
+                    message="bagaimana cara tanda tangan?",
+                ))
+        _, kwargs = chat_mock.call_args
+        self.assertEqual(kwargs["mode"], "signature")
+
+
+class TestLoadSiapDocumentsMerge(unittest.TestCase):
+    """`_load_siap_documents` merges TWO sources into the copilot `_doc_context`
+    shape ({file_id: {filename, mime_type, content, claimed_type,
+    detected_type}}):
+      (a) profile_requirements docs (bytes from Beta storage), and
+      (b) the per-request document API (applicant-upload docs).
+    Docs present in both are deduped by (filename/label). When the document
+    client is not configured, behaviour is byte-for-byte the current (a)-only.
+    """
+
+    @staticmethod
+    def _profile_refs():
+        # Source (a): one requirement, label "Fotokopi KTP".
+        return [
+            {"requirements_id": 11, "requirement_name": "Fotokopi KTP",
+             "file_ref": "storage/ktp.pdf", "status": "uploaded"},
+        ]
+
+    @staticmethod
+    def _doc_client(documents, download_map):
+        client = MagicMock()
+        # is_configured is a METHOD now (parity with the other SIAP clients).
+        client.is_configured.return_value = True
+        # `documents` here is list_documents' NORMALISED output — SIAP's real
+        # file_name/file_type keys have already been mapped to filename/mime by
+        # the client (SiapDocumentClient._normalise_document), which is exactly
+        # what the officer loader consumes.
+        client.list_documents = AsyncMock(return_value={
+            "ok": True, "configured": True, "documents": documents, "note": ""})
+
+        async def _download(file_id):
+            return download_map.get(int(file_id))
+
+        client.download_document = AsyncMock(side_effect=_download)
+        return client
+
+    def _patch_sources(self, *, refs, storage_bytes, doc_client):
+        return [
+            patch("services.siap_db.get_submission_doc_refs",
+                  new=AsyncMock(return_value=refs)),
+            patch("services.siap_templates.fetch_submission_file_bytes",
+                  new=AsyncMock(return_value=storage_bytes)),
+            patch("services.siap_document_client.get_siap_document_client",
+                  return_value=doc_client),
+        ]
+
+    def test_merges_both_sources(self):
+        # (a) yields "Fotokopi KTP"; (b) yields a distinct "NIB.pdf".
+        # list_documents' normalised shape: file_id/filename/mime (mapped from
+        # SIAP's real file_id/file_name/file_type).
+        doc_client = self._doc_client(
+            documents=[{"file_id": 501, "filename": "NIB.pdf",
+                        "mime": "application/pdf", "created_at": "2026-05-10"}],
+            download_map={501: b"NIBBYTES"},
+        )
+        patches = self._patch_sources(
+            refs=self._profile_refs(), storage_bytes=b"KTPBYTES",
+            doc_client=doc_client)
+        with _Ctx_ob(patches):
+            out = _run(ob._load_siap_documents(profile_id=7, request_id=555))
+        # Both docs present, each once, exact shape preserved.
+        self.assertEqual(len(out), 2)
+        labels = {v["filename"] for v in out.values()}
+        self.assertEqual(labels, {"Fotokopi KTP", "NIB.pdf"})
+        for v in out.values():
+            self.assertEqual(
+                set(v.keys()),
+                {"filename", "mime_type", "content", "claimed_type", "detected_type"})
+        # (b) doc carried its bytes + mime through.
+        nib = next(v for v in out.values() if v["filename"] == "NIB.pdf")
+        self.assertEqual(nib["content"], b"NIBBYTES")
+        self.assertEqual(nib["mime_type"], "application/pdf")
+
+    def test_dedupes_doc_present_in_both_sources(self):
+        # (b) also returns a "Fotokopi KTP" (formatted as "Fotokopi_KTP") — it
+        # must NOT be emitted twice; source (a) wins, (b)'s dup is skipped and
+        # never even downloaded.
+        doc_client = self._doc_client(
+            documents=[{"file_id": 777, "filename": "Fotokopi_KTP",
+                        "mime": "application/pdf"}],
+            download_map={777: b"SHOULD-NOT-APPEAR"},
+        )
+        patches = self._patch_sources(
+            refs=self._profile_refs(), storage_bytes=b"KTPBYTES",
+            doc_client=doc_client)
+        with _Ctx_ob(patches):
+            out = _run(ob._load_siap_documents(profile_id=7, request_id=555))
+        self.assertEqual(len(out), 1)
+        only = next(iter(out.values()))
+        self.assertEqual(only["filename"], "Fotokopi KTP")
+        self.assertEqual(only["content"], b"KTPBYTES")   # (a)'s bytes, not (b)'s
+        doc_client.download_document.assert_not_awaited()  # dup never fetched
+
+    def test_not_configured_client_is_byte_for_byte_source_a_only(self):
+        doc_client = MagicMock()
+        doc_client.is_configured.return_value = False
+        doc_client.list_documents = AsyncMock()
+        doc_client.download_document = AsyncMock()
+        patches = self._patch_sources(
+            refs=self._profile_refs(), storage_bytes=b"KTPBYTES",
+            doc_client=doc_client)
+        with _Ctx_ob(patches):
+            out = _run(ob._load_siap_documents(profile_id=7, request_id=555))
+        # Exactly the pre-existing (a)-only result.
+        self.assertEqual(len(out), 1)
+        only = next(iter(out.values()))
+        self.assertEqual(only["filename"], "Fotokopi KTP")
+        self.assertEqual(only["content"], b"KTPBYTES")
+        doc_client.list_documents.assert_not_awaited()
+        doc_client.download_document.assert_not_awaited()
+
+    def test_undownloadable_doc_api_file_is_skipped_not_faked(self):
+        # (b) lists a doc but its bytes come back None → it is NOT emitted.
+        doc_client = self._doc_client(
+            documents=[{"file_id": 900, "filename": "SIUP.pdf",
+                        "mime": "application/pdf"}],
+            download_map={},  # download returns None
+        )
+        patches = self._patch_sources(
+            refs=self._profile_refs(), storage_bytes=b"KTPBYTES",
+            doc_client=doc_client)
+        with _Ctx_ob(patches):
+            out = _run(ob._load_siap_documents(profile_id=7, request_id=555))
+        self.assertEqual(len(out), 1)  # only (a)'s KTP
+        self.assertNotIn("SIUP.pdf", {v["filename"] for v in out.values()})
+
+    def test_real_siap_keys_end_to_end_yield_nonempty_filename(self):
+        # END-TO-END through the REAL SiapDocumentClient normaliser: SIAP sends
+        # data.documents[*].file_name/file_type; the officer loader must still
+        # get a NON-EMPTY filename/label so dedupe + _resolve_doc_ref work. Here
+        # list_documents is NOT mocked — only httpx is — so the real
+        # _normalise_document runs.
+        from services.siap_document_client import SiapDocumentClient
+
+        real_client = SiapDocumentClient(
+            base="http://siap.test", token="tok-real", timeout=5.0)
+
+        # httpx list response in SIAP's real shape.
+        list_resp = MagicMock()
+        list_resp.status_code = 200
+        list_resp.text = ""
+        list_resp.json.return_value = {
+            "status": "success",
+            "data": {"request_id": 555, "count": 1, "documents": [
+                {"file_id": 42, "file_name": "Fotokopi NIB.pdf",
+                 "file_type": "application/pdf", "created_on": "2026-05-10"},
+            ]},
+        }
+
+        # httpx download stream (size-capped path) yielding the NIB bytes.
+        dl_resp = MagicMock()
+        dl_resp.status_code = 200
+        dl_resp.headers = {}
+        dl_resp.text = ""
+
+        async def _aiter():
+            yield b"NIBBYTES"
+
+        dl_resp.aiter_bytes = _aiter
+        dl_resp.__aenter__ = AsyncMock(return_value=dl_resp)
+        dl_resp.__aexit__ = AsyncMock(return_value=False)
+
+        fake_httpx_client = MagicMock()
+        fake_httpx_client.get = AsyncMock(return_value=list_resp)
+        fake_httpx_client.stream = MagicMock(return_value=dl_resp)
+        httpx_ctx = MagicMock()
+        httpx_ctx.__aenter__ = AsyncMock(return_value=fake_httpx_client)
+        httpx_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        patches = [
+            # No source (a) — isolate the doc-API path.
+            patch("services.siap_db.get_submission_doc_refs",
+                  new=AsyncMock(return_value=[])),
+            patch("services.siap_templates.fetch_submission_file_bytes",
+                  new=AsyncMock(return_value=None)),
+            patch("services.siap_document_client.get_siap_document_client",
+                  return_value=real_client),
+            patch("services.siap_document_client.httpx.AsyncClient",
+                  return_value=httpx_ctx),
+        ]
+        with _Ctx_ob(patches):
+            out = _run(ob._load_siap_documents(profile_id=None, request_id=555))
+        self.assertEqual(len(out), 1)
+        only = next(iter(out.values()))
+        # The load-bearing assertion: SIAP's file_name surfaced as a non-empty
+        # filename/label the officer loader can dedupe + resolve on.
+        self.assertEqual(only["filename"], "Fotokopi NIB.pdf")
+        self.assertTrue(only["filename"])
+        self.assertEqual(only["mime_type"], "application/pdf")
+        self.assertEqual(only["content"], b"NIBBYTES")
+
+
+class _Ctx_ob:
+    """Enter a list of context managers together (local to officer-bridge tests)."""
+    def __init__(self, patches):
+        self._p = patches
+
+    def __enter__(self):
+        for p in self._p:
+            p.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        for p in reversed(self._p):
+            p.__exit__(*exc)
+        return False
 
 
 if __name__ == "__main__":
