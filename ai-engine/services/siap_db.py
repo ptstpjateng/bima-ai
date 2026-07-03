@@ -424,13 +424,14 @@ def _normalize_msisdn(raw: Optional[str]) -> str:
 #   services.siap_templates.fetch_submission_file_bytes.
 #
 # Step / last-step detection:
-#   The request's CURRENT step is license_request.approval_step_id. Its
-#   sort_order + the MAX(sort_order) across the license's steps tell us whether
-#   this is the LAST (SK-signing / Kepala Dinas) desk. A `stereotype` on the
-#   step (e.g. LICENSE-RECOMMEND / a signing marker) is captured too when
-#   present — the exact terminal marker is environment-specific, so we treat
-#   "current sort_order == max sort_order" as the authoritative last-step signal
-#   and expose stereotype as a secondary hint.
+#   The request's CURRENT step is license_request.approval_step_id. Its owning
+#   ROLE name decides whether this is the LAST (SK-signing / Kepala Dinas) desk:
+#   the signing desk is a specific role (BIMA_SK_SIGNING_ROLES, default
+#   `Kepala Dinas SKPD` + `Kepala DPMPTSP`), NOT the highest sort_order — SIAP
+#   chains bookend with SYSTEM/APPLICANT roles (super_admin, Pemohon Online) at
+#   the top sort_order, so a positional test mis-fires. sort_order +
+#   MAX(sort_order) are still captured for context (and as a fallback when no
+#   signing role is configured); `stereotype` is a secondary hint.
 #
 # Failure model: NEVER raise. Every function returns a safe empty/None result
 # on any error / unconfigured SIAP DB so a SIAP hiccup degrades the officer
@@ -486,6 +487,42 @@ _SQL_STEP_WITH_MAX = """
      LIMIT 1
 """
 
+# The role name(s) that own the FINAL SK-signing desk (the Kepala Dinas who
+# signs the Surat Keputusan ber-TTE). SIAP approval chains are bookended by
+# SYSTEM/APPLICANT roles (super_admin, Pemohon Online) at the highest
+# sort_order, so "current sort_order == max sort_order" mis-identifies the
+# signer — verified on Beta: request 8's chain ends `super_admin`, and across
+# licenses the terminal role is usually super_admin/Pemohon Online. The signing
+# desk is a SPECIFIC ROLE, not the last position. Comma-separated, matched
+# case-insensitively; confirmed with the SIAP owner as `Kepala Dinas SKPD` +
+# `Kepala DPMPTSP`. Set BIMA_SK_SIGNING_ROLES empty to fall back to the old
+# sort_order heuristic (the signal then never silently vanishes).
+_SK_SIGNING_ROLES: frozenset = frozenset(
+    r.strip().lower()
+    for r in os.getenv(
+        "BIMA_SK_SIGNING_ROLES", "Kepala Dinas SKPD,Kepala DPMPTSP"
+    ).split(",")
+    if r.strip()
+)
+
+
+def _is_signing_desk(role_name, current_sort_order, max_sort_order) -> bool:
+    """True when THIS desk is the FINAL SK-signing (Kepala Dinas) step.
+
+    Primary signal: the desk's ROLE name is one of `_SK_SIGNING_ROLES`
+    (BIMA_SK_SIGNING_ROLES). Fallback (only when no signing roles are
+    configured): the old `current >= max sort_order` heuristic, so the last-step
+    signal is never lost even if the env is blanked.
+    """
+    if _SK_SIGNING_ROLES:
+        name = (role_name or "").strip().lower()
+        return bool(name) and name in _SK_SIGNING_ROLES
+    return (
+        current_sort_order is not None
+        and max_sort_order is not None
+        and current_sort_order >= max_sort_order
+    )
+
 
 def _empty_case_meta() -> dict:
     """Safe default when the request/step cannot be read from SIAP."""
@@ -510,8 +547,9 @@ async def get_request_case_meta(request_id: int) -> dict:
 
     Returns a dict (see `_empty_case_meta`) with `found`, the profile/license/
     step ids, the SIAP `ticket`, the current step's `sort_order`/`stereotype`/
-    owning `group_id`, the license's `max_sort_order`, and a derived
-    `is_final_step` (current_sort_order == max_sort_order). NEVER raises — a
+    owning `group_id`/`owner_desk` role, the license's `max_sort_order`, and a
+    derived `is_final_step` (the desk's role is a configured SK-signing role —
+    see `_is_signing_desk` / BIMA_SK_SIGNING_ROLES). NEVER raises — a
     miss / DB error returns the safe empty meta so the caller degrades to an
     honest "not in SIAP" reply. PII is never logged.
     """
@@ -549,14 +587,18 @@ async def get_request_case_meta(request_id: int) -> dict:
                     result["max_sort_order"] = mx
                     result["group_id"] = step["group_id"]
                     result["stereotype"] = step["stereotype"]
-                    # Authoritative last-step signal: the current desk is the
-                    # one with the highest sort_order in the license's workflow.
-                    result["is_final_step"] = (
-                        cur is not None and mx is not None and cur >= mx
-                    )
+                    # Resolve the current desk's ROLE name first — it is the
+                    # authoritative last-step signal (see _is_signing_desk).
                     if step["group_id"] is not None:
                         role = await conn.fetchrow(_SQL_ROLE_NAME, step["group_id"])
                         result["owner_desk"] = (role["name"] if role else None)
+                    # Last-step (SK-signing) signal keys on the desk's ROLE
+                    # (Kepala Dinas), NOT max sort_order — SIAP chains bookend
+                    # with system/applicant roles at the top sort_order, so the
+                    # positional heuristic mis-fires. See _SK_SIGNING_ROLES.
+                    result["is_final_step"] = _is_signing_desk(
+                        result["owner_desk"], cur, mx
+                    )
             result["found"] = True
 
         logger.info(

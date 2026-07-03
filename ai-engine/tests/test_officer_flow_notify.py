@@ -559,18 +559,19 @@ class TestOfficerCacheWarm(unittest.TestCase):
 
 
 class TestRequestCaseMeta(unittest.TestCase):
-    def test_resolves_step_and_flags_final(self):
+    def test_signing_role_flags_final_even_when_not_max_sort_order(self):
+        # The signing desk is identified by ROLE, not position: current_sort_order
+        # is 3 of 5 (NOT the max) yet the role is a configured signer → final.
         scenario = {
             "case_request_row": {
                 "profile_id": 321, "license_id": 459,
                 "approval_step_id": 5099, "ticket": "000077591",
             },
-            # current sort_order == max → LAST step
             "step_max_row": {
-                "current_sort_order": 4, "group_id": 12,
-                "stereotype": "LICENSE-RECOMMEND", "max_sort_order": 4,
+                "current_sort_order": 3, "group_id": 12,
+                "stereotype": "LICENSE-RECOMMEND", "max_sort_order": 5,
             },
-            "role_row": {"name": "Kepala Dinas"},
+            "role_row": {"name": "Kepala Dinas SKPD"},  # a configured signing role
         }
         with _install_pool(scenario):
             out = _run(siap_db.get_request_case_meta(900))
@@ -579,25 +580,62 @@ class TestRequestCaseMeta(unittest.TestCase):
         self.assertEqual(out["license_id"], 459)
         self.assertEqual(out["ticket"], "000077591")
         self.assertTrue(out["is_final_step"])
-        self.assertEqual(out["owner_desk"], "Kepala Dinas")
+        self.assertEqual(out["owner_desk"], "Kepala Dinas SKPD")
         self.assertEqual(out["stereotype"], "LICENSE-RECOMMEND")
 
-    def test_intermediate_step_is_not_final(self):
+    def test_max_sort_order_but_system_role_is_NOT_final(self):
+        # The exact bug we fixed: the terminal sort_order is a system/applicant
+        # bookend (super_admin) — max sort_order alone must NOT flag final.
         scenario = {
             "case_request_row": {
                 "profile_id": 1, "license_id": 459,
                 "approval_step_id": 5001, "ticket": "000000123",
             },
             "step_max_row": {
-                "current_sort_order": 1, "group_id": 6,
-                "stereotype": None, "max_sort_order": 4,
+                "current_sort_order": 5, "group_id": 6,  # IS the max…
+                "stereotype": None, "max_sort_order": 5,
             },
-            "role_row": {"name": "Petugas SKPD"},
+            "role_row": {"name": "super_admin"},  # …but a system bookend
         }
         with _install_pool(scenario):
             out = _run(siap_db.get_request_case_meta(901))
         self.assertTrue(out["found"])
         self.assertFalse(out["is_final_step"])
+
+    def test_signing_role_match_is_case_insensitive(self):
+        scenario = {
+            "case_request_row": {
+                "profile_id": 1, "license_id": 459,
+                "approval_step_id": 5002, "ticket": "000000124",
+            },
+            "step_max_row": {
+                "current_sort_order": 2, "group_id": 9,
+                "stereotype": None, "max_sort_order": 4,
+            },
+            "role_row": {"name": "  KEPALA DPMPTSP  "},  # padded + upper
+        }
+        with _install_pool(scenario):
+            out = _run(siap_db.get_request_case_meta(903))
+        self.assertTrue(out["is_final_step"])
+
+    def test_falls_back_to_sort_order_when_no_signing_roles_configured(self):
+        # If BIMA_SK_SIGNING_ROLES is blanked, the old positional heuristic is the
+        # fallback so the last-step signal never silently vanishes.
+        scenario = {
+            "case_request_row": {
+                "profile_id": 1, "license_id": 459,
+                "approval_step_id": 5003, "ticket": "000000125",
+            },
+            "step_max_row": {
+                "current_sort_order": 4, "group_id": 6,
+                "stereotype": None, "max_sort_order": 4,
+            },
+            "role_row": {"name": "Petugas Pengambilan SK"},  # not a configured signer
+        }
+        with patch.object(siap_db, "_SK_SIGNING_ROLES", frozenset()):
+            with _install_pool(scenario):
+                out = _run(siap_db.get_request_case_meta(904))
+        self.assertTrue(out["is_final_step"])  # cur(4) >= max(4) via fallback
 
     def test_missing_request_returns_safe_empty(self):
         scenario = {"case_request_row": None}
