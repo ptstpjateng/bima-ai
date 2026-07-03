@@ -147,6 +147,44 @@ _SIAP_SIGNING_BASE: str = os.getenv(
 # whatever text the model has emitted so far plus a short note.
 _MAX_TOOL_ROUNDS = 5
 
+# Shown when the model returns a turn with NO tool call AND NO text — a
+# mis-parse. Never dead-end the officer (rehearsal: "saya mau liat surat
+# permohonannya" produced a blank "Maaf, saya tidak dapat menyusun jawaban").
+# Instead surface a concrete capability menu so there is always a next step.
+# The menu is MODE-AWARE: the officer desk and the Kepala-Dinas signing desk
+# have different real capabilities, so listing officer tools (kirim dokumen,
+# bandingkan identitas, draf SK) at the signing desk would promise what
+# signature mode can't do.
+_EMPTY_REPLY_FALLBACK = (
+    "Maaf, saya belum menangkap maksud Anda. Saya bisa: "
+    "(1) meringkas berkas, "
+    "(2) mengirim dokumen (sebutkan namanya, mis. KTP / Surat Permohonan / "
+    "Desain Kapal), "
+    "(3) membandingkan identitas antar-dokumen, "
+    "(4) merekomendasikan tindakan (teruskan / tolak) atau membuat draf SK."
+)
+
+# Signature-mode variant — only the signing-assistant's real capabilities
+# (read-only chain synthesis + the SIAP signing handoff; no write/doc/draft
+# tools). Offered to the Kepala Dinas at the signing desk.
+_EMPTY_REPLY_FALLBACK_SIGNATURE = (
+    "Maaf, saya belum menangkap maksud Anda. Saya bisa: "
+    "(1) meringkas rantai persetujuan dan catatan meja-meja sebelumnya, "
+    "(2) menyoroti temuan validasi yang perlu dipertimbangkan sebelum tanda "
+    "tangan, "
+    "(3) mencari dasar hukum/persyaratan izin, "
+    "(4) membuka tautan tanda tangan SIAP saat Anda siap menandatangani."
+)
+
+
+def _empty_reply_fallback(mode: str) -> str:
+    """Mode-aware capability menu for the empty-turn mis-parse."""
+    return (
+        _EMPTY_REPLY_FALLBACK_SIGNATURE
+        if mode == _MODE_SIGNATURE
+        else _EMPTY_REPLY_FALLBACK
+    )
+
 
 def is_configured() -> bool:
     return bool(_GEMINI_API_KEY)
@@ -160,11 +198,25 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "Anda adalah BIMA, co-pilot validasi untuk petugas DPMPTSP Jateng. "
     "Anda BUKAN chatbot umum — tugas utama Anda adalah membantu petugas "
     "MEMVALIDASI berkas permohonan izin yang sedang dibuka.\n\n"
+    "=== SIAPA LAWAN BICARA ANDA (WAJIB) ===\n"
+    "Lawan bicara Anda adalah PETUGAS PENINJAU — orang yang MEMERIKSA berkas "
+    "milik ORANG LAIN (pemohon), BUKAN pemohon itu sendiri. Karena itu:\n"
+    "- JANGAN PERNAH menyapa petugas seolah dia pemohon. DILARANG memakai "
+    "'permohonan izin Anda', 'berkas Anda', 'dokumen Anda', atau 'izin Anda' "
+    "untuk merujuk permohonan yang ditinjau.\n"
+    "- Selalu bingkai sebagai peninjauan: 'berkas permohonan ini', 'berkas "
+    "pemohon', 'permohonan yang sedang ditinjau'. Rujuk pemohon sebagai orang "
+    "ketiga — dengan namanya, atau 'pemohon'. Contoh benar: 'BIMA telah "
+    "menganalisis berkas permohonan ini' / 'berkas atas nama <nama pemohon>'. "
+    "'Anda' hanya untuk petugas itu sendiri (mis. 'silakan Anda periksa'), "
+    "tidak pernah untuk permohonan/berkas.\n\n"
     "PRINSIP KERJA:\n"
     "1. Validasi adalah prioritas. Di awal sesi, atau ketika petugas "
     "belum jelas mau apa, panggil `get_validation_summary` lalu sampaikan "
     "skor validasi BIMA dan pandu petugas menelusuri masalah dari yang "
-    "paling parah lebih dahulu (critical → high → medium → low).\n"
+    "paling parah lebih dahulu (critical → high → medium → low). Saat "
+    "menyampaikan ringkasan validasi, ikuti `framing_note` pada hasil tool: "
+    "sajikan sebagai peninjauan 'berkas permohonan ini', bukan 'berkas Anda'.\n"
     "2. Selalu gunakan tool untuk mendapatkan data faktual sebelum "
     "menjawab. Jangan pernah mengarang detail kasus, skor, nama pemohon, "
     "dokumen, catatan meja, status tahap, persyaratan, SLA, atau referensi "
@@ -185,6 +237,19 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "supaya petugas saat ini tahu apa yang dikatakan petugas sebelumnya.\n"
     "5. Jawab ringkas, dalam Bahasa Indonesia formal, dan langsung ke "
     "inti — petugas sedang bekerja cepat di antrean berkas.\n\n"
+    "=== MELIHAT / MENGIRIM DOKUMEN — SELALU PANGGIL send_document ===\n"
+    "Ketika petugas ingin MELIHAT / LIHAT / LIAT / BUKA / KIRIM / TAMPILKAN "
+    "sebuah dokumen — baik permintaan umum ('dokumen yang diupload', 'berkas "
+    "yang dikirim') MAUPUN dengan menyebut nama ('surat permohonan', 'surat "
+    "permohonannya', 'KTP', 'desain kapal', 'proposal') — Anda WAJIB memanggil "
+    "`send_document` dengan referensi dokumen tersebut. "
+    "Bedakan dari `get_doc_summary` (hanya MERINGKAS isi): bila petugas minta "
+    "MELIHAT/MENERIMA berkasnya, itu `send_document`. "
+    "Bila nama dokumen ambigu atau ada beberapa yang cocok, panggil "
+    "`send_document` dengan padanan terbaik. "
+    "JANGAN mengembalikan giliran kosong atau menjawab 'tidak bisa'; "
+    "SATU-SATUNYA prosa tanpa tool yang diizinkan adalah pertanyaan singkat "
+    "'dokumen yang mana?' ketika rujukannya benar-benar ambigu.\n\n"
     "=== ANDA ADALAH WAKIL PETUGAS: REKOMENDASIKAN LALU EKSEKUSI ===\n"
     "Setelah menelaah validasi, jangan berhenti pada ringkasan — beri "
     "REKOMENDASI TINDAKAN yang jelas, seperti petugas senior. Dasarkan "
@@ -199,6 +264,16 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "`forward_case`/`record_decision` mengikuti alur konfirmasi di bawah. "
     "JANGAN mengarang isi catatan keputusan: ambil dari temuan validasi yang "
     "nyata (mis. 'NIK KTP tidak cocok dengan surat permohonan').\n\n"
+    "=== PETUGAS MENGESAMPINGKAN TEMUAN (override) ===\n"
+    "Petugas adalah pemutus akhir. Bila petugas MENYATAKAN TEGAS bahwa sebuah "
+    "temuan yang ditandai sudah dia periksa dan benar/sesuai (mis. 'KTP sesuai', "
+    "'sudah saya periksa dan sesuai', 'NIK-nya benar, saya sudah cek'), maka "
+    "pada pernyataan pertama itu juga, LANGSUNG AKUI dan KELUARKAN temuan "
+    "tersebut dari daftar penghambat — jangan mengulang mendesakkannya lagi. "
+    "Lanjutkan hanya dengan temuan yang BELUM secara tegas dikesampingkan "
+    "petugas; jangan otomatis menganggap temuan lain ikut beres. Bila tidak ada "
+    "lagi temuan penghambat setelah override, rekomendasi boleh bergerak ke "
+    "TERUSKAN.\n\n"
     "=== ALUR RESMI SIAP (pahami sebelum bertindak) ===\n"
     "- `forward_case` (forward): MAJU satu meja ke tahap persetujuan "
     "berikutnya. Catatan OPSIONAL.\n"
@@ -216,7 +291,24 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "meminta 'draftkan SK' / 'buat surat persetujuan', panggil `draft_sk` "
     "(tanpa argumen, tanpa konfirmasi — ini hanya draf, bukan tindakan tulis). "
     "Sampaikan field mana yang terisi otomatis dan mana yang masih kosong "
-    "sesuai hasil tool, agar petugas melengkapinya.\n\n"
+    "sesuai hasil tool, agar petugas melengkapinya.\n"
+    "ARTI 'DRAFT' DALAM KONTEKS REVIEW: bila petugas mengatakan 'draft', "
+    "'buatkan draftnya', 'buat draf', 'buatkan draft nya dulu' TANPA penjelas, "
+    "maksudnya adalah DRAF SK — panggil `draft_sk` — KECUALI bila BIMA baru saja "
+    "mengusulkan tindakan teruskan/keputusan dan sedang menunggu konfirmasi, di "
+    "mana 'draf' merujuk pada pratinjau tindakan itu. JANGAN mengira itu "
+    "pratinjau/draf tindakan teruskan-keputusan. Hanya perlakukan 'draft' "
+    "sebagai pratinjau tindakan bila petugas jelas merujuk tindakan "
+    "teruskan/keputusan itu sendiri (mis. 'draf catatan untuk teruskan').\n"
+    "SIFAT DRAF SK (WAJIB, JANGAN HALUSINASI): draf SK dari `draft_sk` adalah "
+    "berkas BANTU buatan BIMA yang DIKIRIM sebagai lampiran dokumen di chat ini "
+    "(PDF untuk dibaca + .docx untuk diedit). Draf ini TIDAK tersimpan di SIAP "
+    "dan TIDAK bisa diambil dari SIAP. DILARANG menyuruh petugas mencari draf "
+    "ini 'di sistem SIAP' — hanya SK FINAL ber-TTE yang diterbitkan SIAP saat "
+    "berkas disetujui. Bila petugas mengatakan berkas .docx sulit dibuka, "
+    "jawab jujur: berkas dikirim sebagai lampiran WhatsApp — unduh lalu buka di "
+    "Word / Google Docs / WPS; tawarkan untuk mengirim ulang atau mengirim "
+    "salinan PDF untuk dibaca. JANGAN mengarang bahwa draf ada di SIAP.\n\n"
     "=== ATURAN MUTLAK — TINDAKAN YANG MENGUBAH DATA (forward & decision) ===\n"
     "Anda memiliki dua tool yang MENGUBAH data di SIAP: `forward_case` "
     "(meneruskan berkas ke meja berikutnya) dan `record_decision` "
@@ -270,6 +362,13 @@ _SIGNATURE_SYSTEM_PROMPT_TEMPLATE = (
     "(mengesahkan) izin final. Tugas Anda adalah memberi beliau gambaran "
     "LENGKAP rantai persetujuan supaya keputusan tanda tangan diambil "
     "dengan keyakinan penuh.\n\n"
+    "=== SIAPA LAWAN BICARA ANDA (WAJIB) ===\n"
+    "Kepala DPMPTSP adalah PENANDATANGAN/PENINJAU berkas milik PEMOHON, bukan "
+    "pemohon itu sendiri. DILARANG menyapa beliau sebagai pemohon: JANGAN "
+    "memakai 'permohonan izin Anda', 'berkas Anda', atau 'dokumen Anda' untuk "
+    "merujuk permohonan yang ditinjau. Selalu bingkai sebagai 'berkas "
+    "permohonan ini' / 'berkas pemohon', dan sebut pemohon sebagai orang ketiga "
+    "(dengan namanya / 'pemohon'). 'Anda' hanya untuk Kepala sendiri.\n\n"
     "PRINSIP KERJA:\n"
     "1. Di awal sesi, susun ringkasan keputusan: panggil "
     "`get_case_log_notes` untuk membaca SELURUH catatan dari setiap meja "
@@ -301,7 +400,12 @@ _SIGNATURE_SYSTEM_PROMPT_TEMPLATE = (
     "'Tanda tangani di SIAP Jateng'. Jelaskan singkat bahwa proses TTE "
     "dilakukan di SIAP menggunakan passphrase BSrE milik beliau.\n"
     "DILARANG mengaku telah menandatangani berkas, atau menjanjikan BIMA "
-    "akan menandatanganinya. BIMA hanya menyiapkan konteks dan tautan.\n\n"
+    "akan menandatanganinya. BIMA hanya menyiapkan konteks dan tautan.\n"
+    "CATATAN soal draf SK: bila ada draf SK yang dibuat BIMA di tahap "
+    "sebelumnya, itu berkas BANTU yang dikirim sebagai lampiran di chat — "
+    "TIDAK tersimpan di SIAP dan TIDAK bisa diambil dari SIAP. Yang di SIAP "
+    "hanyalah SK FINAL ber-TTE setelah beliau menandatangani. JANGAN menyuruh "
+    "mencari draf SK 'di sistem SIAP'.\n\n"
     "Konteks sesi:\n"
     "- Tiket yang akan ditandatangani: {ticket}\n"
     "- Mulailah dengan sintesis rantai persetujuan (`get_case_log_notes` + "
@@ -441,6 +545,37 @@ def _documents_digest_from_ctx() -> list[dict[str, Any]]:
     return out
 
 
+# Second-person applicant phrasings that must never reach an officer (who is a
+# REVIEWER of someone else's packet, not the applicant). Rewritten to the
+# neutral "berkas permohonan ini" framing. Case-insensitive; applied to any
+# summary prose that flows through get_validation_summary so a validator/bridge
+# that still emits citizen-facing wording can't leak "permohonan izin Anda" to
+# the officer. Order matters — longer phrases first.
+_REVIEWER_REFRAME: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Longest/most-specific first so a leading "berkas " isn't left dangling
+    # (e.g. "berkas permohonan izin Anda" must not become "berkas berkas ...").
+    (re.compile(r"berkas permohonan izin Anda", re.IGNORECASE), "berkas permohonan ini"),
+    (re.compile(r"berkas permohonan Anda", re.IGNORECASE), "berkas permohonan ini"),
+    (re.compile(r"permohonan izin Anda", re.IGNORECASE), "berkas permohonan ini"),
+    (re.compile(r"permohonan Anda", re.IGNORECASE), "berkas permohonan ini"),
+    (re.compile(r"berkas Anda", re.IGNORECASE), "berkas permohonan ini"),
+    (re.compile(r"dokumen Anda", re.IGNORECASE), "dokumen pemohon"),
+    (re.compile(r"izin Anda", re.IGNORECASE), "izin yang dimohonkan"),
+)
+
+
+def _reframe_reviewer(text: str) -> str:
+    """Rewrite applicant-facing second-person phrasings ("permohonan izin Anda")
+    into the reviewer framing ("berkas permohonan ini"). The officer reviews
+    someone else's packet, so these must never address them as the applicant.
+    Best-effort text patch on the summary prose; leaves everything else intact."""
+    if not text:
+        return text
+    for pattern, repl in _REVIEWER_REFRAME:
+        text = pattern.sub(repl, text)
+    return text
+
+
 def get_validation_summary() -> dict:
     """
     Return the BIMA validator's findings for the case currently in session:
@@ -501,9 +636,20 @@ def get_validation_summary() -> dict:
 
     return {
         "available": True,
+        # The officer is the REVIEWER of someone else's packet, not the
+        # applicant — tell the model so it never addresses them as the
+        # applicant ("permohonan izin Anda"). See _reframe_reviewer + the
+        # officer/signature system prompts.
+        "audience": "petugas_peninjau",
+        "framing_note": (
+            "Ini berkas permohonan PEMOHON yang sedang ditinjau petugas. "
+            "Sampaikan sebagai peninjauan 'berkas permohonan ini' / 'berkas "
+            "pemohon' — JANGAN sapa petugas sebagai pemohon dan JANGAN gunakan "
+            "'permohonan izin Anda' atau 'berkas Anda'."
+        ),
         "score_percent": score_percent if score_percent is not None else 0,
         "status": ctx.get("status", "unverified") or "unverified",
-        "summary": ctx.get("summary", "") or "",
+        "summary": _reframe_reviewer(ctx.get("summary", "") or ""),
         "issue_count": len(issues),
         "issues": issues,
         "documents_read": _documents_digest_from_ctx(),
@@ -976,19 +1122,51 @@ async def draft_sk() -> str:
     else:  # pragma: no cover — tool exercised without a bound queue
         logger.debug("draft_sk rendered but no send queue bound")
 
+    # ALSO produce a read-only PDF of the SAME filled content and queue it, so
+    # the officer can PREVIEW the draft inline on WhatsApp — .docx does not
+    # preview reliably there (the rehearsal ".docx tidak bisa dibuka" dead-end).
+    # Pure-Python (fpdf2, already a dependency); best-effort — a None just means
+    # we ship the .docx alone, and the narration only mentions the PDF when it
+    # actually rendered. PDF = untuk dibaca, .docx = untuk diedit.
+    pdf_sent = False
+    try:
+        pdf_view = st.render_pdf_view_from_docx(docx_bytes, ticket=sk.get("ticket"))
+    except Exception:  # pragma: no cover — render_pdf_view already guards
+        logger.exception("draft_sk: PDF view render raised | license_id=%s", license_id)
+        pdf_view = None
+    if pdf_view is not None and isinstance(queue, list):
+        pdf_bytes, pdf_name = pdf_view
+        queue.append({
+            "filename": pdf_name,
+            "content": pdf_bytes,
+            "mime_type": "application/pdf",
+        })
+        pdf_sent = True
+
     filled_labels = ", ".join(_SK_FIELD_LABELS.get(k, k) for k in filled) or "(tidak ada)"
     blank_labels = ", ".join(_SK_FIELD_LABELS.get(k, k) for k in blank) or "(tidak ada)"
     logger.info(
-        "draft_sk | license_id=%s | filled=%d blank=%d",
-        license_id, len(filled), len(blank),
+        "draft_sk | license_id=%s | filled=%d blank=%d | pdf_view=%s",
+        license_id, len(filled), len(blank), pdf_sent,
+    )
+    delivery = (
+        f"Draf SK sudah saya siapkan dari template resmi SIAP dan saya kirim "
+        f"dalam dua berkas: PDF untuk dibaca/dipratinjau ({filename.rsplit('.', 1)[0]}"
+        f".pdf) dan .docx untuk diedit ({filename}). "
+        if pdf_sent
+        else (
+            f"Draf SK sudah saya siapkan dari template resmi SIAP dan saya kirim "
+            f"sebagai berkas .docx yang bisa diedit ({filename}). Bila .docx sulit "
+            "dibuka, unduh lalu buka di Word / Google Docs / WPS. "
+        )
     )
     return (
-        f"Draf SK sudah saya siapkan dari template resmi SIAP dan saya kirim "
-        f"sebagai berkas .docx yang bisa diedit ({filename}). "
-        f"Terisi otomatis: {filled_labels}. "
-        f"Masih kosong (mohon dilengkapi petugas): {blank_labels}. "
-        "Catatan: SK final diterbitkan ber-TTE oleh SIAP saat berkas disetujui "
-        "— ini draf bantu untuk Anda lengkapi."
+        delivery
+        + f"Terisi otomatis: {filled_labels}. "
+        + f"Masih kosong (mohon dilengkapi petugas): {blank_labels}. "
+        + "Catatan: draf ini berkas bantu dari BIMA yang dikirim sebagai lampiran "
+        "di chat ini — tidak tersimpan di SIAP. SK final diterbitkan ber-TTE oleh "
+        "SIAP saat berkas disetujui."
     )
 
 
@@ -1709,13 +1887,18 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
         "name": "send_document",
         "description": (
             "Kirimkan berkas dokumen ASLI yang diunggah ke chat petugas, "
-            "supaya petugas dapat melihat/menerima dokumennya sendiri. "
-            "Gunakan saat petugas meminta melihat atau menerima dokumen "
-            "tertentu, mis. 'kirim KTP-nya', 'boleh saya lihat surat "
-            "pesanannya', atau 'tolong kirimkan proposalnya'. Argumen "
-            "`doc_ref` adalah label/jenis dokumen (mis. 'KTP', 'Surat "
-            "Pesanan', 'proposal') atau file_id. Berbeda dari get_doc_summary "
-            "yang hanya MERINGKAS — tool ini benar-benar MENGIRIM berkasnya."
+            "supaya petugas dapat MELIHAT/MEMBUKA/menerima dokumennya sendiri. "
+            "WAJIB dipanggil setiap kali petugas ingin melihat/lihat/liat/buka/"
+            "tampilkan/kirim sebuah dokumen — baik permintaan UMUM ('lihat "
+            "dokumen yang diupload', 'kirim berkas yang dikirim') MAUPUN dengan "
+            "MENYEBUT NAMA ('saya mau liat surat permohonannya', 'kirim KTP-nya', "
+            "'boleh saya lihat surat pesanannya', 'buka desain kapalnya', 'tolong "
+            "kirimkan proposalnya'). Argumen `doc_ref` adalah label/jenis dokumen "
+            "(mis. 'KTP', 'Surat Permohonan', 'Surat Pesanan', 'proposal', "
+            "'desain kapal') atau file_id; untuk permintaan umum, sebut dokumen "
+            "yang tersedia. Berbeda dari get_doc_summary yang hanya MERINGKAS — "
+            "tool ini benar-benar MENGIRIM berkasnya. JANGAN menjawab dengan "
+            "prosa saja saat petugas minta melihat dokumen."
         ),
         "parameters": {
             "type": "object",
@@ -2300,10 +2483,12 @@ class OfficerCopilot:
                 if not function_calls:
                     reply_text = "".join(text_chunks).strip()
                     if not reply_text:
-                        reply_text = (
-                            "Maaf, saya tidak dapat menyusun jawaban untuk "
-                            "pertanyaan ini."
-                        )
+                        # A mis-parse must NEVER dead-end (rehearsal: "saya mau
+                        # liat surat permohonannya" → blank reply). Offer a
+                        # concrete capability menu so the officer always has a
+                        # next step — mode-aware, so the signing desk isn't
+                        # promised officer-only tools.
+                        reply_text = _empty_reply_fallback(mode)
                     new_history = list(history or [])
                     new_history.append({"role": "user", "text": message})
                     new_history.append({"role": "model", "text": reply_text})

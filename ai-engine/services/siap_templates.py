@@ -690,3 +690,122 @@ async def render_sk_docx(
 
     safe_ticket = re.sub(r"\W", "", str(ticket or "")) or "draft"
     return filled, f"SK_PPKP_{safe_ticket}.docx"
+
+
+# ---------------------------------------------------------------------------
+# PDF VIEW copy of the filled SK — so the officer can PREVIEW it on WhatsApp.
+#
+# Why: WhatsApp/APTANA does NOT reliably render an inline PREVIEW of a .docx
+# document message — the officer sees a file card they must download and open in
+# Word. During the live rehearsal that produced a ".docx tidak bisa dibuka"
+# dead-end. A PDF, by contrast, previews inline in WhatsApp. So alongside the
+# EDITABLE .docx we also produce a read-only PDF of the SAME filled content
+# (PDF = untuk dibaca, .docx = untuk diedit).
+#
+# Implementation is PURE-PYTHON — no LibreOffice/soffice in the image. We read
+# the just-filled .docx back with python-docx (paragraphs + table cells, in
+# document order) and lay the text out with fpdf2. Both libs already ship in
+# requirements.txt (fpdf2 for the citizen PPKP path, python-docx for the SIAP
+# templates), so this adds NO dependency. It is a plain-text rendering, not a
+# pixel-perfect copy — enough for the officer to READ and verify before editing
+# the .docx. Best-effort: any miss (either lib absent, parse/render error) →
+# None, and the caller simply ships the .docx alone with the honest wording.
+# ---------------------------------------------------------------------------
+
+# fpdf2's core fonts are latin-1 only; the fill line uses '…' (U+2026) and SK
+# prose may carry other non-latin-1 glyphs. Map the ones we emit, then drop the
+# rest, so a stray character can never crash the render.
+_PDF_CHAR_MAP = {
+    "…": "...", "–": "-", "—": "-", "’": "'", "‘": "'",
+    "“": '"', "”": '"', " ": " ",
+}
+
+
+def _pdf_safe_text(text: str) -> str:
+    """Make `text` safe for fpdf2's latin-1 core fonts: swap the smart-quote /
+    ellipsis / dash glyphs we know we emit, then strip anything still outside
+    latin-1 so encoding can never raise."""
+    for bad, good in _PDF_CHAR_MAP.items():
+        text = text.replace(bad, good)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def _iter_docx_lines(docx_bytes: bytes) -> list[str]:
+    """Extract the filled document's text as ordered lines (paragraphs, then each
+    table row joined by '  '), skipping blank rows. Used to lay the SK out as a
+    readable PDF view copy."""
+    from docx import Document  # lazy: only when producing the PDF view
+
+    doc = Document(io.BytesIO(docx_bytes))
+    lines: list[str] = []
+    for para in doc.paragraphs:
+        lines.append(para.text.rstrip())
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            joined = "  ".join(c for c in cells if c)
+            if joined:
+                lines.append(joined)
+    return lines
+
+
+def render_pdf_view_from_docx(
+    docx_bytes: bytes, *, ticket: Optional[str] = None
+) -> Optional[tuple[bytes, str]]:
+    """Render a READ-ONLY PDF preview of an already-filled SK .docx, so the
+    officer can view it inline on WhatsApp (which does not preview .docx).
+
+    Returns (pdf_bytes, "SK_PPKP_<ticket>.pdf") or None on ANY miss (fpdf2 or
+    python-docx absent, parse/render error). Pure-Python; never raises. The PDF
+    carries the SAME filled content as the .docx but is not editable — the .docx
+    remains the source of truth for the officer to complete.
+    """
+    try:
+        from fpdf import FPDF
+    except Exception:  # pragma: no cover — dependency guard
+        logger.info("SK PDF view: fpdf2 not available, shipping .docx only")
+        return None
+
+    try:
+        lines = _iter_docx_lines(docx_bytes)
+    except Exception:
+        logger.exception("SK PDF view: could not read filled .docx")
+        return None
+
+    try:
+        pdf = FPDF(format="A4", unit="mm")
+        # Explicit margins so the effective text width is a known positive value
+        # (fpdf2 raises "not enough horizontal space" if a multi_cell width can't
+        # fit a character — passing the computed width defensively avoids it).
+        margin = 15.0
+        pdf.set_margins(margin, margin, margin)
+        pdf.set_auto_page_break(auto=True, margin=margin)
+        pdf.add_page()
+        eff_w = pdf.w - 2 * margin  # printable width in mm
+        # A slim header so the officer sees at a glance this is the read copy.
+        pdf.set_font("Helvetica", style="B", size=9)
+        pdf.set_text_color(120, 120, 120)
+        pdf.multi_cell(
+            eff_w, 5,
+            _pdf_safe_text(
+                "SALINAN UNTUK DIBACA (Draf SK) - versi .docx yang bisa diedit "
+                "dikirim terpisah."
+            ),
+        )
+        pdf.ln(2)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", size=11)
+        for line in lines:
+            safe = _pdf_safe_text(line)
+            if safe.strip():
+                pdf.multi_cell(eff_w, 6, safe)
+            else:
+                pdf.ln(3)  # preserve blank-line spacing
+        out = pdf.output()
+        pdf_bytes = bytes(out)
+    except Exception:
+        logger.exception("SK PDF view: fpdf2 render failed")
+        return None
+
+    safe_ticket = re.sub(r"\W", "", str(ticket or "")) or "draft"
+    return pdf_bytes, f"SK_PPKP_{safe_ticket}.pdf"

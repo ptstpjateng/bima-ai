@@ -1638,8 +1638,9 @@ def _render_sk_sign_brief(
         ]
     lines += [
         "",
-        "Balas pesan ini bila ingin BIMA menyiapkan draf SK atau meringkas "
-        "catatan meja-meja sebelumnya sebelum Anda menandatangani.",
+        "Balas pesan ini bila ingin BIMA meringkas catatan meja-meja sebelumnya, "
+        "menyoroti temuan validasi dan dasar hukumnya, atau membuka kembali "
+        "tautan tanda tangan SIAP sebelum Anda menandatangani.",
     ]
     return "\n".join(lines)
 
