@@ -666,6 +666,58 @@ class TestResolveFillData(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data, {})            # nothing sourced → all blank
         self.assertEqual(classes["nama_kapal"], st.SOURCE_VISION)
 
+    async def test_nonblank_override_wins_and_is_marked_source_form(self):
+        # A NON-BLANK override (from the filled SIAP Formulir Isian) WINS over the
+        # profile source AND runs NO Vision for that key. The key is classed
+        # SOURCE_FORM. A key ABSENT from overrides still resolves normally.
+        called = {"vision": False}
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            called["vision"] = True
+            return {"nama_kapal": "SHOULD NOT BE USED"}
+
+        mod = types.ModuleType("services.gemini_vision")
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            data, classes = await st.resolve_fill_data(
+                ["nama_pemohon", "nama_kapal", "gt"],
+                profile={"full_name": "CASMO"}, case_meta={},
+                license_name=None,
+                documents={"d1": {"content": b"x", "mime_type": "application/pdf"}},
+                overrides={"nama_kapal": "KM FORMULIR"},
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        # The form override wins for nama_kapal — its value, and SOURCE_FORM class.
+        self.assertEqual(data["nama_kapal"], "KM FORMULIR")
+        self.assertEqual(classes["nama_kapal"], st.SOURCE_FORM)
+        # No Vision was run for the overridden key (gt is the only vision key
+        # left; but nama_kapal must NOT have hit Vision).
+        # profile key still resolves normally.
+        self.assertEqual(data["nama_pemohon"], "CASMO")
+        self.assertEqual(classes["nama_pemohon"], st.SOURCE_PROFILE)
+        # gt had no override and no vision value → blank, still classed VISION.
+        self.assertNotIn("gt", data)
+        self.assertEqual(classes["gt"], st.SOURCE_VISION)
+
+    async def test_blank_override_is_ignored_and_falls_through(self):
+        # A blank/whitespace override must NOT override a real source with
+        # emptiness, and must NOT fabricate: nama_pemohon still resolves from the
+        # profile, and its class stays PROFILE (not SOURCE_FORM).
+        data, classes = await st.resolve_fill_data(
+            ["nama_pemohon", "alamat"],
+            profile={"full_name": "CASMO", "address": "Jl. Laut No. 1"},
+            case_meta={}, license_name=None, documents=None, run_vision=False,
+            overrides={"nama_pemohon": "   ", "alamat": ""},
+        )
+        # Blank overrides ignored → real profile source used, classed PROFILE.
+        self.assertEqual(data["nama_pemohon"], "CASMO")
+        self.assertEqual(classes["nama_pemohon"], st.SOURCE_PROFILE)
+        self.assertEqual(data["alamat"], "Jl. Laut No. 1")
+        self.assertEqual(classes["alamat"], st.SOURCE_PROFILE)
+
 
 @unittest.skipUnless(_DEPS_OK, "python-docx/httpx not installed")
 class TestRenderOutputDocx(unittest.IsolatedAsyncioTestCase):

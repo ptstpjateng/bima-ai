@@ -285,11 +285,13 @@ class TestDraftSkTool(unittest.TestCase):
 
         # --- siap_templates ---
         async def _render_output_docx(*, internal_filename, profile, case_meta,
-                                       license_name, documents, ticket, out_prefix):
+                                       license_name, documents, ticket, out_prefix,
+                                       overrides=None):
             calls["render_output_docx"] = {
                 "internal_filename": internal_filename, "profile": profile,
                 "case_meta": case_meta, "license_name": license_name,
                 "documents": documents, "ticket": ticket, "out_prefix": out_prefix,
+                "overrides": overrides,
             }
             if rendered == "_auto":
                 fname = f"{out_prefix}_{(ticket or 'draft')}.docx"

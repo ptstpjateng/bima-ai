@@ -437,6 +437,14 @@ SOURCE_PROFILE = "profile"
 SOURCE_CASE = "case"
 SOURCE_VISION = "vision"
 SOURCE_BLANK = "blank"
+# A key whose value came straight from the request's filled SIAP Formulir Isian
+# (ptsp.form_value.properties). This is REAL data — citizen-/officer-entered or
+# BIMA-auto-filled from real reads — so it preserves the no-hallucination
+# contract. When an `overrides` map (the form_value) carries a NON-BLANK value
+# for a key, that value WINS over every other source and no Vision/profile/case
+# read is done for that key. A blank/whitespace override is IGNORED (it never
+# overrides a real source with emptiness, and never fabricates).
+SOURCE_FORM = "form"
 
 # Applicant-identity placeholder-key → person_profile.properties field.
 # Covers the exact key names seen across the investigated templates plus common
@@ -815,6 +823,21 @@ async def _extract_vision_fields(
     return out
 
 
+def _override_value(key: str, overrides: Optional[dict]) -> str:
+    """Return the NON-BLANK override value for a key from the SIAP form_value
+    map, or '' when there is none. A blank/whitespace value is IGNORED (returns
+    '') so an empty form field never overrides a real source with emptiness and
+    never fabricates. Non-string values are stringified then trimmed."""
+    if not overrides or not isinstance(overrides, dict):
+        return ""
+    if key not in overrides:
+        return ""
+    raw = overrides.get(key)
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
 async def resolve_fill_data(
     keys: list[str],
     *,
@@ -823,6 +846,7 @@ async def resolve_fill_data(
     license_name: Optional[str] = None,
     documents: Optional[dict] = None,
     run_vision: bool = True,
+    overrides: Optional[dict] = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Resolve a template's discovered placeholder keys to a fill-data map from
     REAL sources only.
@@ -830,10 +854,22 @@ async def resolve_fill_data(
     Given the discovered `keys` and the real data handles (person_profile
     `profile` dict, `case_meta` from get_request_case_meta, resolved
     `license_name`, in-session `documents`), classify each key and source it:
+      - FORM    → the request's filled SIAP Formulir Isian (`overrides`) — WINS
+        over every other source (see below)
       - PROFILE → person_profile.properties (deterministic)
       - CASE    → case meta / licence name (deterministic)
       - VISION  → ONE best-effort Gemini Vision pass over the docs (`run_vision`)
       - BLANK   → never sourced (SIAP-issued or unresolvable)
+
+    `overrides` is the request's `ptsp.form_value.properties` (the filled
+    Formulir Isian). For each discovered key, if `overrides` holds a NON-BLANK
+    value, that value is used and the key is classed SOURCE_FORM — and NO other
+    source (profile/case/Vision) runs for that key. This makes a draft reflect
+    EXACTLY what the SIAP form holds (the source of truth), with no redundant /
+    divergent re-read. A key ABSENT from `overrides` (or present but blank/
+    whitespace) still falls through to profile/case/Vision/blank exactly as
+    before — a blank override never overrides a real source with emptiness and
+    never fabricates a value.
 
     Returns `(data, classes)`:
       * `data`   — {key: value} with ONLY the keys that resolved to a NON-EMPTY
@@ -845,13 +881,22 @@ async def resolve_fill_data(
 
     NEVER raises — a source miss just yields a blank for that key. No value is
     ever fabricated: the resolver adds a key to `data` only after reading it from
-    a real source.
+    a real source (the form, the profile, the case, or the document).
     """
     classes: dict[str, str] = {}
     data: dict[str, str] = {}
     vision_keys: list[str] = []
 
     for key in keys:
+        # FORM override wins first — a NON-BLANK value from the filled SIAP
+        # Formulir Isian short-circuits every other source (and any Vision pass)
+        # for this key. A blank/whitespace override is ignored (falls through).
+        override = _override_value(key, overrides)
+        if override:
+            classes[key] = SOURCE_FORM
+            data[key] = override
+            continue
+
         cls = classify_placeholder_key(key)
         classes[key] = cls
         if cls == SOURCE_PROFILE:
@@ -873,8 +918,9 @@ async def resolve_fill_data(
                 data[key] = val
 
     logger.info(
-        "resolve_fill_data | keys=%d profile=%d case=%d vision_req=%d filled=%d",
+        "resolve_fill_data | keys=%d form=%d profile=%d case=%d vision_req=%d filled=%d",
         len(keys),
+        sum(1 for c in classes.values() if c == SOURCE_FORM),
         sum(1 for c in classes.values() if c == SOURCE_PROFILE),
         sum(1 for c in classes.values() if c == SOURCE_CASE),
         len(vision_keys),
@@ -892,16 +938,22 @@ async def render_output_docx(
     documents: Optional[dict] = None,
     ticket: Optional[str] = None,
     out_prefix: str = "Dokumen",
+    overrides: Optional[dict] = None,
 ) -> Optional[tuple[bytes, str, dict[str, str], dict[str, str]]]:
     """Generic output-template renderer for ANY licence.
 
     Fetch the fillable `.docx` at `internal_filename`, DISCOVER its `[data.KEY]`
-    keys, resolve them from REAL sources (profile / case / Vision), fill, and
-    return `(docx_bytes, filename, data, classes)` where `data` is the map that
-    was filled and `classes` is the per-key source classification (both power
-    the officer's filled-vs-blank note). Returns None on any miss (disabled, no
-    template, not a .docx, 404, python-docx absent, fill error) so the caller
+    keys, resolve them from REAL sources (form_value / profile / case / Vision),
+    fill, and return `(docx_bytes, filename, data, classes)` where `data` is the
+    map that was filled and `classes` is the per-key source classification (both
+    power the officer's filled-vs-blank note). Returns None on any miss (disabled,
+    no template, not a .docx, 404, python-docx absent, fill error) so the caller
     degrades gracefully. Never raises.
+
+    `overrides` is the request's filled SIAP Formulir Isian
+    (`ptsp.form_value.properties`). When supplied, a NON-BLANK value there WINS
+    for its key (classed SOURCE_FORM) and no other source runs for that key — so
+    the draft reflects exactly what the SIAP form holds. See resolve_fill_data.
     """
     if not _ENABLED:
         return None
@@ -926,6 +978,7 @@ async def render_output_docx(
         case_meta=case_meta,
         license_name=license_name,
         documents=documents,
+        overrides=overrides,
     )
 
     try:

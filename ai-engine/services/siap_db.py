@@ -890,3 +890,115 @@ async def get_applicant_form_id(license_id: int) -> Optional[int]:
             license_id,
         )
         return None
+
+
+# ===========================================================================
+# get_form_value_properties — read the request's filled Formulir-Isian row.
+#
+# The whole applicant Formulir Isian (text fields + FLE file slots) is ONE
+# ptsp.form_value.properties JSONB row keyed by (form_id, request_id); its keys
+# ARE the SK template keys. SIAP generates the SK FROM that form_value. The
+# officer copilot's draft_sk reads it back so a draft reflects EXACTLY what the
+# citizen/officer entered in SIAP (no divergent re-read), and the DRAFT GATE
+# refuses to draft while the vessel-subject fields are still blank.
+#
+# Read-only by contract (parameterised SELECT + the read-only-transaction pool
+# guard). NEVER raises — a miss / DB error / unconfigured DB returns {} so the
+# caller degrades. The property VALUES are PII / applicant data and are NEVER
+# logged — only the form_id, request_id, and the COUNT of keys.
+# ===========================================================================
+
+# (form_id, request_id) → the filled form's properties JSONB (as text, parsed
+# by the caller). The whole JSONB is returned so the caller can read ANY field
+# key the form holds without this module knowing the form's key set in advance.
+_SQL_FORM_VALUE = """
+    SELECT properties
+      FROM ptsp.form_value
+     WHERE form_id = $1
+       AND request_id = $2
+     LIMIT 1
+"""
+
+
+async def get_form_value_properties(form_id: int, request_id: int) -> Optional[dict]:
+    """Return the request's filled `ptsp.form_value.properties` as a dict.
+
+    Keyed by (form_id, request_id) — the ONE JSONB row that holds the whole
+    applicant Formulir Isian (text fields + file slots). Its keys are the SK
+    template keys; SIAP generates the SK from this row. draft_sk reads it as the
+    source of truth for a draft, and the DRAFT GATE keys on whether its
+    vessel-subject fields are filled.
+
+    NEVER raises. Return contract distinguishes "definitely not filled" from
+    "could not read":
+      * `{}` — the row is genuinely absent / properties NULL / unconfigured DB /
+        bad ids / corrupt JSON. The form is treated as EMPTY (the gate applies).
+      * `None` — a transient DB read error (pool/query failure). The caller
+        CANNOT tell whether the form is filled, so it must NOT gate on this (a
+        DB hiccup should degrade to the ungated draft, not a false "form empty"
+        refusal on an already-filled form).
+    The property VALUES are applicant PII and are NEVER logged (only the ids +
+    the key COUNT). Mirrors get_request_case_meta / get_person_profile_properties.
+    """
+    if not is_siap_db_configured():
+        logger.info(
+            "get_form_value_properties: SIAP DB not configured | form_id=%s "
+            "request_id=%s",
+            form_id, request_id,
+        )
+        return {}
+    try:
+        fid = int(form_id)
+        rid = int(request_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "get_form_value_properties: bad ids | form_id=%r request_id=%r",
+            form_id, request_id,
+        )
+        return {}
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_FORM_VALUE, fid, rid)
+        if row is None or row["properties"] is None:
+            logger.info(
+                "get_form_value_properties: form_value not found | form_id=%s "
+                "request_id=%s",
+                fid, rid,
+            )
+            return {}
+        raw = row["properties"]
+        # asyncpg returns a JSONB column as a str (no codec registered) or, with
+        # a codec, as a dict. Handle both; a str is parsed with json.
+        if isinstance(raw, str):
+            import json
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "get_form_value_properties: properties not valid JSON | "
+                    "form_id=%s request_id=%s", fid, rid,
+                )
+                return {}
+        elif isinstance(raw, dict):
+            parsed = raw
+        else:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        # Never log the values — only how many keys were read.
+        logger.info(
+            "get_form_value_properties | form_id=%s request_id=%s keys=%d",
+            fid, rid, len(parsed),
+        )
+        return parsed
+    except Exception:  # pragma: no cover — defensive; never break the officer path
+        # A transient READ failure (pool/query error) — NOT a genuine empty form.
+        # Return None so the caller degrades to the ungated draft instead of
+        # falsely refusing "Formulir Isian masih kosong" on a filled form.
+        logger.exception(
+            "get_form_value_properties read failed (returning None) | form_id=%s "
+            "request_id=%s",
+            form_id, request_id,
+        )
+        return None

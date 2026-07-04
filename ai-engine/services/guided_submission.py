@@ -731,8 +731,11 @@ async def _send_to_user(user_id: str, text: str) -> bool:
             return await send_text(recipient_phone=msisdn, body=text)
         if user_id.startswith("tg-"):
             # Best-effort Telegram support — only if a sender module exists.
+            # telegram_sender exposes send_text(chat_id, body) (NOT send_message);
+            # the old import name silently ImportError'd, so tg out-of-band
+            # replies always no-op'd. Use the real function + param names.
             try:
-                from services.telegram_sender import send_message  # type: ignore
+                from services.telegram_sender import send_text as tg_send
             except Exception:
                 logger.warning(
                     "Guided-submission: no telegram sender for out-of-band reply "
@@ -740,7 +743,7 @@ async def _send_to_user(user_id: str, text: str) -> bool:
                 )
                 return False
             chat_id = user_id[3:]
-            return await send_message(chat_id=chat_id, text=text)
+            return await tg_send(chat_id=chat_id, body=text)
         logger.warning(
             "Guided-submission: unknown channel for out-of-band reply | user=%s",
             _mask(user_id),
@@ -1708,8 +1711,15 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
     # best-effort guarding (per-file try/except, PII masking, no-op when the doc
     # client is unconfigured) lives INSIDE _upload_docs_to_siap. Only runs once
     # we have the numeric request_id (the document API is keyed by it, not ticket).
+    #
+    # AUTO-FILL the SIAP Formulir Isian too (task): the upload MUST complete first
+    # so the SIAP APPLICANT-UPLOAD file_ids exist for the form's file slots — so
+    # we spawn ONE task that uploads THEN auto-fills, and sends the citizen a
+    # follow-up. This is fully backgrounded: it never delays or alters the success
+    # reply below, and never raises. profile_id_for_request is threaded so the
+    # auto-fill can source the applicant identity from person_profile.
     if request_id is not None:
-        _spawn_doc_upload(sess, int(request_id))
+        _spawn_upload_then_fill(sess, int(request_id), profile_id_for_request)
 
     # --- Officer hand-off: brief + score (fire-and-forget) ---
     if ticket:
@@ -1858,6 +1868,309 @@ async def _upload_docs_to_siap(sess: SubmissionSession, request_id: int) -> None
             "| request_id=%s",
             _mask(sess.user_id), request_id,
         )
+
+
+# ===========================================================================
+# CITIZEN auto-fill of the SIAP Formulir Isian at submission.
+#
+# DECISION: auto-fill at submission. After a successful submit, BIMA fills the
+# request's Formulir Isian (form 560 for PKPP, discovered generically) from the
+# SAME no-hallucination fill core the officer copilot uses — profile-sourced +
+# Vision-sourced + never fabricated — then sends the citizen ONE warm follow-up
+# listing the FIELD LABELS it filled and the ones still blank (asking them to
+# complete those). SIAP generates the SK from this form, so pre-filling it saves
+# the officer a manual step.
+#
+# ORDERING: the doc upload MUST finish first so the SIAP APPLICANT-UPLOAD
+# file_ids exist for the form's file slots — `_spawn_upload_then_fill` awaits the
+# upload, THEN runs the auto-fill. Fully backgrounded; NEVER delays/alters the
+# citizen success reply and NEVER raises. Degrades silently (no message, no
+# crash) when the form/doc client is unconfigured or the form_id is None.
+# NIK/nama/alamat VALUES and any SIAP_* token are NEVER logged.
+# ===========================================================================
+
+# Human labels for the Formulir-Isian text field keys, for the citizen note.
+# Warm, plain-Indonesian labels (Bapak/Ibu audience).
+_CITIZEN_FORM_FIELD_LABELS: dict[str, str] = {
+    "nama_kapal": "Nama Kapal",
+    "gt": "Ukuran Kapal (GT)",
+    "thn_bangun": "Tahun Pembangunan",
+    "tipe": "Tipe/Jenis Kapal",
+    "alat": "Alat Penangkapan Ikan",
+    "bahan": "Bahan Utama Kapal",
+    "galangan": "Nama dan Lokasi Galangan",
+    "alamat": "Alamat Lengkap",
+    "tgl_srt_permohonan": "Tanggal Surat Permohonan",
+    "perihal_surat_perm": "Perihal Surat Permohonan",
+    "nama_pemohon": "Nama Pemohon",
+    "no_siup": "Nomor SIUP",
+    "tgl_siup": "Tanggal SIUP",
+    "jenis_pengadaan": "Jenis Pengadaan",
+}
+
+
+def _citizen_form_label(key: str) -> str:
+    """A warm citizen-facing label for a Formulir-Isian key (Title-Case fallback)."""
+    return _CITIZEN_FORM_FIELD_LABELS.get(
+        key, (key or "").replace("_", " ").strip().title() or key
+    )
+
+
+def _spawn_upload_then_fill(
+    sess: SubmissionSession, request_id: int, profile_id: Optional[int]
+) -> None:
+    """Detach `_upload_then_fill` as a fire-and-forget task so a slow SIAP can't
+    delay the citizen's success reply.
+
+    Uses the SAME strong-ref + done-callback pattern as `_spawn_doc_upload`: hold
+    the task in `_upload_tasks` until it finishes (the event loop only weakly
+    references pending tasks) and discard it in a done-callback that retrieves any
+    exception. `_upload_then_fill` swallows every error internally; this is a
+    defence-in-depth backstop. Never raises; on the (unexpected) no-running-loop
+    path it logs and returns, leaving the already-successful submit untouched.
+    """
+    try:
+        task = asyncio.create_task(
+            _upload_then_fill(sess, request_id, profile_id)
+        )
+    except RuntimeError:
+        # No running event loop (shouldn't happen on the submit path). The submit
+        # already succeeded; the upload + auto-fill are best-effort, so skip.
+        logger.warning(
+            "Guided-submission: could not schedule upload-then-fill (no loop) | "
+            "user=%s | request_id=%s",
+            _mask(sess.user_id), request_id,
+        )
+        return
+    _upload_tasks.add(task)  # strong ref until the done-callback discards it
+
+    def _done(t: asyncio.Task) -> None:
+        _upload_tasks.discard(t)
+        if not t.cancelled():
+            exc = t.exception()
+            if exc is not None:  # pragma: no cover — inner coro never re-raises
+                logger.warning(
+                    "Guided-submission upload-then-fill task errored (non-fatal) "
+                    "| user=%s | request_id=%s | err=%s",
+                    _mask(sess.user_id), request_id, exc,
+                )
+
+    task.add_done_callback(_done)
+
+
+async def _upload_then_fill(
+    sess: SubmissionSession, request_id: int, profile_id: Optional[int]
+) -> None:
+    """Upload the citizen's docs to SIAP, THEN auto-fill the Formulir Isian.
+
+    The upload MUST complete first so the SIAP APPLICANT-UPLOAD file_ids exist
+    for the form's file slots. Both steps are strictly best-effort and wrapped so
+    a failure in either is logged (PII-masked) and swallowed — this runs AFTER
+    the citizen has been told their permit is filed and must never raise.
+    """
+    await _upload_docs_to_siap(sess, request_id)
+    try:
+        await _auto_fill_siap_form_for_citizen(sess, request_id, profile_id)
+    except Exception:
+        # Absolute backstop — the auto-fill can never touch the citizen's
+        # already-successful submission.
+        logger.exception(
+            "Guided-submission auto-fill block failed (non-fatal) | user=%s | "
+            "request_id=%s",
+            _mask(sess.user_id), request_id,
+        )
+
+
+async def _auto_fill_siap_form_for_citizen(
+    sess: SubmissionSession, request_id: int, profile_id: Optional[int]
+) -> None:
+    """Auto-fill the request's SIAP Formulir Isian from REAL sources, then send
+    the citizen ONE warm follow-up naming the filled + still-blank fields.
+
+    Degrades SILENTLY (no message, no crash) when: the licence has no discoverable
+    applicant form (form_id None), the form/doc client is unconfigured, or a read
+    fails. Reuses officer_copilot._perform_form_fill so the no-hallucination
+    contract is identical to the officer path. Never logs NIK/nama/alamat VALUES
+    or any SIAP_* token — only counts + ids.
+    """
+    try:
+        license_id = sess.license_id
+        if not license_id:
+            return
+
+        from services import siap_db as sdb
+
+        # 1) Discover the applicant Formulir-Isian form_id (skip silently if None).
+        try:
+            form_id = await sdb.get_applicant_form_id(int(license_id))
+        except Exception:
+            logger.exception(
+                "Guided-submission auto-fill: form_id resolve failed | user=%s",
+                _mask(sess.user_id),
+            )
+            form_id = None
+        if form_id is None:
+            logger.info(
+                "Guided-submission auto-fill skipped (no applicant form) | "
+                "user=%s | request_id=%s",
+                _mask(sess.user_id), request_id,
+            )
+            return
+
+        # 2) Real data handles — profile (identity), case meta + licence name
+        #    (jenis_pengadaan/ticket). All degrade to empty; never raise.
+        profile: dict = {}
+        if profile_id is not None:
+            try:
+                profile = await sdb.get_person_profile_properties(int(profile_id))
+            except Exception:
+                logger.exception(
+                    "Guided-submission auto-fill: profile read failed | user=%s",
+                    _mask(sess.user_id),
+                )
+                profile = {}
+
+        case_meta: dict = {}
+        license_name = sess.license_name
+        try:
+            case_meta = await sdb.get_request_case_meta(int(request_id))
+            if not license_name:
+                license_name = await sdb.get_license_name(int(license_id))
+        except Exception:
+            logger.exception(
+                "Guided-submission auto-fill: case-meta read failed | user=%s",
+                _mask(sess.user_id),
+            )
+
+        # 3) vision_documents — the in-session bytes (for the Vision TEXT pass),
+        #    keyed the copilot `_doc_context` way.
+        vision_documents: dict = {}
+        for d in sess.documents:
+            if not d.content:
+                continue
+            vision_documents[str(d.file_id)] = {
+                "filename": d.filename or "",
+                "mime_type": d.mime_type or "application/octet-stream",
+                "content": d.content,
+                "claimed_type": d.claimed_type or "",
+            }
+
+        # 4) slot_documents — the SIAP APPLICANT-UPLOAD file_ids + filenames now
+        #    present on the request (the upload finished before this runs).
+        slot_documents: list[dict] = []
+        try:
+            from services.siap_document_client import get_siap_document_client
+            doc_client = get_siap_document_client()
+            if doc_client.is_configured():
+                listing = await doc_client.list_documents(int(request_id))
+                if listing.get("ok"):
+                    for entry in listing.get("documents") or []:
+                        fid = entry.get("file_id")
+                        if fid is None:
+                            continue
+                        slot_documents.append({
+                            "file_id": fid,
+                            "filename": str(entry.get("filename") or "").strip(),
+                            "label": "",
+                        })
+        except Exception:
+            logger.exception(
+                "Guided-submission auto-fill: doc-list read failed | user=%s",
+                _mask(sess.user_id),
+            )
+            slot_documents = []
+
+        # 5) SHARED fill core — resolves TEXT fields, maps slots, upserts. Best-
+        #    effort; on a not-configured form client it returns ok=False,
+        #    configured=False and we degrade silently (no citizen message).
+        from services.agents import officer_copilot as oc
+
+        core_case_meta = case_meta
+        if not core_case_meta and sess.ticket:
+            core_case_meta = {"ticket": sess.ticket}
+
+        core = await oc._perform_form_fill(
+            request_id=int(request_id),
+            license_id=int(license_id),
+            form_id=int(form_id),
+            profile=profile,
+            case_meta=core_case_meta,
+            license_name=license_name,
+            vision_documents=vision_documents,
+            slot_documents=slot_documents,
+        )
+
+        if not core.get("configured"):
+            # No SIAP form seam on this env → degrade silently (no message).
+            logger.info(
+                "Guided-submission auto-fill: form client not configured | "
+                "user=%s | request_id=%s",
+                _mask(sess.user_id), request_id,
+            )
+            return
+
+        filled_keys = list((core.get("filled") or {}).keys())
+        blank_keys = list(core.get("blank_keys") or [])
+
+        # Only message when an applicant form exists (it does — form_id resolved),
+        # i.e. at least one field filled OR some are missing. Guard against the
+        # (impossible) all-empty case so we never send a contentless note.
+        if not filled_keys and not blank_keys:
+            return
+
+        logger.info(
+            "Guided-submission auto-fill | user=%s | request_id=%s | form_id=%s "
+            "| ok=%s | filled=%d blank=%d",
+            _mask(sess.user_id), request_id, form_id, core.get("ok"),
+            len(filled_keys), len(blank_keys),
+        )
+
+        note = _citizen_autofill_note(sess.license_name, filled_keys, blank_keys)
+
+        # 6) Send ONE warm follow-up to the citizen. Route through the
+        # channel-aware _send_to_user: sess.user_id is prefixed ('wa-{msisdn}' /
+        # 'tg-{chat_id}'), and only _send_to_user strips the prefix and picks the
+        # right sender. Sending the raw prefixed id to whatsapp_sender.send_text
+        # would misdeliver a Telegram citizen's Formulir-Isian field labels to an
+        # unrelated number (normalize_phone would turn 'tg-123' into a phone).
+        # Best-effort; _send_to_user never raises.
+        await _send_to_user(sess.user_id, note)
+    except Exception:
+        logger.exception(
+            "Guided-submission auto-fill failed (non-fatal) | user=%s | "
+            "request_id=%s",
+            _mask(sess.user_id), request_id,
+        )
+
+
+def _citizen_autofill_note(
+    license_name: Optional[str], filled_keys: list, blank_keys: list
+) -> str:
+    """Compose the warm citizen follow-up: BIMA auto-filled the Formulir Isian
+    from their documents; here are the filled fields; please complete the blanks.
+    Field labels only — never the VALUES."""
+    filled_labels = ", ".join(_citizen_form_label(k) for k in filled_keys)
+    blank_labels = ", ".join(_citizen_form_label(k) for k in blank_keys)
+    izin = license_name or "permohonan"
+
+    lines = [
+        f"Bapak/Ibu, kabar baik: BIMA telah mengisikan sebagian Formulir Isian "
+        f"{izin} di SIAP secara otomatis dari dokumen yang Bapak/Ibu kirimkan.",
+    ]
+    if filled_labels:
+        lines.append(f"Sudah terisi: {filled_labels}.")
+    if blank_labels:
+        lines.append(
+            f"Yang masih perlu Bapak/Ibu lengkapi: {blank_labels}. Mohon "
+            "kirimkan datanya kepada saya, atau isi langsung di SIAP agar "
+            "permohonan dapat segera diproses."
+        )
+    else:
+        lines.append(
+            "Seluruh data yang diperlukan sudah terisi. Petugas akan memeriksa "
+            "dan memproses permohonan Bapak/Ibu."
+        )
+    return " ".join(lines)
 
 
 # ===========================================================================
