@@ -25,6 +25,9 @@ import io
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 from typing import Any, Optional
 
 import httpx
@@ -1562,6 +1565,77 @@ def _iter_docx_lines(docx_bytes: bytes) -> list[str]:
             if joined:
                 lines.append(joined)
     return lines
+
+
+# ---------------------------------------------------------------------------
+# High-fidelity DOCX → PDF via LibreOffice (soffice --headless).
+#
+# The fpdf2 path below is a PLAIN-TEXT re-layout — it drops the SK's letterhead,
+# tables and alignment, so the officer sees a garbled/near-empty page. When
+# LibreOffice is present in the image it renders the ACTUAL filled .docx to PDF
+# (real letterhead + tables), so the officer gets a faithful preview of the SK.
+# Pure best-effort: returns None when soffice is absent / the convert fails /
+# times out, and the caller falls back to the fpdf2 view. NEVER raises.
+# ---------------------------------------------------------------------------
+_SOFFICE_TIMEOUT = float(os.getenv("BIMA_SOFFICE_TIMEOUT", "45"))
+
+
+def _soffice_bin() -> Optional[str]:
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def _convert_docx_to_pdf_sync(docx_bytes: bytes) -> Optional[bytes]:
+    """Blocking soffice conversion — run via asyncio.to_thread. NEVER raises."""
+    soffice = _soffice_bin()
+    if not soffice:
+        logger.info("SK PDF: LibreOffice not installed, using fpdf2 fallback")
+        return None
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="bima_pdf_")
+        src = os.path.join(tmpdir, "draft.docx")
+        with open(src, "wb") as fh:
+            fh.write(docx_bytes)
+        # soffice needs a writable profile dir; point HOME at the temp dir so a
+        # locked-down /root or a stale profile never blocks the convert.
+        env = dict(os.environ, HOME=tmpdir)
+        proc = subprocess.run(
+            [soffice, "--headless", "--nologo", "--nofirststartwizard",
+             "--convert-to", "pdf:writer_pdf_Export", "--outdir", tmpdir, src],
+            capture_output=True, timeout=_SOFFICE_TIMEOUT, env=env, check=False,
+        )
+        out_pdf = os.path.join(tmpdir, "draft.pdf")
+        if not os.path.exists(out_pdf):
+            logger.warning(
+                "SK PDF: soffice produced no pdf (rc=%s)", proc.returncode
+            )
+            return None
+        with open(out_pdf, "rb") as fh:
+            data = fh.read()
+        return data or None
+    except subprocess.TimeoutExpired:
+        logger.warning("SK PDF: soffice convert timed out (%.0fs)", _SOFFICE_TIMEOUT)
+        return None
+    except Exception:  # pragma: no cover — defensive; fall back to fpdf2
+        logger.exception("SK PDF: soffice convert failed")
+        return None
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def render_docx_to_pdf(docx_bytes: bytes) -> Optional[bytes]:
+    """Render a filled SK .docx to a faithful PDF via LibreOffice (off the event
+    loop). Returns the PDF bytes, or None when LibreOffice is unavailable / the
+    convert fails — the caller then falls back to the fpdf2 text view. Never
+    raises. The .docx bytes are never logged."""
+    if not docx_bytes:
+        return None
+    try:
+        return await asyncio.to_thread(_convert_docx_to_pdf_sync, docx_bytes)
+    except Exception:  # pragma: no cover — to_thread wrapper guard
+        logger.exception("SK PDF: render_docx_to_pdf wrapper failed")
+        return None
 
 
 def render_pdf_view_from_docx(

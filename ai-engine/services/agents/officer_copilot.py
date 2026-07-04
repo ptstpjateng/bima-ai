@@ -328,14 +328,13 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "untuk mengisi Formulir Isian lebih dulu; setelah terisi, draf baru bisa "
     "dibuat.\n"
     "SIFAT DRAF SK (WAJIB, JANGAN HALUSINASI): draf SK dari `draft_sk` adalah "
-    "berkas BANTU buatan BIMA yang DIKIRIM sebagai lampiran dokumen di chat ini "
-    "(PDF untuk dibaca + .docx untuk diedit). Draf ini TIDAK tersimpan di SIAP "
+    "berkas BANTU buatan BIMA yang DIKIRIM sebagai lampiran PDF di chat ini. "
+    "Draf ini TIDAK tersimpan di SIAP "
     "dan TIDAK bisa diambil dari SIAP. DILARANG menyuruh petugas mencari draf "
     "ini 'di sistem SIAP' — hanya SK FINAL ber-TTE yang diterbitkan SIAP saat "
-    "berkas disetujui. Bila petugas mengatakan berkas .docx sulit dibuka, "
-    "jawab jujur: berkas dikirim sebagai lampiran WhatsApp — unduh lalu buka di "
-    "Word / Google Docs / WPS; tawarkan untuk mengirim ulang atau mengirim "
-    "salinan PDF untuk dibaca. JANGAN mengarang bahwa draf ada di SIAP.\n\n"
+    "berkas disetujui. Bila petugas mengatakan berkas sulit dibuka, "
+    "jawab jujur: berkas dikirim sebagai lampiran PDF WhatsApp — unduh lalu buka; "
+    "tawarkan untuk mengirim ulang. JANGAN mengarang bahwa draf ada di SIAP.\n\n"
     "=== ISI FORMULIR ISIAN DI SIAP (fill_siap_form) — SK DIBUAT SIAP DARI FORM INI ===\n"
     "Ada DUA hal berbeda; JANGAN tertukar:\n"
     "  - `draft_sk` = draf BANTU (PDF/.docx) yang dikirim ke chat; TIDAK tersimpan "
@@ -1519,43 +1518,60 @@ async def draft_sk() -> str:
     ]
     filled_vision = [k for k in filled if classes.get(k) == st.SOURCE_VISION]
 
-    # Queue the rendered .docx for out-of-band delivery on the officer channel.
+    # Send ONLY the PDF (the officer wants a single readable file). Prefer a REAL
+    # LibreOffice conversion of the filled .docx (keeps the official letterhead +
+    # tables); fall back to the pure-Python fpdf2 text view; and only if NO pdf
+    # can be produced at all, send the editable .docx as a last resort so the
+    # officer still gets the draft.
     queue = _docs_to_send_context.get()
+    pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
+    pdf_bytes = None
+    try:
+        pdf_bytes = await st.render_docx_to_pdf(docx_bytes)
+    except Exception:  # pragma: no cover — render_docx_to_pdf already guards
+        logger.exception("draft_sk: soffice PDF convert raised | license_id=%s", license_id)
+        pdf_bytes = None
+    if not pdf_bytes:
+        try:
+            pdf_view = st.render_pdf_view_from_docx(docx_bytes, ticket=ticket)
+            if pdf_view is not None:
+                pdf_bytes = pdf_view[0]
+        except Exception:  # pragma: no cover — render_pdf_view already guards
+            logger.exception("draft_sk: fpdf2 PDF fallback raised | license_id=%s", license_id)
+
+    pdf_sent = False
     if isinstance(queue, list):
-        queue.append({
-            "filename": filename,
-            "content": docx_bytes,
-            "mime_type": (
-                "application/vnd.openxmlformats-officedocument."
-                "wordprocessingml.document"
-            ),
-        })
+        if pdf_bytes:
+            queue.append({
+                "filename": pdf_name,
+                "content": pdf_bytes,
+                "mime_type": "application/pdf",
+            })
+            pdf_sent = True
+        else:
+            queue.append({
+                "filename": filename,
+                "content": docx_bytes,
+                "mime_type": (
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+            })
     else:  # pragma: no cover — tool exercised without a bound queue
         logger.debug("draft_sk rendered but no send queue bound")
 
-    # ALSO produce a read-only PDF of the SAME filled content and queue it, so
-    # the officer can PREVIEW the draft inline on WhatsApp — .docx does not
-    # preview reliably there. Pure-Python (fpdf2); best-effort.
-    pdf_sent = False
-    try:
-        pdf_view = st.render_pdf_view_from_docx(docx_bytes, ticket=ticket)
-    except Exception:  # pragma: no cover — render_pdf_view already guards
-        logger.exception("draft_sk: PDF view render raised | license_id=%s", license_id)
-        pdf_view = None
-    if pdf_view is not None and isinstance(queue, list):
-        pdf_bytes, _pdf_name = pdf_view
-        # Name the PDF after the docx so the pair reads as one document.
-        pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
-        queue.append({
-            "filename": pdf_name,
-            "content": pdf_bytes,
-            "mime_type": "application/pdf",
-        })
-        pdf_sent = True
-
+    # Tgl. Penetapan / Pengesahan is the SIGNING date — SIAP stamps it when the
+    # SK is ditetapkan/ditandatangani (TTE), NOT something the officer types in.
+    # Keep it out of the "mohon dilengkapi petugas" nag; note it separately.
+    _signing_blank = [k for k in blank if any(h in k.lower() for h in ("penetapan", "pengesahan"))]
+    _officer_blank = [k for k in blank if k not in _signing_blank]
     official_labels = ", ".join(_pretty_field_label(k) for k in filled_official) or "(tidak ada)"
     vision_labels = ", ".join(_pretty_field_label(k) for k in filled_vision) or "(tidak ada)"
-    blank_labels = ", ".join(_pretty_field_label(k) for k in blank) or "(tidak ada)"
+    blank_labels = ", ".join(_pretty_field_label(k) for k in _officer_blank) or "(tidak ada)"
+    signing_note = (
+        " " + ", ".join(_pretty_field_label(k) for k in _signing_blank)
+        + " akan terisi otomatis saat SK ditetapkan/ditandatangani (TTE) di SIAP."
+    ) if _signing_blank else ""
     logger.info(
         "draft_sk | license_id=%s | kind=%s fell_back=%s | keys=%d filled=%d "
         "(official=%d vision=%d) blank=%d | pdf_view=%s",
@@ -1577,13 +1593,12 @@ async def draft_sk() -> str:
 
     delivery = (
         f"Draf {doc_label} sudah saya siapkan dari template resmi SIAP dan saya "
-        f"kirim dalam dua berkas: PDF untuk dibaca/dipratinjau ({filename.rsplit('.', 1)[0]}"
-        f".pdf) dan .docx untuk diedit ({filename}). "
+        f"kirim sebagai PDF untuk dibaca/dipratinjau ({pdf_name}). "
         if pdf_sent
         else (
             f"Draf {doc_label} sudah saya siapkan dari template resmi SIAP dan "
-            f"saya kirim sebagai berkas .docx yang bisa diedit ({filename}). Bila "
-            ".docx sulit dibuka, unduh lalu buka di Word / Google Docs / WPS. "
+            f"saya kirim sebagai berkas .docx ({filename}). Bila .docx sulit "
+            "dibuka, unduh lalu buka di Word / Google Docs / WPS. "
         )
     )
     return (
@@ -1593,7 +1608,7 @@ async def draft_sk() -> str:
         f"{official_labels}. "
         + f"Dibaca otomatis dari dokumen unggahan — MOHON DIPERIKSA petugas "
         f"karena hasil pembacaan bisa keliru: {vision_labels}. "
-        + f"Masih kosong (mohon dilengkapi petugas): {blank_labels}. "
+        + f"Masih kosong (mohon dilengkapi petugas): {blank_labels}.{signing_note} "
         + "Catatan: draf ini berkas bantu dari BIMA yang dikirim sebagai lampiran "
         "di chat ini — tidak tersimpan di SIAP. Dokumen final diterbitkan "
         "ber-TTE oleh SIAP saat berkas disetujui."
