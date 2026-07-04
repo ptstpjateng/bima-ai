@@ -1275,15 +1275,11 @@ async def draft_sk() -> str:
         )
 
     # 2) Fetch REAL data handles (all read-only, all degrade to empty).
-    profile: dict = {}
-    profile_id = sk.get("profile_id")
-    if profile_id is not None:
-        try:
-            profile = await sdb.get_person_profile_properties(int(profile_id))
-        except Exception:
-            logger.exception("draft_sk: profile read failed | profile_id set")
-            profile = {}
-
+    #    Resolve the case meta FIRST so the applicant profile_id can fall back
+    #    to it: a durable/rehydrated officer session may carry no profile_id (or
+    #    one encoded before the request was profile-linked), and reading the
+    #    profile off a stale sk_context alone would leave nama_pemohon/alamat
+    #    blank on the draft even though SIAP has them on the linked profile.
     case_meta: dict = {}
     license_name = sk.get("license_name")
     request_id = None
@@ -1297,6 +1293,15 @@ async def draft_sk() -> str:
             license_name = await sdb.get_license_name(int(license_id))
     except Exception:
         logger.exception("draft_sk: case-meta read failed | license_id=%s", license_id)
+
+    profile: dict = {}
+    profile_id = sk.get("profile_id") or (case_meta.get("profile_id") if case_meta else None)
+    if profile_id is not None:
+        try:
+            profile = await sdb.get_person_profile_properties(int(profile_id))
+        except Exception:
+            logger.exception("draft_sk: profile read failed | profile_id set")
+            profile = {}
 
     # 3) GENERIC render — discover keys, resolve from real sources, fill.
     try:
@@ -1699,7 +1704,6 @@ async def fill_siap_form() -> str:
 
     license_id = sk.get("license_id")
     ticket = sk.get("ticket")
-    profile_id = sk.get("profile_id")
 
     if not license_id:
         return (
@@ -1755,14 +1759,11 @@ async def fill_siap_form() -> str:
     #    licence name (jenis_pengadaan/ticket), and the in-session docs (Vision).
     documents = _doc_context.get() or {}
 
-    profile: dict = {}
-    if profile_id is not None:
-        try:
-            profile = await sdb.get_person_profile_properties(int(profile_id))
-        except Exception:
-            logger.exception("fill_siap_form: profile read failed | profile_id set")
-            profile = {}
-
+    # Case meta FIRST so the applicant profile_id can fall back to it: a
+    # durable/rehydrated officer session may carry no profile_id (or one encoded
+    # before the request was profile-linked), and reading the profile off a
+    # stale sk_context alone would leave nama_pemohon/alamat unfilled on the
+    # SIAP form even though SIAP has them on the linked profile.
     license_name = sk.get("license_name")
     case_meta: dict = {}
     try:
@@ -1773,6 +1774,15 @@ async def fill_siap_form() -> str:
         logger.exception(
             "fill_siap_form: case-meta read failed | license_id=%s", license_id
         )
+
+    profile: dict = {}
+    profile_id = sk.get("profile_id") or (case_meta.get("profile_id") if case_meta else None)
+    if profile_id is not None:
+        try:
+            profile = await sdb.get_person_profile_properties(int(profile_id))
+        except Exception:
+            logger.exception("fill_siap_form: profile read failed | profile_id set")
+            profile = {}
 
     try:
         data, classes = await st.resolve_fill_data(

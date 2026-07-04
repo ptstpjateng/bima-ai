@@ -807,20 +807,25 @@ async def get_license_name(license_id: int) -> Optional[str]:
 # form-value endpoint's form_id-belongs-to-licence guard, a different write
 # entirely.
 #
-# SIAP itself discriminates the applicant form with the filter in
-# License::GetLicenseRequestFormPemohon: `forms.code LIKE '%Form Pemohon%'`
-# (the Penomoran form's code does NOT match). We mirror that EXACTLY (ILIKE for
-# case-insensitivity), then pick the lowest form_id deterministically so a
-# licence with more than one applicant form is stable. This is a data-driven
-# read — no hardcoded per-licence form_id (PKPP 459 → 560 is discovered here,
-# not baked in). Read-only; the form code/name are non-PII.
+# SIAP discriminates the applicant form by the human title "Form Pemohon".
+# NOTE: on live Beta both PKPP forms share code='ppkp' — the discriminator is in
+# forms.NAME, not forms.code (form 560 name="Form Pemohon Persetujuan Pengadaan
+# Kapal Perikanan" vs form 768 name="Form Penomoran PPKP"). SIAP's own
+# License::GetLicenseRequestFormPemohon filters `forms.code LIKE '%Form Pemohon%'`,
+# which matches NOTHING against this data — so we filter `forms.name ILIKE
+# '%Form Pemohon%'` (the Penomoran form's name does NOT match: "Penomoran" ≠
+# "Pemohon"), then pick the lowest form_id deterministically so a licence with
+# more than one applicant form is stable. Data-driven — no hardcoded per-licence
+# form_id (PKPP 459 → 560 is discovered here, not baked in). Read-only; the form
+# code/name are non-PII.
 # ===========================================================================
 
 # license_id → the APPLICANT "Formulir Isian" form_id. Walks the same join as
-# License::GetLicenseRequestForm and filters to the applicant form the way
-# License::GetLicenseRequestFormPemohon does (forms.code ILIKE '%Form Pemohon%').
-# DISTINCT + lowest form_id so a multi-step licence that references the same
-# applicant form on several steps still yields one deterministic id.
+# License::GetLicenseRequestForm and filters to the applicant form by its title
+# (forms.name ILIKE '%Form Pemohon%') — NOT forms.code, which is 'ppkp' for both
+# the applicant and the Penomoran form on live data. DISTINCT + lowest form_id so
+# a multi-step licence that references the same applicant form on several steps
+# still yields one deterministic id.
 _SQL_APPLICANT_FORM_ID = """
     SELECT f.form_id
       FROM ptsp.license_approval_step s
@@ -829,7 +834,7 @@ _SQL_APPLICANT_FORM_ID = """
       JOIN ptsp.forms f
             ON f.form_id = sf.form_id
      WHERE s.license_id = $1
-       AND f.code ILIKE '%Form Pemohon%'
+       AND f.name ILIKE '%Form Pemohon%'
      ORDER BY f.form_id
      LIMIT 1
 """
@@ -840,9 +845,10 @@ async def get_applicant_form_id(license_id: int) -> Optional[int]:
 
     Resolves the applicant input form via
     license_approval_step -> license_approval_step_form -> forms, filtered to
-    `forms.code ILIKE '%Form Pemohon%'` — SIAP's own discriminator for the
-    applicant form (License::GetLicenseRequestFormPemohon), which excludes the
-    officer/system "Penomoran" numbering form. Picks the lowest form_id so the
+    `forms.name ILIKE '%Form Pemohon%'` — the applicant form's human title,
+    which excludes the officer/system "Penomoran" numbering form. (forms.code is
+    'ppkp' for BOTH on live Beta, so we key on the name, not the code SIAP's own
+    GetLicenseRequestFormPemohon filters on.) Picks the lowest form_id so the
     result is deterministic for a licence that references the form on several
     steps.
 
