@@ -746,6 +746,16 @@ def _log_meta_webhook_summary(envelope: dict[str, Any]) -> None:
                 except Exception:
                     logger.exception("delivery tracker update_status failed (non-fatal)")
 
+                # Auto-resend a DOCUMENT that failed with a transient Meta code
+                # (131053 "media upload error"). Correlated by recipient; capped;
+                # never fatal to the webhook. No-op unless a doc was sent here.
+                try:
+                    if recipient and st_value == "failed" and err_codes:
+                        from services import doc_resend
+                        doc_resend.maybe_resend(recipient, err_codes)
+                except Exception:
+                    logger.exception("doc_resend maybe_resend failed (non-fatal)")
+
             for msg in messages:
                 # Inbound messages also arrive via the raw passthrough; the
                 # inbound worker handles them. Log only that they appeared.
