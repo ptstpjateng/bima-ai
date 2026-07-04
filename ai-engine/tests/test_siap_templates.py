@@ -309,6 +309,136 @@ class TestBuildSkData(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("bahan", data)
         self.assertEqual(data["nama_pemohon"], "CASMO")
 
+    async def test_vision_merges_fields_across_multiple_docs(self):
+        # The vessel specs live in DIFFERENT docs (GT/tipe/bahan in the Desain
+        # Kapal, alat in the Spesifikasi, thn_bangun/galangan in the Surat
+        # Pesanan). Vision must read EACH doc and MERGE — a single-doc pass left
+        # most of the form blank. Stub Vision to return a different field per doc.
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            if image_bytes == b"desain":
+                return {"gt": "12", "bahan": "Fiberglass", "tipe": "Purse Seine"}
+            if image_bytes == b"spesifikasi":
+                return {"alat": "Pukat Cincin"}
+            if image_bytes == b"pesanan":
+                return {"thn_bangun": "2021", "galangan": "Galangan Jaya, Tegal"}
+            return {}
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            out = await st._extract_vision_fields(
+                ["gt", "bahan", "tipe", "alat", "thn_bangun", "galangan"],
+                {
+                    "d1": {"filename": "Desain_Kapal.pdf", "mime_type": "application/pdf",
+                           "content": b"desain", "claimed_type": "Desain Kapal"},
+                    "d2": {"filename": "Spesifikasi_Alat.pdf", "mime_type": "application/pdf",
+                           "content": b"spesifikasi", "claimed_type": "Spesifikasi Alat Tangkap"},
+                    "d3": {"filename": "Surat_Pesanan.pdf", "mime_type": "application/pdf",
+                           "content": b"pesanan", "claimed_type": "Surat Pesanan"},
+                },
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        # Every field, though spread across three separate docs, is merged.
+        self.assertEqual(out, {
+            "gt": "12", "bahan": "Fiberglass", "tipe": "Purse Seine",
+            "alat": "Pukat Cincin", "thn_bangun": "2021",
+            "galangan": "Galangan Jaya, Tegal",
+        })
+
+    async def test_vision_source_guard_rejects_thn_bangun_from_wrong_doc(self):
+        # thn_bangun (build-order year) is only trustworthy from the Surat
+        # Pesanan. A year read off the SIUP (its ISSUE date) must be REJECTED —
+        # otherwise the SIUP's 2026 would wrongly win over the Pesanan's 2021.
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            if image_bytes == b"siup":
+                return {"thn_bangun": "2026", "no_siup": "SIUP-9"}
+            if image_bytes == b"pesanan":
+                return {"thn_bangun": "2021"}
+            return {}
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            out = await st._extract_vision_fields(
+                ["thn_bangun", "no_siup"],
+                {  # SIUP first in dict order → would win without the guard
+                    "d1": {"filename": "SIUP_CASMO.pdf", "mime_type": "application/pdf",
+                           "content": b"siup", "claimed_type": "SIUP"},
+                    "d2": {"filename": "Surat_Pesanan.pdf", "mime_type": "application/pdf",
+                           "content": b"pesanan", "claimed_type": "Surat Pesanan"},
+                },
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        # thn_bangun taken from the Surat Pesanan (2021), NOT the SIUP (2026);
+        # no_siup (unguarded) still comes from the SIUP.
+        self.assertEqual(out["thn_bangun"], "2021")
+        self.assertEqual(out["no_siup"], "SIUP-9")
+
+    async def test_gt_computed_from_desain_dimensions(self):
+        # Docs give only a class range "10-20" for GT; the Desain Kapal has the
+        # dimensions but no explicit GT. GT is computed 0.25×L×B×D×0.70 and the
+        # range is replaced. 0.25 * 12.88 * 5.50 * 1.30 * 0.70 = 16.116 -> "16".
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            props = response_schema.get("properties", {})
+            if "panjang_m" in props:  # the GT dimension read (Desain Kapal only)
+                if image_bytes == b"desain":
+                    return {"panjang_m": "12.88 Meter", "lebar_m": "5,50 m",
+                            "dalam_m": "1.30 Meter"}
+                return {}
+            if image_bytes == b"siup":
+                return {"gt": "10-20"}   # class range from the SIUP
+            return {}                    # Desain has no explicit GT
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            out = await st._extract_vision_fields(
+                ["gt"],
+                {
+                    "d1": {"filename": "SIUP.pdf", "content": b"siup",
+                           "mime_type": "application/pdf", "claimed_type": "SIUP"},
+                    "d2": {"filename": "Desain_Kapal.pdf", "content": b"desain",
+                           "mime_type": "application/pdf", "claimed_type": "Desain Kapal"},
+                },
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        self.assertEqual(out["gt"], "16")
+
+    async def test_gt_precise_read_is_not_overwritten_by_calc(self):
+        # If a doc states a PRECISE GT, keep it — don't replace with the calc.
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            props = response_schema.get("properties", {})
+            if "panjang_m" in props:
+                return {"panjang_m": "12.88", "lebar_m": "5.50", "dalam_m": "1.30"}
+            return {"gt": "18"}  # precise GT already present
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            out = await st._extract_vision_fields(
+                ["gt"],
+                {"d2": {"filename": "Desain_Kapal.pdf", "content": b"desain",
+                        "mime_type": "application/pdf", "claimed_type": "Desain Kapal"}},
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        self.assertEqual(out["gt"], "18")
+
     async def test_vision_unconfigured_leaves_vessel_blank(self):
         mod = types.ModuleType("services.gemini_vision")
         mod.extract_structured = None
@@ -665,6 +795,58 @@ class TestResolveFillData(unittest.IsolatedAsyncioTestCase):
             sys.modules.pop("services.gemini_vision", None)
         self.assertEqual(data, {})            # nothing sourced → all blank
         self.assertEqual(classes["nama_kapal"], st.SOURCE_VISION)
+
+    async def test_nonblank_override_wins_and_is_marked_source_form(self):
+        # A NON-BLANK override (from the filled SIAP Formulir Isian) WINS over the
+        # profile source AND runs NO Vision for that key. The key is classed
+        # SOURCE_FORM. A key ABSENT from overrides still resolves normally.
+        called = {"vision": False}
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            called["vision"] = True
+            return {"nama_kapal": "SHOULD NOT BE USED"}
+
+        mod = types.ModuleType("services.gemini_vision")
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            data, classes = await st.resolve_fill_data(
+                ["nama_pemohon", "nama_kapal", "gt"],
+                profile={"full_name": "CASMO"}, case_meta={},
+                license_name=None,
+                documents={"d1": {"content": b"x", "mime_type": "application/pdf"}},
+                overrides={"nama_kapal": "KM FORMULIR"},
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        # The form override wins for nama_kapal — its value, and SOURCE_FORM class.
+        self.assertEqual(data["nama_kapal"], "KM FORMULIR")
+        self.assertEqual(classes["nama_kapal"], st.SOURCE_FORM)
+        # No Vision was run for the overridden key (gt is the only vision key
+        # left; but nama_kapal must NOT have hit Vision).
+        # profile key still resolves normally.
+        self.assertEqual(data["nama_pemohon"], "CASMO")
+        self.assertEqual(classes["nama_pemohon"], st.SOURCE_PROFILE)
+        # gt had no override and no vision value → blank, still classed VISION.
+        self.assertNotIn("gt", data)
+        self.assertEqual(classes["gt"], st.SOURCE_VISION)
+
+    async def test_blank_override_is_ignored_and_falls_through(self):
+        # A blank/whitespace override must NOT override a real source with
+        # emptiness, and must NOT fabricate: nama_pemohon still resolves from the
+        # profile, and its class stays PROFILE (not SOURCE_FORM).
+        data, classes = await st.resolve_fill_data(
+            ["nama_pemohon", "alamat"],
+            profile={"full_name": "CASMO", "address": "Jl. Laut No. 1"},
+            case_meta={}, license_name=None, documents=None, run_vision=False,
+            overrides={"nama_pemohon": "   ", "alamat": ""},
+        )
+        # Blank overrides ignored → real profile source used, classed PROFILE.
+        self.assertEqual(data["nama_pemohon"], "CASMO")
+        self.assertEqual(classes["nama_pemohon"], st.SOURCE_PROFILE)
+        self.assertEqual(data["alamat"], "Jl. Laut No. 1")
+        self.assertEqual(classes["alamat"], st.SOURCE_PROFILE)
 
 
 @unittest.skipUnless(_DEPS_OK, "python-docx/httpx not installed")

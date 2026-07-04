@@ -793,3 +793,411 @@ async def get_license_name(license_id: int) -> Optional[str]:
     except Exception:  # pragma: no cover — defensive
         logger.exception("get_license_name failed (returning None) | license_id=%s", license_id)
         return None
+
+
+# ===========================================================================
+# get_applicant_form_id — resolve a licence's APPLICANT "Formulir Isian" form.
+#
+# A licence's forms live behind
+#   license -> license_approval_step -> license_approval_step_form -> forms
+# (the SAME join SIAP's License::GetLicenseRequestForm walks). A licence has
+# SEVERAL forms across its steps — the applicant's Formulir Isian, and separate
+# officer/system forms such as the "Penomoran" numbering form. We must fill ONLY
+# the APPLICANT one; stamping the Penomoran form would be wrong and, per the
+# form-value endpoint's form_id-belongs-to-licence guard, a different write
+# entirely.
+#
+# SIAP discriminates the applicant form by the human title "Form Pemohon".
+# NOTE: on live Beta both PKPP forms share code='ppkp' — the discriminator is in
+# forms.NAME, not forms.code (form 560 name="Form Pemohon Persetujuan Pengadaan
+# Kapal Perikanan" vs form 768 name="Form Penomoran PPKP"). SIAP's own
+# License::GetLicenseRequestFormPemohon filters `forms.code LIKE '%Form Pemohon%'`,
+# which matches NOTHING against this data — so we filter `forms.name ILIKE
+# '%Form Pemohon%'` (the Penomoran form's name does NOT match: "Penomoran" ≠
+# "Pemohon"), then pick the lowest form_id deterministically so a licence with
+# more than one applicant form is stable. Data-driven — no hardcoded per-licence
+# form_id (PKPP 459 → 560 is discovered here, not baked in). Read-only; the form
+# code/name are non-PII.
+# ===========================================================================
+
+# license_id → the APPLICANT "Formulir Isian" form_id. Walks the same join as
+# License::GetLicenseRequestForm and filters to the applicant form by its title
+# (forms.name ILIKE '%Form Pemohon%') — NOT forms.code, which is 'ppkp' for both
+# the applicant and the Penomoran form on live data. DISTINCT + lowest form_id so
+# a multi-step licence that references the same applicant form on several steps
+# still yields one deterministic id.
+_SQL_APPLICANT_FORM_ID = """
+    SELECT f.form_id
+      FROM ptsp.license_approval_step s
+      JOIN ptsp.license_approval_step_form sf
+            ON sf.approval_step_id = s.approval_step_id
+      JOIN ptsp.forms f
+            ON f.form_id = sf.form_id
+     WHERE s.license_id = $1
+       AND f.name ILIKE '%Form Pemohon%'
+     ORDER BY f.form_id
+     LIMIT 1
+"""
+
+
+async def get_applicant_form_id(license_id: int) -> Optional[int]:
+    """Return the APPLICANT Formulir-Isian `form_id` for a licence, or None.
+
+    Resolves the applicant input form via
+    license_approval_step -> license_approval_step_form -> forms, filtered to
+    `forms.name ILIKE '%Form Pemohon%'` — the applicant form's human title,
+    which excludes the officer/system "Penomoran" numbering form. (forms.code is
+    'ppkp' for BOTH on live Beta, so we key on the name, not the code SIAP's own
+    GetLicenseRequestFormPemohon filters on.) Picks the lowest form_id so the
+    result is deterministic for a licence that references the form on several
+    steps.
+
+    Generic across licences — for PKPP (license 459) this returns 560 by
+    DISCOVERY, not a hardcode. NEVER raises: a miss / DB error / unconfigured DB
+    returns None so the caller (fill_siap_form) degrades to an honest "form not
+    resolvable" message rather than filling the wrong form. Non-PII; the
+    license_id + resolved form_id are the only things logged.
+    """
+    if not is_siap_db_configured():
+        logger.info(
+            "get_applicant_form_id: SIAP DB not configured | license_id=%s",
+            license_id,
+        )
+        return None
+    try:
+        lid = int(license_id)
+    except (TypeError, ValueError):
+        logger.warning("get_applicant_form_id: bad license_id=%r", license_id)
+        return None
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_APPLICANT_FORM_ID, lid)
+        if row is None or row["form_id"] is None:
+            logger.info(
+                "get_applicant_form_id: no applicant form found | license_id=%s",
+                lid,
+            )
+            return None
+        form_id = int(row["form_id"])
+        logger.info(
+            "get_applicant_form_id | license_id=%s | form_id=%s", lid, form_id
+        )
+        return form_id
+    except Exception:  # pragma: no cover — defensive; never break the officer path
+        logger.exception(
+            "get_applicant_form_id failed (returning None) | license_id=%s",
+            license_id,
+        )
+        return None
+
+
+# ===========================================================================
+# get_form_value_properties — read the request's filled Formulir-Isian row.
+#
+# The whole applicant Formulir Isian (text fields + FLE file slots) is ONE
+# ptsp.form_value.properties JSONB row keyed by (form_id, request_id); its keys
+# ARE the SK template keys. SIAP generates the SK FROM that form_value. The
+# officer copilot's draft_sk reads it back so a draft reflects EXACTLY what the
+# citizen/officer entered in SIAP (no divergent re-read), and the DRAFT GATE
+# refuses to draft while the vessel-subject fields are still blank.
+#
+# Read-only by contract (parameterised SELECT + the read-only-transaction pool
+# guard). NEVER raises — a miss / DB error / unconfigured DB returns {} so the
+# caller degrades. The property VALUES are PII / applicant data and are NEVER
+# logged — only the form_id, request_id, and the COUNT of keys.
+# ===========================================================================
+
+# (form_id, request_id) → the filled form's properties JSONB (as text, parsed
+# by the caller). The whole JSONB is returned so the caller can read ANY field
+# key the form holds without this module knowing the form's key set in advance.
+_SQL_FORM_VALUE = """
+    SELECT properties
+      FROM ptsp.form_value
+     WHERE form_id = $1
+       AND request_id = $2
+     LIMIT 1
+"""
+
+
+async def get_form_value_properties(form_id: int, request_id: int) -> Optional[dict]:
+    """Return the request's filled `ptsp.form_value.properties` as a dict.
+
+    Keyed by (form_id, request_id) — the ONE JSONB row that holds the whole
+    applicant Formulir Isian (text fields + file slots). Its keys are the SK
+    template keys; SIAP generates the SK from this row. draft_sk reads it as the
+    source of truth for a draft, and the DRAFT GATE keys on whether its
+    vessel-subject fields are filled.
+
+    NEVER raises. Return contract distinguishes "definitely not filled" from
+    "could not read":
+      * `{}` — the row is genuinely absent / properties NULL / unconfigured DB /
+        bad ids / corrupt JSON. The form is treated as EMPTY (the gate applies).
+      * `None` — a transient DB read error (pool/query failure). The caller
+        CANNOT tell whether the form is filled, so it must NOT gate on this (a
+        DB hiccup should degrade to the ungated draft, not a false "form empty"
+        refusal on an already-filled form).
+    The property VALUES are applicant PII and are NEVER logged (only the ids +
+    the key COUNT). Mirrors get_request_case_meta / get_person_profile_properties.
+    """
+    if not is_siap_db_configured():
+        logger.info(
+            "get_form_value_properties: SIAP DB not configured | form_id=%s "
+            "request_id=%s",
+            form_id, request_id,
+        )
+        return {}
+    try:
+        fid = int(form_id)
+        rid = int(request_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "get_form_value_properties: bad ids | form_id=%r request_id=%r",
+            form_id, request_id,
+        )
+        return {}
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_FORM_VALUE, fid, rid)
+        if row is None or row["properties"] is None:
+            logger.info(
+                "get_form_value_properties: form_value not found | form_id=%s "
+                "request_id=%s",
+                fid, rid,
+            )
+            return {}
+        raw = row["properties"]
+        # asyncpg returns a JSONB column as a str (no codec registered) or, with
+        # a codec, as a dict. Handle both; a str is parsed with json.
+        if isinstance(raw, str):
+            import json
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "get_form_value_properties: properties not valid JSON | "
+                    "form_id=%s request_id=%s", fid, rid,
+                )
+                return {}
+        elif isinstance(raw, dict):
+            parsed = raw
+        else:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        # Never log the values — only how many keys were read.
+        logger.info(
+            "get_form_value_properties | form_id=%s request_id=%s keys=%d",
+            fid, rid, len(parsed),
+        )
+        return parsed
+    except Exception:  # pragma: no cover — defensive; never break the officer path
+        # A transient READ failure (pool/query error) — NOT a genuine empty form.
+        # Return None so the caller degrades to the ungated draft instead of
+        # falsely refusing "Formulir Isian masih kosong" on a filled form.
+        logger.exception(
+            "get_form_value_properties read failed (returning None) | form_id=%s "
+            "request_id=%s",
+            form_id, request_id,
+        )
+        return None
+
+
+# ===========================================================================
+# get_form_id_for_field — resolve the licence form that OWNS a given field.
+#
+# The officer PENOMORAN step assigns the No. PPKP on a DIFFERENT form than the
+# applicant Formulir Isian: for PKPP (license 459) the applicant fields live on
+# form 560 ("Form Pemohon …") and `no_ppkp` lives ALONE on form 768 ("Form
+# Penomoran PPKP"). To WRITE an officer-supplied value to the right field we must
+# DISCOVER which form declares that field — never hardcode 768.
+#
+# The join is the SAME licence-forms walk get_applicant_form_id uses
+#   license_approval_step -> license_approval_step_form -> forms
+# but instead of filtering by the form's human title we filter by whether the
+# form DECLARES the field: JOIN ptsp.vw_form_fields vf ON vf.form_id = f.form_id
+# AND vf.name = $2. This is exactly the field-name ∈ vw_form_fields guard the
+# SIAP form-value endpoint itself validates, so a form_id this returns is
+# guaranteed writable for that field. DISTINCT + lowest form_id → deterministic.
+# For (459, "no_ppkp") this returns 768 by DISCOVERY, not a hardcode.
+#
+# Read-only by contract (parameterised SELECT + the read-only-transaction pool
+# guard). NEVER raises — a miss / DB error / unconfigured DB returns None so the
+# caller (set_ppkp_number) degrades to an honest "form penomoran tidak ditemukan"
+# message rather than writing to the wrong form. Non-PII; only the license_id,
+# the field name, and the resolved form_id are logged.
+# ===========================================================================
+
+# (license_id, field_name) → the form_id BOUND TO THE LICENCE whose fields
+# include field_name. Walks license_approval_step -> license_approval_step_form
+# -> forms, then joins ptsp.vw_form_fields to keep only forms that DECLARE the
+# field. DISTINCT + lowest form_id so a field declared on several bound forms (or
+# a form referenced on several steps) still yields one deterministic id.
+_SQL_FORM_ID_FOR_FIELD = """
+    SELECT f.form_id
+      FROM ptsp.license_approval_step s
+      JOIN ptsp.license_approval_step_form sf
+            ON sf.approval_step_id = s.approval_step_id
+      JOIN ptsp.forms f
+            ON f.form_id = sf.form_id
+      JOIN ptsp.vw_form_fields vf
+            ON vf.form_id = f.form_id
+     WHERE s.license_id = $1
+       AND vf.name = $2
+     ORDER BY f.form_id
+     LIMIT 1
+"""
+
+
+async def get_form_id_for_field(license_id: int, field_name: str) -> Optional[int]:
+    """Return the `form_id` of the licence form that DECLARES `field_name`, or None.
+
+    Resolves the form BOUND TO THE LICENCE (via
+    license_approval_step -> license_approval_step_form -> forms) whose field set
+    — read from ptsp.vw_form_fields — includes `field_name`. Picks the lowest
+    form_id so the result is deterministic. This is the OWNING form the SIAP
+    form-value endpoint will accept a write to (form_id-belongs-to-licence +
+    field-name ∈ vw_form_fields are exactly its guards).
+
+    Generic across licences — for PKPP (license 459, field "no_ppkp") this
+    returns 768 by DISCOVERY, not a hardcode. NEVER raises: a miss / DB error /
+    unconfigured DB / bad ids returns None so the caller degrades to an honest
+    message rather than writing the wrong form. Non-PII; only the license_id, the
+    field name, and the resolved form_id are logged.
+    """
+    if not is_siap_db_configured():
+        logger.info(
+            "get_form_id_for_field: SIAP DB not configured | license_id=%s field=%s",
+            license_id, field_name,
+        )
+        return None
+    try:
+        lid = int(license_id)
+    except (TypeError, ValueError):
+        logger.warning("get_form_id_for_field: bad license_id=%r", license_id)
+        return None
+    fname = str(field_name or "").strip()
+    if not fname:
+        logger.warning("get_form_id_for_field: blank field_name | license_id=%s", lid)
+        return None
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_FORM_ID_FOR_FIELD, lid, fname)
+        if row is None or row["form_id"] is None:
+            logger.info(
+                "get_form_id_for_field: no owning form found | license_id=%s field=%s",
+                lid, fname,
+            )
+            return None
+        form_id = int(row["form_id"])
+        logger.info(
+            "get_form_id_for_field | license_id=%s field=%s | form_id=%s",
+            lid, fname, form_id,
+        )
+        return form_id
+    except Exception:  # pragma: no cover — defensive; never break the officer path
+        logger.exception(
+            "get_form_id_for_field failed (returning None) | license_id=%s field=%s",
+            license_id, field_name,
+        )
+        return None
+
+
+# ===========================================================================
+# get_all_form_values — MERGE the filled values of ALL forms bound to a licence.
+#
+# A licence's request data can span SEVERAL form_value rows: the applicant
+# Formulir Isian (form 560 — vessel/identity fields) AND the officer Penomoran
+# form (form 768 — no_ppkp). A draft (Rekomtek/SK) must reflect fields that live
+# on DIFFERENT forms, so this merges every bound form's
+# ptsp.form_value.properties for this request into ONE dict.
+#
+# The forms have DISJOINT key sets (768 adds only no_ppkp), so a plain
+# update-merge is fine — but we guard against a blank value clobbering a non-blank
+# one across forms, so the merge is order-independent and safe.
+#
+# Read-only by contract. NEVER raises — a miss / DB error / unconfigured DB
+# returns {} so the caller degrades. The property VALUES are PII / applicant data
+# and are NEVER logged — only the license_id, request_id, and the merged key COUNT.
+# ===========================================================================
+
+# license_id → the DISTINCT set of form_ids bound to the licence (any step).
+_SQL_LICENSE_FORM_IDS = """
+    SELECT DISTINCT f.form_id
+      FROM ptsp.license_approval_step s
+      JOIN ptsp.license_approval_step_form sf
+            ON sf.approval_step_id = s.approval_step_id
+      JOIN ptsp.forms f
+            ON f.form_id = sf.form_id
+     WHERE s.license_id = $1
+     ORDER BY f.form_id
+"""
+
+
+async def get_all_form_values(license_id: int, request_id: int) -> dict:
+    """Return the MERGE of every licence-bound form's filled values for a request.
+
+    Resolves the licence's bound form_ids (license_approval_step ->
+    license_approval_step_form -> forms), reads each form's
+    ptsp.form_value.properties for this request via get_form_value_properties, and
+    merges them into one dict so a draft can reflect fields that live on DIFFERENT
+    forms (applicant 560 + Penomoran 768's no_ppkp). Since the forms have DISJOINT
+    keys a plain update-merge suffices; a non-blank value is never clobbered by a
+    blank one.
+
+    NEVER raises — a miss / DB error / unconfigured DB returns {} so the caller
+    degrades safely (draft still renders from profile/case sources). The property
+    VALUES are PII and are NEVER logged (only the ids + the merged key COUNT).
+    """
+    if not is_siap_db_configured():
+        logger.info(
+            "get_all_form_values: SIAP DB not configured | license_id=%s request_id=%s",
+            license_id, request_id,
+        )
+        return {}
+    try:
+        lid = int(license_id)
+        rid = int(request_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "get_all_form_values: bad ids | license_id=%r request_id=%r",
+            license_id, request_id,
+        )
+        return {}
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_LICENSE_FORM_IDS, lid)
+        form_ids = [int(r["form_id"]) for r in rows if r["form_id"] is not None]
+        if not form_ids:
+            logger.info(
+                "get_all_form_values: no bound forms | license_id=%s request_id=%s",
+                lid, rid,
+            )
+            return {}
+        merged: dict = {}
+        for fid in form_ids:
+            props = await get_form_value_properties(fid, rid)
+            # `props` is {} (empty/absent) or None (transient read error) or a
+            # dict of this form's values. Merge only real dicts; skip None/{}.
+            if not props or not isinstance(props, dict):
+                continue
+            for k, v in props.items():
+                # A non-blank value must never be clobbered by a blank one from
+                # another form. Otherwise last-writer wins (disjoint keys anyway).
+                if k in merged and str(merged.get(k) or "").strip() and not str(v or "").strip():
+                    continue
+                merged[k] = v
+        logger.info(
+            "get_all_form_values | license_id=%s request_id=%s forms=%d keys=%d",
+            lid, rid, len(form_ids), len(merged),
+        )
+        return merged
+    except Exception:  # pragma: no cover — defensive; never break the officer path
+        logger.exception(
+            "get_all_form_values failed (returning empty) | license_id=%s request_id=%s",
+            license_id, request_id,
+        )
+        return {}

@@ -1447,13 +1447,35 @@ async def maybe_handle_officer_reply(
         # which routes back), auto-notify the NEXT desk's officer(s), chaining
         # the copilot down the SIAP approval chain to the last step. Never
         # raises out of the officer reply path.
-        if _case_advanced(tool_calls) and sess.request_id is not None:
-            try:
-                await notify_next_step(sess.request_id)
-            except Exception:
-                logger.exception(
-                    "next-step officer notify crashed (non-fatal) | ticket=%s",
-                    sess.ticket,
+        if _case_advanced(tool_calls):
+            # Recover request_id from the ticket when the session never carried
+            # it. A ticket-only officer session can have sess.request_id == None
+            # even though the forward SUCCEEDED (forward_case resolves the id
+            # locally), and the old `sess.request_id is not None` guard then
+            # SILENTLY skipped the next-desk notify — which is why a forwarded
+            # case's next officer was never pinged.
+            rid = sess.request_id
+            if rid is None and sess.ticket:
+                try:
+                    from services.siap_tools import siap_resolve_request_id
+                    rid = await siap_resolve_request_id(str(sess.ticket))
+                except Exception:
+                    logger.exception(
+                        "next-step notify: request_id recovery failed | ticket=%s",
+                        sess.ticket,
+                    )
+                    rid = None
+            if rid is not None:
+                try:
+                    await notify_next_step(int(rid))
+                except Exception:
+                    logger.exception(
+                        "next-step officer notify crashed (non-fatal) | ticket=%s",
+                        sess.ticket,
+                    )
+            else:
+                logger.warning(
+                    "next-step notify skipped: no request_id | ticket=%s", sess.ticket
                 )
         return reply
 

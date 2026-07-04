@@ -20,10 +20,14 @@ raises to the caller — a template miss is a graceful None, never a broken flow
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 from typing import Any, Optional
 
 import httpx
@@ -35,6 +39,12 @@ _ENABLED = os.getenv("BIMA_SIAP_TEMPLATES_ENABLED", "true").lower() in ("1", "tr
 _STORAGE_BASE = os.getenv("SIAP_STORAGE_BASE", "https://beta-siap.nolongin.com").rstrip("/")
 _FETCH_TIMEOUT = float(os.getenv("BIMA_SIAP_TEMPLATE_TIMEOUT", "20"))
 _MAX_TEMPLATE_BYTES = int(os.getenv("BIMA_SIAP_TEMPLATE_MAX_BYTES", str(8 * 1024 * 1024)))
+# How many applicant docs one Vision fill pass reads. The vessel/permit specs are
+# spread ACROSS documents (Desain Kapal → GT/tipe/bahan/galangan, Spesifikasi →
+# alat, Surat Pesanan → thn_bangun, SIUP → no_siup …), so reading a single doc
+# leaves most of the form blank. We read up to this many (spec-docs first) in
+# parallel and merge. Bounds latency/cost; PKPP has ~8 applicant docs.
+_VISION_MAX_DOCS = int(os.getenv("BIMA_VISION_MAX_DOCS", "8"))
 
 _ID_MONTHS = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
               "Agustus", "September", "Oktober", "November", "Desember"]
@@ -437,6 +447,14 @@ SOURCE_PROFILE = "profile"
 SOURCE_CASE = "case"
 SOURCE_VISION = "vision"
 SOURCE_BLANK = "blank"
+# A key whose value came straight from the request's filled SIAP Formulir Isian
+# (ptsp.form_value.properties). This is REAL data — citizen-/officer-entered or
+# BIMA-auto-filled from real reads — so it preserves the no-hallucination
+# contract. When an `overrides` map (the form_value) carries a NON-BLANK value
+# for a key, that value WINS over every other source and no Vision/profile/case
+# read is done for that key. A blank/whitespace override is IGNORED (it never
+# overrides a real source with emptiness, and never fabricates).
+SOURCE_FORM = "form"
 
 # Applicant-identity placeholder-key → person_profile.properties field.
 # Covers the exact key names seen across the investigated templates plus common
@@ -701,7 +719,14 @@ _VISION_KEY_DESCRIPTIONS: dict[str, str] = {
     "nama_kapal": "Nama kapal perikanan.",
     "gt": "Ukuran/tonase kapal (Gross Tonnage), angka saja bila ada.",
     "bahan": "Bahan kasko kapal (Kayu/Fiberglass/Besi/Baja).",
-    "thn_bangun": "Tahun pembuatan/pembangunan kapal.",
+    "thn_bangun": (
+        "Tahun pembangunan kapal. Bila tidak tertulis eksplisit sebagai 'tahun "
+        "pembangunan', ambil TAHUN dari tanggal Surat Pesanan/Pemesanan "
+        "pembangunan kapal (surat pemilik yang memesan/meminta pembangunan "
+        "kapal) — tahun surat pesanan itu adalah tahun mulai pembangunan. Isi "
+        "HANYA bila tanggal/tahun tersebut benar-benar terbaca di dokumen; "
+        "kosongkan bila tidak ada."
+    ),
     "alat": "Alat penangkap ikan yang digunakan.",
     "galangan": "Nama/alamat galangan atau tukang pembuat kapal.",
     "no_siup": "Nomor SIUP (Surat Izin Usaha Perikanan).",
@@ -721,6 +746,18 @@ _VISION_KEY_DESCRIPTIONS: dict[str, str] = {
     "no_siup_": "Nomor SIUP.",
     "peruntukan": "Peruntukan/penggunaan yang dimohonkan.",
     "no_pertek_perm": "Nomor pertek pada surat permohonan.",
+}
+
+
+# Field → source-document keyword allow-list. A VISION key listed here is ONLY
+# accepted when read from a document whose label (detected_type/claimed_type/
+# filename) matches one of the keywords — so a value that legitimately lives in
+# ONE document type is not contaminated by a same-looking value in another.
+# thn_bangun (the year the vessel build was ordered) must come from the Surat
+# Pesanan (the owner's build order); read from the SIUP its issue-year (e.g.
+# 2026) would be plain wrong. A key NOT listed here is accepted from any doc.
+_VISION_KEY_SOURCE_HINTS: dict[str, tuple[str, ...]] = {
+    "thn_bangun": ("pesanan", "pemesanan", "kontrak"),
 }
 
 
@@ -747,14 +784,116 @@ _GENERIC_VISION_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Gross Tonnage (GT) computed from principal dimensions.
+#
+# Applicant docs usually give only a CLASS RANGE ("10-20 GT"), not a precise GT —
+# but the Desain/Rancang-Bangun Kapal carries the principal dimensions. When GT
+# is requested and no precise value is read, compute it by the Indonesian
+# domestic-measurement form GT = 0.25 × L × B × D × f (f = block coefficient,
+# default 0.70 for wooden fishing vessels; env BIMA_GT_BLOCK_COEFFICIENT). The
+# result is an ESTIMATE — it lands in the VISION / "mohon diperiksa" bucket so
+# the officer verifies it; it is NOT presented as a measured figure. Not a
+# hallucination: it is a deterministic calc from real dimensions on a real doc.
+# ---------------------------------------------------------------------------
+_GT_COMPUTE_ENABLED = os.getenv("BIMA_GT_COMPUTE_ENABLED", "true").lower() in ("1", "true", "yes")
+_GT_BLOCK_COEFFICIENT = float(os.getenv("BIMA_GT_BLOCK_COEFFICIENT", "0.70"))
+_GT_DIM_DESCRIPTIONS: dict[str, str] = {
+    "panjang_m": "Panjang kapal (LOA/Loa/L/panjang) dalam METER — angka saja.",
+    "lebar_m": "Lebar kapal (B/Breadth/lebar) dalam METER — angka saja.",
+    "dalam_m": "Dalam/tinggi kapal (D/Depth/H/dalam) dalam METER — angka saja.",
+}
+_GT_DIM_PROMPT = (
+    "Ini dokumen desain/rancang bangun kapal. Ambil dimensi utama kapal: "
+    "panjang, lebar, dan dalam (tinggi) dalam METER, apa adanya (angka saja). "
+    "Kosongkan bila tidak terlihat. JANGAN mengarang."
+)
+
+
+def _parse_meters(raw: Any) -> Optional[float]:
+    """Parse a dimension like '12.88 Meter' / '5,50 m' → float meters (or None)."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower().replace(",", ".")
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        v = float(m.group(0))
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+def _is_precise_gt(value: Any) -> bool:
+    """True when `value` is a single clean number (e.g. '16' / '15.5') — an
+    already-precise GT, NOT a class range like '10-20' or an empty read."""
+    return bool(re.fullmatch(r"\d+(?:[.,]\d+)?", str(value or "").strip()))
+
+
+async def _compute_gt_from_docs(ordered: list[dict]) -> Optional[str]:
+    """Compute GT from the Desain/Rancang-Bangun Kapal's principal dimensions:
+    GT = 0.25 × L × B × D × f. Returns the whole-number GT as a string, or None
+    when the design doc / any dimension is missing/illegible. NEVER raises. Only
+    the ROUNDED gt is logged (no raw dimensions)."""
+    from services.gemini_vision import extract_structured  # caller already guarded
+
+    def _lbl(d: dict) -> str:
+        return " ".join(
+            str(d.get(k) or "") for k in ("detected_type", "claimed_type", "filename")
+        ).lower()
+
+    desain = next(
+        (d for d in ordered
+         if d.get("content") and any(w in _lbl(d) for w in ("desain", "rancang", "gambar"))),
+        None,
+    )
+    if desain is None:
+        return None
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            k: {"type": "string", "description": v}
+            for k, v in _GT_DIM_DESCRIPTIONS.items()
+        },
+        "required": [],
+    }
+    try:
+        parsed = await extract_structured(
+            image_bytes=desain["content"],
+            mime_type=desain.get("mime_type", "application/octet-stream"),
+            prompt=_GT_DIM_PROMPT,
+            response_schema=schema,
+        )
+    except Exception:  # pragma: no cover — extract_structured already guards
+        logger.exception("GT compute: dimension read raised (skipping)")
+        return None
+    if not parsed or not isinstance(parsed, dict):
+        return None
+    L = _parse_meters(parsed.get("panjang_m"))
+    B = _parse_meters(parsed.get("lebar_m"))
+    D = _parse_meters(parsed.get("dalam_m"))
+    if not (L and B and D):
+        return None
+    gt = 0.25 * L * B * D * _GT_BLOCK_COEFFICIENT
+    if gt <= 0:
+        return None
+    result = str(int(round(gt)))
+    logger.info("GT computed from Desain Kapal dims | f=%.2f -> gt=%s", _GT_BLOCK_COEFFICIENT, result)
+    return result
+
+
 async def _extract_vision_fields(
     vision_keys: list[str], documents: Optional[dict]
 ) -> dict[str, str]:
-    """Run ONE best-effort Gemini Vision pass over the submission docs to pull
-    the VISION-classified keys. Schema is built from `vision_keys` so it is
-    licence-agnostic. Returns {key: value} for the non-empty reads only, or {}
-    when Vision is unconfigured / fails / there are no bytes / no vision keys.
-    NEVER raises. Bytes never logged.
+    """Run a best-effort Gemini Vision pass over the submission docs to pull the
+    VISION-classified keys. Reads up to `_VISION_MAX_DOCS` applicant docs
+    (spec-bearing first) concurrently and MERGES their reads — the vessel/permit
+    specs live in DIFFERENT documents, so a single-doc pass leaves most fields
+    blank. Schema is built from `vision_keys` so it is licence-agnostic. Returns
+    {key: value} for the non-empty reads only, or {} when Vision is unconfigured
+    / fails / there are no bytes / no vision keys. NEVER raises. Bytes never
+    logged.
 
     `documents` is the copilot `_doc_context` shape:
       {file_id: {"filename","mime_type","content","claimed_type","detected_type"}}
@@ -778,12 +917,21 @@ async def _extract_vision_fields(
             str(d.get(k) or "") for k in ("detected_type", "claimed_type", "filename")
         ).lower()
 
-    preferred = next(
-        (d for d in docs_with_bytes
-         if any(w in _label(d) for w in
-                ("permohonan", "siup", "kapal", "izin usaha", "spesifikasi", "teknis"))),
-        docs_with_bytes[0],
+    # Read EACH applicant doc and MERGE — the vessel/permit specs are spread
+    # across documents (GT/tipe/bahan/galangan in the Desain Kapal, alat in the
+    # Spesifikasi, thn_bangun in the Surat Pesanan, no_siup/tgl_siup in the SIUP,
+    # dates/perihal in the Surat Permohonan). A single-doc pass left most of the
+    # form blank (exactly what the officer saw). Spec-bearing docs go first so
+    # their value wins a per-key tie; still NO hallucination — each pass extracts
+    # only what is literally in that one doc, and merging real reads stays real.
+    _spec_words = (
+        "desain", "rancang", "gambar", "spesifikasi", "teknis", "kapal",
+        "pesanan", "kontrak", "permohonan", "siup", "izin usaha", "nib",
     )
+    ordered = sorted(
+        docs_with_bytes,
+        key=lambda d: 0 if any(w in _label(d) for w in _spec_words) else 1,
+    )[:_VISION_MAX_DOCS]
 
     schema: dict[str, Any] = {
         "type": "object",
@@ -794,25 +942,70 @@ async def _extract_vision_fields(
         "required": [],
     }
 
-    try:
-        parsed = await extract_structured(
-            image_bytes=preferred["content"],
-            mime_type=preferred.get("mime_type", "application/octet-stream"),
-            prompt=_GENERIC_VISION_PROMPT,
-            response_schema=schema,
-        )
-    except Exception:  # pragma: no cover — extract_structured already guards
-        logger.exception("generic Vision extract raised (degrading to blanks)")
-        return {}
-    if not parsed or not isinstance(parsed, dict):
-        return {}
+    async def _extract_one(d: dict) -> Optional[dict]:
+        try:
+            return await extract_structured(
+                image_bytes=d["content"],
+                mime_type=d.get("mime_type", "application/octet-stream"),
+                prompt=_GENERIC_VISION_PROMPT,
+                response_schema=schema,
+            )
+        except Exception:  # pragma: no cover — extract_structured already guards
+            logger.exception("generic Vision extract raised on one doc (skipped)")
+            return None
+
+    # Run the per-doc passes concurrently (wall-clock ≈ one pass); gather keeps
+    # `ordered` order so the spec-doc-first, first-non-blank-wins merge is stable.
+    results = await asyncio.gather(*[_extract_one(d) for d in ordered])
+
     out: dict[str, str] = {}
-    for key in vision_keys:
-        val = str(parsed.get(key) or "").strip()
-        if val:
+    for d, parsed in zip(ordered, results):
+        if not parsed or not isinstance(parsed, dict):
+            continue
+        label = _label(d)
+        for key in vision_keys:
+            if key in out:  # first non-blank read (spec-doc order) wins
+                continue
+            val = str(parsed.get(key) or "").strip()
+            if not val:
+                continue
+            # Field-scoped source guard: a key in _VISION_KEY_SOURCE_HINTS is only
+            # trustworthy from a SPECIFIC document. thn_bangun must come from the
+            # Surat Pesanan (the build order); a year read off the SIUP's issue
+            # date would be wrong. Reject a value read from the wrong document.
+            hints = _VISION_KEY_SOURCE_HINTS.get(key)
+            if hints and not any(w in label for w in hints):
+                continue
             out[key] = val
-    logger.info("generic Vision extract | requested=%d filled=%d", len(vision_keys), len(out))
+
+    # GT: the docs typically give only a CLASS RANGE ("10-20") or nothing. When
+    # GT is requested and no PRECISE value was read, compute it from the Desain
+    # Kapal's dimensions (0.25 × L × B × D × f). An already-precise GT is kept.
+    if "gt" in vision_keys and _GT_COMPUTE_ENABLED and not _is_precise_gt(out.get("gt")):
+        computed_gt = await _compute_gt_from_docs(ordered)
+        if computed_gt:
+            out["gt"] = computed_gt
+
+    logger.info(
+        "generic Vision extract | docs=%d requested=%d filled=%d",
+        len(ordered), len(vision_keys), len(out),
+    )
     return out
+
+
+def _override_value(key: str, overrides: Optional[dict]) -> str:
+    """Return the NON-BLANK override value for a key from the SIAP form_value
+    map, or '' when there is none. A blank/whitespace value is IGNORED (returns
+    '') so an empty form field never overrides a real source with emptiness and
+    never fabricates. Non-string values are stringified then trimmed."""
+    if not overrides or not isinstance(overrides, dict):
+        return ""
+    if key not in overrides:
+        return ""
+    raw = overrides.get(key)
+    if raw is None:
+        return ""
+    return str(raw).strip()
 
 
 async def resolve_fill_data(
@@ -823,6 +1016,7 @@ async def resolve_fill_data(
     license_name: Optional[str] = None,
     documents: Optional[dict] = None,
     run_vision: bool = True,
+    overrides: Optional[dict] = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Resolve a template's discovered placeholder keys to a fill-data map from
     REAL sources only.
@@ -830,10 +1024,22 @@ async def resolve_fill_data(
     Given the discovered `keys` and the real data handles (person_profile
     `profile` dict, `case_meta` from get_request_case_meta, resolved
     `license_name`, in-session `documents`), classify each key and source it:
+      - FORM    → the request's filled SIAP Formulir Isian (`overrides`) — WINS
+        over every other source (see below)
       - PROFILE → person_profile.properties (deterministic)
       - CASE    → case meta / licence name (deterministic)
       - VISION  → ONE best-effort Gemini Vision pass over the docs (`run_vision`)
       - BLANK   → never sourced (SIAP-issued or unresolvable)
+
+    `overrides` is the request's `ptsp.form_value.properties` (the filled
+    Formulir Isian). For each discovered key, if `overrides` holds a NON-BLANK
+    value, that value is used and the key is classed SOURCE_FORM — and NO other
+    source (profile/case/Vision) runs for that key. This makes a draft reflect
+    EXACTLY what the SIAP form holds (the source of truth), with no redundant /
+    divergent re-read. A key ABSENT from `overrides` (or present but blank/
+    whitespace) still falls through to profile/case/Vision/blank exactly as
+    before — a blank override never overrides a real source with emptiness and
+    never fabricates a value.
 
     Returns `(data, classes)`:
       * `data`   — {key: value} with ONLY the keys that resolved to a NON-EMPTY
@@ -845,13 +1051,22 @@ async def resolve_fill_data(
 
     NEVER raises — a source miss just yields a blank for that key. No value is
     ever fabricated: the resolver adds a key to `data` only after reading it from
-    a real source.
+    a real source (the form, the profile, the case, or the document).
     """
     classes: dict[str, str] = {}
     data: dict[str, str] = {}
     vision_keys: list[str] = []
 
     for key in keys:
+        # FORM override wins first — a NON-BLANK value from the filled SIAP
+        # Formulir Isian short-circuits every other source (and any Vision pass)
+        # for this key. A blank/whitespace override is ignored (falls through).
+        override = _override_value(key, overrides)
+        if override:
+            classes[key] = SOURCE_FORM
+            data[key] = override
+            continue
+
         cls = classify_placeholder_key(key)
         classes[key] = cls
         if cls == SOURCE_PROFILE:
@@ -873,8 +1088,9 @@ async def resolve_fill_data(
                 data[key] = val
 
     logger.info(
-        "resolve_fill_data | keys=%d profile=%d case=%d vision_req=%d filled=%d",
+        "resolve_fill_data | keys=%d form=%d profile=%d case=%d vision_req=%d filled=%d",
         len(keys),
+        sum(1 for c in classes.values() if c == SOURCE_FORM),
         sum(1 for c in classes.values() if c == SOURCE_PROFILE),
         sum(1 for c in classes.values() if c == SOURCE_CASE),
         len(vision_keys),
@@ -892,16 +1108,22 @@ async def render_output_docx(
     documents: Optional[dict] = None,
     ticket: Optional[str] = None,
     out_prefix: str = "Dokumen",
+    overrides: Optional[dict] = None,
 ) -> Optional[tuple[bytes, str, dict[str, str], dict[str, str]]]:
     """Generic output-template renderer for ANY licence.
 
     Fetch the fillable `.docx` at `internal_filename`, DISCOVER its `[data.KEY]`
-    keys, resolve them from REAL sources (profile / case / Vision), fill, and
-    return `(docx_bytes, filename, data, classes)` where `data` is the map that
-    was filled and `classes` is the per-key source classification (both power
-    the officer's filled-vs-blank note). Returns None on any miss (disabled, no
-    template, not a .docx, 404, python-docx absent, fill error) so the caller
+    keys, resolve them from REAL sources (form_value / profile / case / Vision),
+    fill, and return `(docx_bytes, filename, data, classes)` where `data` is the
+    map that was filled and `classes` is the per-key source classification (both
+    power the officer's filled-vs-blank note). Returns None on any miss (disabled,
+    no template, not a .docx, 404, python-docx absent, fill error) so the caller
     degrades gracefully. Never raises.
+
+    `overrides` is the request's filled SIAP Formulir Isian
+    (`ptsp.form_value.properties`). When supplied, a NON-BLANK value there WINS
+    for its key (classed SOURCE_FORM) and no other source runs for that key — so
+    the draft reflects exactly what the SIAP form holds. See resolve_fill_data.
     """
     if not _ENABLED:
         return None
@@ -926,6 +1148,7 @@ async def render_output_docx(
         case_meta=case_meta,
         license_name=license_name,
         documents=documents,
+        overrides=overrides,
     )
 
     try:
@@ -1130,7 +1353,7 @@ _SK_VESSEL_SCHEMA: dict[str, Any] = {
         "nama_kapal": {"type": "string", "description": "Nama kapal perikanan."},
         "gt": {"type": "string", "description": "Ukuran/tonase kapal (Gross Tonnage), angka saja bila ada."},
         "bahan": {"type": "string", "description": "Bahan kasko kapal (Kayu/Fiberglass/Besi/Baja)."},
-        "thn_bangun": {"type": "string", "description": "Tahun pembuatan/pembangunan kapal."},
+        "thn_bangun": {"type": "string", "description": "Tahun pembangunan kapal; bila tak eksplisit, ambil tahun dari tanggal Surat Pesanan/Pemesanan pembangunan kapal. Hanya bila terbaca."},
         "alat": {"type": "string", "description": "Alat penangkap ikan yang digunakan."},
         "galangan": {"type": "string", "description": "Nama/alamat galangan atau tukang pembuat kapal."},
         "no_siup": {"type": "string", "description": "Nomor SIUP (Surat Izin Usaha Perikanan)."},
@@ -1342,6 +1565,77 @@ def _iter_docx_lines(docx_bytes: bytes) -> list[str]:
             if joined:
                 lines.append(joined)
     return lines
+
+
+# ---------------------------------------------------------------------------
+# High-fidelity DOCX → PDF via LibreOffice (soffice --headless).
+#
+# The fpdf2 path below is a PLAIN-TEXT re-layout — it drops the SK's letterhead,
+# tables and alignment, so the officer sees a garbled/near-empty page. When
+# LibreOffice is present in the image it renders the ACTUAL filled .docx to PDF
+# (real letterhead + tables), so the officer gets a faithful preview of the SK.
+# Pure best-effort: returns None when soffice is absent / the convert fails /
+# times out, and the caller falls back to the fpdf2 view. NEVER raises.
+# ---------------------------------------------------------------------------
+_SOFFICE_TIMEOUT = float(os.getenv("BIMA_SOFFICE_TIMEOUT", "45"))
+
+
+def _soffice_bin() -> Optional[str]:
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def _convert_docx_to_pdf_sync(docx_bytes: bytes) -> Optional[bytes]:
+    """Blocking soffice conversion — run via asyncio.to_thread. NEVER raises."""
+    soffice = _soffice_bin()
+    if not soffice:
+        logger.info("SK PDF: LibreOffice not installed, using fpdf2 fallback")
+        return None
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="bima_pdf_")
+        src = os.path.join(tmpdir, "draft.docx")
+        with open(src, "wb") as fh:
+            fh.write(docx_bytes)
+        # soffice needs a writable profile dir; point HOME at the temp dir so a
+        # locked-down /root or a stale profile never blocks the convert.
+        env = dict(os.environ, HOME=tmpdir)
+        proc = subprocess.run(
+            [soffice, "--headless", "--nologo", "--nofirststartwizard",
+             "--convert-to", "pdf:writer_pdf_Export", "--outdir", tmpdir, src],
+            capture_output=True, timeout=_SOFFICE_TIMEOUT, env=env, check=False,
+        )
+        out_pdf = os.path.join(tmpdir, "draft.pdf")
+        if not os.path.exists(out_pdf):
+            logger.warning(
+                "SK PDF: soffice produced no pdf (rc=%s)", proc.returncode
+            )
+            return None
+        with open(out_pdf, "rb") as fh:
+            data = fh.read()
+        return data or None
+    except subprocess.TimeoutExpired:
+        logger.warning("SK PDF: soffice convert timed out (%.0fs)", _SOFFICE_TIMEOUT)
+        return None
+    except Exception:  # pragma: no cover — defensive; fall back to fpdf2
+        logger.exception("SK PDF: soffice convert failed")
+        return None
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def render_docx_to_pdf(docx_bytes: bytes) -> Optional[bytes]:
+    """Render a filled SK .docx to a faithful PDF via LibreOffice (off the event
+    loop). Returns the PDF bytes, or None when LibreOffice is unavailable / the
+    convert fails — the caller then falls back to the fpdf2 text view. Never
+    raises. The .docx bytes are never logged."""
+    if not docx_bytes:
+        return None
+    try:
+        return await asyncio.to_thread(_convert_docx_to_pdf_sync, docx_bytes)
+    except Exception:  # pragma: no cover — to_thread wrapper guard
+        logger.exception("SK PDF: render_docx_to_pdf wrapper failed")
+        return None
 
 
 def render_pdf_view_from_docx(

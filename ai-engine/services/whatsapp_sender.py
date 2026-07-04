@@ -235,6 +235,14 @@ async def send_document(
                     "APTANA send-doc ok | to=%s status=%d attempt=%d",
                     masked_to, resp.status_code, attempt + 1,
                 )
+                # Register for transient-failure auto-resend (Meta 131053). Lazy
+                # import breaks the doc_resend↔whatsapp_sender cycle; guarded so a
+                # tracker glitch never fails the (already successful) send.
+                try:
+                    from services import doc_resend
+                    doc_resend.register(recipient_phone, link, filename, caption)
+                except Exception:  # pragma: no cover — never break a send
+                    logger.debug("doc_resend.register skipped (non-fatal)")
                 return True
 
             if resp.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS - 1:
