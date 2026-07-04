@@ -716,7 +716,14 @@ _VISION_KEY_DESCRIPTIONS: dict[str, str] = {
     "nama_kapal": "Nama kapal perikanan.",
     "gt": "Ukuran/tonase kapal (Gross Tonnage), angka saja bila ada.",
     "bahan": "Bahan kasko kapal (Kayu/Fiberglass/Besi/Baja).",
-    "thn_bangun": "Tahun pembuatan/pembangunan kapal.",
+    "thn_bangun": (
+        "Tahun pembangunan kapal. Bila tidak tertulis eksplisit sebagai 'tahun "
+        "pembangunan', ambil TAHUN dari tanggal Surat Pesanan/Pemesanan "
+        "pembangunan kapal (surat pemilik yang memesan/meminta pembangunan "
+        "kapal) — tahun surat pesanan itu adalah tahun mulai pembangunan. Isi "
+        "HANYA bila tanggal/tahun tersebut benar-benar terbaca di dokumen; "
+        "kosongkan bila tidak ada."
+    ),
     "alat": "Alat penangkap ikan yang digunakan.",
     "galangan": "Nama/alamat galangan atau tukang pembuat kapal.",
     "no_siup": "Nomor SIUP (Surat Izin Usaha Perikanan).",
@@ -1214,7 +1221,7 @@ _SK_VESSEL_SCHEMA: dict[str, Any] = {
         "nama_kapal": {"type": "string", "description": "Nama kapal perikanan."},
         "gt": {"type": "string", "description": "Ukuran/tonase kapal (Gross Tonnage), angka saja bila ada."},
         "bahan": {"type": "string", "description": "Bahan kasko kapal (Kayu/Fiberglass/Besi/Baja)."},
-        "thn_bangun": {"type": "string", "description": "Tahun pembuatan/pembangunan kapal."},
+        "thn_bangun": {"type": "string", "description": "Tahun pembangunan kapal; bila tak eksplisit, ambil tahun dari tanggal Surat Pesanan/Pemesanan pembangunan kapal. Hanya bila terbaca."},
         "alat": {"type": "string", "description": "Alat penangkap ikan yang digunakan."},
         "galangan": {"type": "string", "description": "Nama/alamat galangan atau tukang pembuat kapal."},
         "no_siup": {"type": "string", "description": "Nomor SIUP (Surat Izin Usaha Perikanan)."},
