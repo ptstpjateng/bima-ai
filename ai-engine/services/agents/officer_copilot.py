@@ -1508,9 +1508,14 @@ async def draft_sk() -> str:
     all_keys = list(classes.keys())
     filled = [k for k in all_keys if str(data.get(k) or "").strip()]
     blank = [k for k in all_keys if not str(data.get(k) or "").strip()]
+    # SOURCE_FORM = a value already saved in the SIAP Formulir Isian (applicant
+    # 560 or officer Penomoran 768, e.g. no_ppkp) — authoritative SIAP data, so
+    # it belongs in the "data resmi SIAP" bucket alongside profile/case (NOT the
+    # Vision "mohon diperiksa" bucket). Without this a form-sourced field would
+    # render filled in the docx yet show as "(tidak ada)" in the note.
     filled_official = [
         k for k in filled
-        if classes.get(k) in (st.SOURCE_PROFILE, st.SOURCE_CASE)
+        if classes.get(k) in (st.SOURCE_PROFILE, st.SOURCE_CASE, st.SOURCE_FORM)
     ]
     filled_vision = [k for k in filled if classes.get(k) == st.SOURCE_VISION]
 
