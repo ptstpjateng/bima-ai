@@ -746,6 +746,18 @@ _VISION_KEY_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+# Field → source-document keyword allow-list. A VISION key listed here is ONLY
+# accepted when read from a document whose label (detected_type/claimed_type/
+# filename) matches one of the keywords — so a value that legitimately lives in
+# ONE document type is not contaminated by a same-looking value in another.
+# thn_bangun (the year the vessel build was ordered) must come from the Surat
+# Pesanan (the owner's build order); read from the SIUP its issue-year (e.g.
+# 2026) would be plain wrong. A key NOT listed here is accepted from any doc.
+_VISION_KEY_SOURCE_HINTS: dict[str, tuple[str, ...]] = {
+    "thn_bangun": ("pesanan", "pemesanan", "kontrak"),
+}
+
+
 def _vision_description_for_key(key: str) -> str:
     """A short Indonesian description to guide Vision for one key. Falls back to
     a generic 'read this field off the document, empty if not visible' line so
@@ -845,15 +857,24 @@ async def _extract_vision_fields(
     results = await asyncio.gather(*[_extract_one(d) for d in ordered])
 
     out: dict[str, str] = {}
-    for parsed in results:
+    for d, parsed in zip(ordered, results):
         if not parsed or not isinstance(parsed, dict):
             continue
+        label = _label(d)
         for key in vision_keys:
             if key in out:  # first non-blank read (spec-doc order) wins
                 continue
             val = str(parsed.get(key) or "").strip()
-            if val:
-                out[key] = val
+            if not val:
+                continue
+            # Field-scoped source guard: a key in _VISION_KEY_SOURCE_HINTS is only
+            # trustworthy from a SPECIFIC document. thn_bangun must come from the
+            # Surat Pesanan (the build order); a year read off the SIUP's issue
+            # date would be wrong. Reject a value read from the wrong document.
+            hints = _VISION_KEY_SOURCE_HINTS.get(key)
+            if hints and not any(w in label for w in hints):
+                continue
+            out[key] = val
     logger.info(
         "generic Vision extract | docs=%d requested=%d filled=%d",
         len(ordered), len(vision_keys), len(out),

@@ -349,6 +349,39 @@ class TestBuildSkData(unittest.IsolatedAsyncioTestCase):
             "galangan": "Galangan Jaya, Tegal",
         })
 
+    async def test_vision_source_guard_rejects_thn_bangun_from_wrong_doc(self):
+        # thn_bangun (build-order year) is only trustworthy from the Surat
+        # Pesanan. A year read off the SIUP (its ISSUE date) must be REJECTED —
+        # otherwise the SIUP's 2026 would wrongly win over the Pesanan's 2021.
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            if image_bytes == b"siup":
+                return {"thn_bangun": "2026", "no_siup": "SIUP-9"}
+            if image_bytes == b"pesanan":
+                return {"thn_bangun": "2021"}
+            return {}
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            out = await st._extract_vision_fields(
+                ["thn_bangun", "no_siup"],
+                {  # SIUP first in dict order → would win without the guard
+                    "d1": {"filename": "SIUP_CASMO.pdf", "mime_type": "application/pdf",
+                           "content": b"siup", "claimed_type": "SIUP"},
+                    "d2": {"filename": "Surat_Pesanan.pdf", "mime_type": "application/pdf",
+                           "content": b"pesanan", "claimed_type": "Surat Pesanan"},
+                },
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        # thn_bangun taken from the Surat Pesanan (2021), NOT the SIUP (2026);
+        # no_siup (unguarded) still comes from the SIUP.
+        self.assertEqual(out["thn_bangun"], "2021")
+        self.assertEqual(out["no_siup"], "SIUP-9")
+
     async def test_vision_unconfigured_leaves_vessel_blank(self):
         mod = types.ModuleType("services.gemini_vision")
         mod.extract_structured = None
