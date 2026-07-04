@@ -382,6 +382,63 @@ class TestBuildSkData(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["thn_bangun"], "2021")
         self.assertEqual(out["no_siup"], "SIUP-9")
 
+    async def test_gt_computed_from_desain_dimensions(self):
+        # Docs give only a class range "10-20" for GT; the Desain Kapal has the
+        # dimensions but no explicit GT. GT is computed 0.25×L×B×D×0.70 and the
+        # range is replaced. 0.25 * 12.88 * 5.50 * 1.30 * 0.70 = 16.116 -> "16".
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            props = response_schema.get("properties", {})
+            if "panjang_m" in props:  # the GT dimension read (Desain Kapal only)
+                if image_bytes == b"desain":
+                    return {"panjang_m": "12.88 Meter", "lebar_m": "5,50 m",
+                            "dalam_m": "1.30 Meter"}
+                return {}
+            if image_bytes == b"siup":
+                return {"gt": "10-20"}   # class range from the SIUP
+            return {}                    # Desain has no explicit GT
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            out = await st._extract_vision_fields(
+                ["gt"],
+                {
+                    "d1": {"filename": "SIUP.pdf", "content": b"siup",
+                           "mime_type": "application/pdf", "claimed_type": "SIUP"},
+                    "d2": {"filename": "Desain_Kapal.pdf", "content": b"desain",
+                           "mime_type": "application/pdf", "claimed_type": "Desain Kapal"},
+                },
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        self.assertEqual(out["gt"], "16")
+
+    async def test_gt_precise_read_is_not_overwritten_by_calc(self):
+        # If a doc states a PRECISE GT, keep it — don't replace with the calc.
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            props = response_schema.get("properties", {})
+            if "panjang_m" in props:
+                return {"panjang_m": "12.88", "lebar_m": "5.50", "dalam_m": "1.30"}
+            return {"gt": "18"}  # precise GT already present
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            out = await st._extract_vision_fields(
+                ["gt"],
+                {"d2": {"filename": "Desain_Kapal.pdf", "content": b"desain",
+                        "mime_type": "application/pdf", "claimed_type": "Desain Kapal"}},
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        self.assertEqual(out["gt"], "18")
+
     async def test_vision_unconfigured_leaves_vessel_blank(self):
         mod = types.ModuleType("services.gemini_vision")
         mod.extract_structured = None

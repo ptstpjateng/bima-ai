@@ -781,6 +781,105 @@ _GENERIC_VISION_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Gross Tonnage (GT) computed from principal dimensions.
+#
+# Applicant docs usually give only a CLASS RANGE ("10-20 GT"), not a precise GT —
+# but the Desain/Rancang-Bangun Kapal carries the principal dimensions. When GT
+# is requested and no precise value is read, compute it by the Indonesian
+# domestic-measurement form GT = 0.25 × L × B × D × f (f = block coefficient,
+# default 0.70 for wooden fishing vessels; env BIMA_GT_BLOCK_COEFFICIENT). The
+# result is an ESTIMATE — it lands in the VISION / "mohon diperiksa" bucket so
+# the officer verifies it; it is NOT presented as a measured figure. Not a
+# hallucination: it is a deterministic calc from real dimensions on a real doc.
+# ---------------------------------------------------------------------------
+_GT_COMPUTE_ENABLED = os.getenv("BIMA_GT_COMPUTE_ENABLED", "true").lower() in ("1", "true", "yes")
+_GT_BLOCK_COEFFICIENT = float(os.getenv("BIMA_GT_BLOCK_COEFFICIENT", "0.70"))
+_GT_DIM_DESCRIPTIONS: dict[str, str] = {
+    "panjang_m": "Panjang kapal (LOA/Loa/L/panjang) dalam METER — angka saja.",
+    "lebar_m": "Lebar kapal (B/Breadth/lebar) dalam METER — angka saja.",
+    "dalam_m": "Dalam/tinggi kapal (D/Depth/H/dalam) dalam METER — angka saja.",
+}
+_GT_DIM_PROMPT = (
+    "Ini dokumen desain/rancang bangun kapal. Ambil dimensi utama kapal: "
+    "panjang, lebar, dan dalam (tinggi) dalam METER, apa adanya (angka saja). "
+    "Kosongkan bila tidak terlihat. JANGAN mengarang."
+)
+
+
+def _parse_meters(raw: Any) -> Optional[float]:
+    """Parse a dimension like '12.88 Meter' / '5,50 m' → float meters (or None)."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower().replace(",", ".")
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        v = float(m.group(0))
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+def _is_precise_gt(value: Any) -> bool:
+    """True when `value` is a single clean number (e.g. '16' / '15.5') — an
+    already-precise GT, NOT a class range like '10-20' or an empty read."""
+    return bool(re.fullmatch(r"\d+(?:[.,]\d+)?", str(value or "").strip()))
+
+
+async def _compute_gt_from_docs(ordered: list[dict]) -> Optional[str]:
+    """Compute GT from the Desain/Rancang-Bangun Kapal's principal dimensions:
+    GT = 0.25 × L × B × D × f. Returns the whole-number GT as a string, or None
+    when the design doc / any dimension is missing/illegible. NEVER raises. Only
+    the ROUNDED gt is logged (no raw dimensions)."""
+    from services.gemini_vision import extract_structured  # caller already guarded
+
+    def _lbl(d: dict) -> str:
+        return " ".join(
+            str(d.get(k) or "") for k in ("detected_type", "claimed_type", "filename")
+        ).lower()
+
+    desain = next(
+        (d for d in ordered
+         if d.get("content") and any(w in _lbl(d) for w in ("desain", "rancang", "gambar"))),
+        None,
+    )
+    if desain is None:
+        return None
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            k: {"type": "string", "description": v}
+            for k, v in _GT_DIM_DESCRIPTIONS.items()
+        },
+        "required": [],
+    }
+    try:
+        parsed = await extract_structured(
+            image_bytes=desain["content"],
+            mime_type=desain.get("mime_type", "application/octet-stream"),
+            prompt=_GT_DIM_PROMPT,
+            response_schema=schema,
+        )
+    except Exception:  # pragma: no cover — extract_structured already guards
+        logger.exception("GT compute: dimension read raised (skipping)")
+        return None
+    if not parsed or not isinstance(parsed, dict):
+        return None
+    L = _parse_meters(parsed.get("panjang_m"))
+    B = _parse_meters(parsed.get("lebar_m"))
+    D = _parse_meters(parsed.get("dalam_m"))
+    if not (L and B and D):
+        return None
+    gt = 0.25 * L * B * D * _GT_BLOCK_COEFFICIENT
+    if gt <= 0:
+        return None
+    result = str(int(round(gt)))
+    logger.info("GT computed from Desain Kapal dims | f=%.2f -> gt=%s", _GT_BLOCK_COEFFICIENT, result)
+    return result
+
+
 async def _extract_vision_fields(
     vision_keys: list[str], documents: Optional[dict]
 ) -> dict[str, str]:
@@ -875,6 +974,15 @@ async def _extract_vision_fields(
             if hints and not any(w in label for w in hints):
                 continue
             out[key] = val
+
+    # GT: the docs typically give only a CLASS RANGE ("10-20") or nothing. When
+    # GT is requested and no PRECISE value was read, compute it from the Desain
+    # Kapal's dimensions (0.25 × L × B × D × f). An already-precise GT is kept.
+    if "gt" in vision_keys and _GT_COMPUTE_ENABLED and not _is_precise_gt(out.get("gt")):
+        computed_gt = await _compute_gt_from_docs(ordered)
+        if computed_gt:
+            out["gt"] = computed_gt
+
     logger.info(
         "generic Vision extract | docs=%d requested=%d filled=%d",
         len(ordered), len(vision_keys), len(out),
