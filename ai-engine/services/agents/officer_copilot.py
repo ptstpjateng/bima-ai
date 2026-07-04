@@ -359,6 +359,23 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "SK akan dibuat SIAP dari formulir itu. Bila tool gagal/integrasi mati, "
     "sampaikan jujur agar petugas mengisi sendiri di SIAP; JANGAN mengaku sudah "
     "mengisi bila belum.\n\n"
+    "=== ISIKAN NO. PPKP / PENOMORAN (set_ppkp_number) ===\n"
+    "No. PPKP adalah NOMOR IZIN PPKP yang DITETAPKAN PETUGAS pada tahap Penomoran. "
+    "Nomor ini BUKAN bagian dari Formulir Isian pemohon — ia berada di form "
+    "PENOMORAN yang terpisah (field no_ppkp), berbeda dari Formulir Isian yang "
+    "diisi lewat `fill_siap_form`. Ketika petugas meminta mengisi/menuliskan NOMOR "
+    "PPKP — mis. 'isikan nomor ppkp', 'isikan nomor ppkp yaitu 2026/1234/01', "
+    "'nomor ppkp = 2026/1234/01', 'tulis No. PPKP-nya 2026/1234/01' — PANGGIL "
+    "`set_ppkp_number` DENGAN nomor itu sebagai argumen `nomor_ppkp`. JANGAN "
+    "menolak dengan 'Formulir Isian tidak dapat ditemukan' — itu keliru; No. PPKP "
+    "punya tool & form tersendiri. BIMA menuliskan PERSIS nomor yang petugas "
+    "berikan dan TIDAK PERNAH mengarang nomor izin. Bila petugas belum menyebut "
+    "nomornya, MINTA dulu nomornya (jangan menulis apa pun). Tgl. Penetapan "
+    "DITETAPKAN SIAP saat penetapan (bukan field yang bisa diisi) — biarkan kosong, "
+    "jangan mencoba menuliskannya. Setelah tool dijalankan, sampaikan agar petugas "
+    "membuka form Penomoran di SIAP, memeriksa nomornya, lalu klik Simpan; SK final "
+    "ber-TTE diterbitkan SIAP dari form itu. Ini BUKAN tindakan teruskan/keputusan — "
+    "jangan meneruskan atau memutuskan berkas setelahnya.\n\n"
     "=== ATURAN MUTLAK — TINDAKAN YANG MENGUBAH DATA (forward & decision) ===\n"
     "Anda memiliki dua tool yang MENGUBAH data di SIAP: `forward_case` "
     "(meneruskan berkas ke meja berikutnya) dan `record_decision` "
@@ -1422,6 +1439,32 @@ async def draft_sk() -> str:
                     + _siap_edit_link_line(request_id)
                 )
 
+    # 2c) MERGED form-value overrides. The draft must reflect fields that live on
+    #     DIFFERENT forms of this licence — the applicant Formulir Isian (560:
+    #     vessel/identity) AND the officer Penomoran form (768: no_ppkp the officer
+    #     assigned). get_all_form_values merges every bound form's form_value into
+    #     one dict so no_ppkp lands in the Rekomtek/SK draft. It NEVER raises and
+    #     returns {} on a miss/transient error, in which case we fall back to the
+    #     applicant form_value already read for the gate — so a transient read
+    #     still degrades safely and no field is lost. The GATE above is unchanged
+    #     (it keys on the applicant vessel fields; 768 adds no gate key).
+    overrides: Optional[dict] = None
+    if request_id is not None:
+        merged: dict = {}
+        try:
+            merged = await sdb.get_all_form_values(int(license_id), int(request_id))
+        except Exception:
+            logger.exception(
+                "draft_sk: merged form-values read failed | license_id=%s "
+                "request_id=%s", license_id, request_id,
+            )
+            merged = {}
+        # Prefer the merged 560+768 values; fall back to the applicant-only
+        # form_value (read for the gate) when the merge yielded nothing.
+        overrides = merged or (form_value or None)
+    else:
+        overrides = form_value or None
+
     # 3) GENERIC render — discover keys, resolve from real sources, fill.
     #    The filled Formulir Isian (form_value) is the SOURCE OF TRUTH: passed as
     #    `overrides` so each key it holds wins (SOURCE_FORM) with no divergent
@@ -1435,7 +1478,7 @@ async def draft_sk() -> str:
             documents=documents,
             ticket=ticket,
             out_prefix=out_prefix,
-            overrides=form_value or None,
+            overrides=overrides,
         )
     except Exception:
         logger.exception("draft_sk: render failed | license_id=%s", license_id)
@@ -2223,6 +2266,173 @@ async def fill_siap_form() -> str:
         "Langkah Anda: buka Formulir Isian permohonan ini di SIAP, PERIKSA "
         "setiap isian (terutama yang dibaca dari dokumen), lengkapi yang kosong, "
         "lalu klik Simpan. SK akan dibuat SIAP dari formulir itu. "
+        + _siap_edit_link_line(request_id)
+    )
+
+
+# ---------------------------------------------------------------------------
+# set_ppkp_number — write the officer-SUPPLIED No. PPKP to SIAP's Penomoran form.
+#
+# At the Penomoran step the officer ASSIGNS the PPKP licence number (e.g.
+# "2026/1234/01"). That number lives on a DIFFERENT form than the applicant
+# Formulir Isian — for PKPP it is `no_ppkp` on form 768 ("Form Penomoran PPKP"),
+# discovered (never hardcoded) via siap_db.get_form_id_for_field(license_id,
+# "no_ppkp"). BIMA writes EXACTLY the value the officer gives — it NEVER
+# fabricates a licence number. SIAP then issues the final SK ber-TTE from the
+# form. This is the tool the copilot was missing: previously it had no way to
+# write an officer-supplied value to a specific field, so it parroted a stale
+# "Formulir Isian tidak ditemukan" refusal.
+#
+# The PPKP number itself is a licence number; to be safe it is kept OUT of logs
+# (only its length + the ids are logged). Best-effort: on any failure an honest
+# message is returned — the officer turn is NEVER crashed. This is NOT a
+# decision/forward action, so it is not confirmation-gated.
+# ---------------------------------------------------------------------------
+
+
+async def set_ppkp_number(nomor_ppkp: str) -> str:
+    """WRITE the officer-supplied No. PPKP to the request's SIAP Penomoran form.
+
+    The officer assigns the PPKP licence number at the Penomoran step and asks
+    BIMA to fill it (e.g. "isikan nomor ppkp 2026/1234/01"). This tool writes
+    EXACTLY that value to the `no_ppkp` field of the licence's Penomoran form —
+    the form is DISCOVERED via siap_db.get_form_id_for_field(license_id,
+    "no_ppkp"), not hardcoded. BIMA never fabricates the number: if the officer
+    supplies nothing, it asks for it rather than writing a guess.
+
+    Best-effort — degrades to an honest message on any missing context / unresolved
+    request / undiscoverable form / SIAP failure. NEVER raises. Returns a
+    confirmation that the number was written to the SIAP Penomoran form and the
+    officer should VERIFY + Simpan; SIAP issues the final SK ber-TTE from the form.
+    Includes the officer edit-page link. Does NOT auto-forward/decide.
+    """
+    # (a) Need the SK context (license_id + ticket) bound to the session.
+    sk = _sk_context.get()
+    if not sk or not isinstance(sk, dict):
+        return (
+            "No. PPKP belum bisa saya isikan di jalur ini: konteks berkas (izin & "
+            "permohonan) tidak tersedia pada sesi. Pada alur chat petugas, No. PPKP "
+            "ditulis ke form Penomoran SIAP dari konteks berkas yang aktif."
+        )
+
+    # (b) Trim the officer-supplied number. Empty → ask, do NOT write anything.
+    number = str(nomor_ppkp or "").strip()
+    if not number:
+        return (
+            "Silakan sebutkan nomor PPKP-nya (mis. \"2026/1234/01\"), lalu saya "
+            "tuliskan ke form Penomoran di SIAP. Saya hanya menuliskan nomor yang "
+            "Anda berikan — tidak mengarang."
+        )
+
+    license_id = sk.get("license_id")
+    ticket = sk.get("ticket")
+    if not license_id:
+        return (
+            "No. PPKP belum bisa ditulis: ID izin (license_id) tidak diketahui "
+            "untuk berkas ini, sehingga form Penomoran di SIAP tidak dapat "
+            "ditemukan. Silakan isikan No. PPKP langsung di SIAP."
+        )
+
+    try:
+        from services import siap_tools as stools
+        from services import siap_db as sdb
+        from services.siap_form_client import get_siap_form_client
+    except Exception:  # pragma: no cover — module import guard
+        return (
+            "No. PPKP belum bisa ditulis: modul integrasi formulir SIAP tidak "
+            "tersedia di server ini. Silakan isikan langsung di SIAP."
+        )
+
+    # (c) Resolve the request_id from the ticket (needed for the form-value write).
+    request_id: Optional[int] = None
+    try:
+        if ticket:
+            request_id = await stools.siap_resolve_request_id(str(ticket))
+    except Exception:
+        logger.exception("set_ppkp_number: request_id resolve failed | ticket bound")
+        request_id = None
+    if request_id is None:
+        return (
+            "No. PPKP belum bisa ditulis: nomor permohonan (request_id) tidak dapat "
+            "ditemukan di SIAP untuk tiket ini. Silakan isikan No. PPKP langsung di "
+            "SIAP."
+        )
+
+    # (d) DISCOVER the form that owns `no_ppkp` for this licence (the Penomoran
+    #     form — 768 for PKPP, by discovery, never hardcoded).
+    form_id: Optional[int] = None
+    try:
+        form_id = await sdb.get_form_id_for_field(int(license_id), "no_ppkp")
+    except Exception:
+        logger.exception(
+            "set_ppkp_number: form_id resolve failed | license_id=%s", license_id
+        )
+        form_id = None
+    if form_id is None:
+        return (
+            "No. PPKP belum bisa ditulis: form Penomoran (field no_ppkp) untuk izin "
+            "ini tidak dapat ditemukan di SIAP. Silakan isikan No. PPKP langsung di "
+            "SIAP."
+        )
+
+    # (e) WRITE exactly the officer-supplied value to the discovered form. The
+    #     PPKP number is a licence number — kept OUT of logs; only its LENGTH +
+    #     the ids are logged.
+    client = get_siap_form_client()
+    if not client.is_configured():
+        logger.info(
+            "set_ppkp_number: form client not configured | license_id=%s "
+            "request_id=%s form_id=%s len=%d",
+            license_id, request_id, form_id, len(number),
+        )
+        return (
+            "Integrasi penulisan form Penomoran SIAP belum aktif pada lingkungan "
+            "ini, jadi No. PPKP belum bisa saya tuliskan otomatis. Silakan isikan "
+            "No. PPKP langsung di form Penomoran di SIAP. "
+            + _siap_edit_link_line(request_id)
+        )
+
+    # (f) BEST-EFFORT — any failure returns an honest message, NEVER raises.
+    try:
+        upsert = await client.upsert_form(
+            request_id=int(request_id),
+            form_id=int(form_id),
+            fields={"no_ppkp": number},
+            files={},
+        )
+    except Exception:  # pragma: no cover — client never raises, defence-in-depth
+        logger.exception(
+            "set_ppkp_number: upsert_form raised | license_id=%s request_id=%s "
+            "form_id=%s len=%d",
+            license_id, request_id, form_id, len(number),
+        )
+        return (
+            "Maaf, terjadi kendala saat menghubungi SIAP, jadi No. PPKP belum "
+            "tertulis. Silakan isikan No. PPKP langsung di form Penomoran di SIAP. "
+            + _siap_edit_link_line(request_id)
+        )
+
+    ok = bool(isinstance(upsert, dict) and upsert.get("ok"))
+    logger.info(
+        "set_ppkp_number | license_id=%s request_id=%s form_id=%s len=%d ok=%s",
+        license_id, request_id, form_id, len(number), ok,
+    )
+    if not ok:
+        note = str((upsert or {}).get("note") or "") if isinstance(upsert, dict) else ""
+        note = (" " + note) if note else ""
+        return (
+            "Maaf, No. PPKP belum berhasil saya tuliskan otomatis ke SIAP." + note
+            + " Silakan isikan No. PPKP langsung di form Penomoran di SIAP. "
+            + _siap_edit_link_line(request_id)
+        )
+
+    # (g) SUCCESS — confirm, steer the officer to verify + Simpan, note that SIAP
+    #     issues the final SK ber-TTE from the form. Do NOT auto-forward/decide.
+    return (
+        f"No. PPKP sudah saya tuliskan ke form Penomoran PPKP di SIAP: {number}. "
+        "Langkah Anda: buka form Penomoran permohonan ini di SIAP, PERIKSA nomornya, "
+        "lalu klik Simpan. SK final ber-TTE diterbitkan SIAP dari form itu — saya "
+        "tidak meneruskan atau memutuskan berkas ini. "
         + _siap_edit_link_line(request_id)
     )
 
@@ -3029,6 +3239,36 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "set_ppkp_number",
+        "description": (
+            "TULISKAN No. PPKP (nomor izin PPKP yang DIBERIKAN PETUGAS pada tahap "
+            "Penomoran) ke form Penomoran permohonan di SIAP. No. PPKP TIDAK berada "
+            "di Formulir Isian pemohon — ia ada di form Penomoran (field no_ppkp), "
+            "yang ditemukan otomatis, bukan di-hardcode. Gunakan saat petugas minta "
+            "'isikan nomor ppkp', 'nomor ppkp = X', 'isikan nomor ppkp yaitu X', "
+            "'tulis No. PPKP-nya', atau menyebut nomor PPKP yang harus diisi. BIMA "
+            "menulis PERSIS nilai yang petugas berikan — TIDAK PERNAH mengarang "
+            "nomor izin. Bila petugas belum menyebut nomornya, MINTA dulu (jangan "
+            "menulis apa pun). BUKAN tindakan keputusan/teruskan — hanya menulis "
+            "isian, jadi TIDAK perlu konfirmasi. SIAP menerbitkan SK final ber-TTE "
+            "dari form itu; petugas cukup memeriksa lalu Simpan."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "nomor_ppkp": {
+                    "type": "string",
+                    "description": (
+                        "Nomor PPKP yang diberikan petugas, PERSIS seperti "
+                        "diucapkan (mis. \"2026/1234/01\"). Ditulis apa adanya ke "
+                        "field no_ppkp form Penomoran — tidak dikarang/diubah."
+                    ),
+                },
+            },
+            "required": ["nomor_ppkp"],
+        },
+    },
+    {
         "name": "compare_field",
         "description": (
             "Bandingkan satu field di antara dua dokumen yang sudah "
@@ -3249,6 +3489,7 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "send_document": send_document,
     "draft_sk": draft_sk,
     "fill_siap_form": fill_siap_form,
+    "set_ppkp_number": set_ppkp_number,
     "compare_field": compare_field,
     "compare_identity": compare_identity,
     "cite_regulation": cite_regulation,
@@ -3277,6 +3518,7 @@ _OFFICER_TOOL_NAMES = frozenset({
     "send_document",
     "draft_sk",
     "fill_siap_form",
+    "set_ppkp_number",
     "compare_field",
     "compare_identity",
     "cite_regulation",
