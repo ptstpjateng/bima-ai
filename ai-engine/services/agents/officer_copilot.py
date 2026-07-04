@@ -177,6 +177,11 @@ _EMPTY_REPLY_FALLBACK_SIGNATURE = (
 )
 
 
+# Retries when Gemini returns an EMPTY candidate (no tool call, no text) before
+# dead-ending on the capability menu — the empty turn is a transient.
+_MAX_EMPTY_RETRIES = 1
+
+
 def _empty_reply_fallback(mode: str) -> str:
     """Mode-aware capability menu for the empty-turn mis-parse."""
     return (
@@ -3789,6 +3794,7 @@ class OfficerCopilot:
         # signature-assistant never sees the write tools.
         declarations = _declarations_for_mode(mode)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
+            empty_retries = 0
             for round_idx in range(self.max_rounds):
                 payload = {
                     "systemInstruction": system_instruction,
@@ -3796,7 +3802,15 @@ class OfficerCopilot:
                     "tools": [{"functionDeclarations": declarations}],
                     "generationConfig": {
                         "temperature": 0.2,
-                        "maxOutputTokens": 1024,
+                        "maxOutputTokens": 2048,
+                        # Disable Gemini 2.5 Flash "thinking". With thinking ON
+                        # (the default) the model intermittently spends its output
+                        # budget reasoning and returns an EMPTY candidate (no tool
+                        # call, no text) — which surfaced as the officer copilot
+                        # flakily NOT calling send_document/draft_sk and dead-ending
+                        # on the capability menu. thinkingBudget=0 → respond
+                        # directly, which makes tool invocation reliable.
+                        "thinkingConfig": {"thinkingBudget": 0},
                     },
                 }
 
@@ -3843,6 +3857,18 @@ class OfficerCopilot:
                 if not function_calls:
                     reply_text = "".join(text_chunks).strip()
                     if not reply_text:
+                        # Gemini can still return an EMPTY candidate (no tool
+                        # call, no text) even with thinking off. Retry the same
+                        # turn once before dead-ending — the empty turn is a
+                        # transient and a re-generation usually calls the tool.
+                        if empty_retries < _MAX_EMPTY_RETRIES:
+                            empty_retries += 1
+                            logger.info(
+                                "Copilot empty turn — retrying | attempt=%d | "
+                                "mode=%s | ticket=%s",
+                                empty_retries, mode, ticket,
+                            )
+                            continue
                         # A mis-parse must NEVER dead-end (rehearsal: "saya mau
                         # liat surat permohonannya" → blank reply). Offer a
                         # concrete capability menu so the officer always has a
