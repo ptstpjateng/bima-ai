@@ -872,13 +872,29 @@ async def load_case_from_siap(
 
     documents = await _load_siap_documents(meta.get("profile_id"), int(request_id))
 
+    # Resolve the licence's real display name so the next-desk brief/notification
+    # reads "Persetujuan Pengadaan Kapal Perikanan (PKPP)…" instead of a bare "-"
+    # or the generic type. Best-effort; degrades to None (brief then shows "-").
+    license_name = None
+    _lid = meta.get("license_id")
+    if _lid is not None:
+        try:
+            from services.siap_db import get_license_name
+            license_name = await get_license_name(int(_lid))
+        except Exception:
+            logger.exception(
+                "load_case_from_siap: license_name resolve failed | request_id=%s",
+                request_id,
+            )
+            license_name = None
+
     sess = OfficerCaseSession(
         channel_id=channel_id,
         channel=channel,
         ticket=str(meta["ticket"]),
         request_id=int(request_id),
         license_id=meta.get("license_id"),
-        license_name=None,          # not needed for the copilot's SIAP tools
+        license_name=license_name,  # real name for the officer brief/notification
         profile_id=meta.get("profile_id"),  # grounds draft_sk identity on profile
         step_stereotype=meta.get("stereotype"),  # per-step template selection
         applicant_name=None,        # copilot reads identity from profile, grounded
