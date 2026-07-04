@@ -309,6 +309,46 @@ class TestBuildSkData(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("bahan", data)
         self.assertEqual(data["nama_pemohon"], "CASMO")
 
+    async def test_vision_merges_fields_across_multiple_docs(self):
+        # The vessel specs live in DIFFERENT docs (GT/tipe/bahan in the Desain
+        # Kapal, alat in the Spesifikasi, thn_bangun/galangan in the Surat
+        # Pesanan). Vision must read EACH doc and MERGE — a single-doc pass left
+        # most of the form blank. Stub Vision to return a different field per doc.
+        mod = types.ModuleType("services.gemini_vision")
+
+        async def _extract(*, image_bytes, mime_type, prompt, response_schema):
+            if image_bytes == b"desain":
+                return {"gt": "12", "bahan": "Fiberglass", "tipe": "Purse Seine"}
+            if image_bytes == b"spesifikasi":
+                return {"alat": "Pukat Cincin"}
+            if image_bytes == b"pesanan":
+                return {"thn_bangun": "2021", "galangan": "Galangan Jaya, Tegal"}
+            return {}
+
+        mod.extract_structured = _extract
+        mod.is_configured = lambda: True
+        sys.modules["services.gemini_vision"] = mod
+        try:
+            out = await st._extract_vision_fields(
+                ["gt", "bahan", "tipe", "alat", "thn_bangun", "galangan"],
+                {
+                    "d1": {"filename": "Desain_Kapal.pdf", "mime_type": "application/pdf",
+                           "content": b"desain", "claimed_type": "Desain Kapal"},
+                    "d2": {"filename": "Spesifikasi_Alat.pdf", "mime_type": "application/pdf",
+                           "content": b"spesifikasi", "claimed_type": "Spesifikasi Alat Tangkap"},
+                    "d3": {"filename": "Surat_Pesanan.pdf", "mime_type": "application/pdf",
+                           "content": b"pesanan", "claimed_type": "Surat Pesanan"},
+                },
+            )
+        finally:
+            sys.modules.pop("services.gemini_vision", None)
+        # Every field, though spread across three separate docs, is merged.
+        self.assertEqual(out, {
+            "gt": "12", "bahan": "Fiberglass", "tipe": "Purse Seine",
+            "alat": "Pukat Cincin", "thn_bangun": "2021",
+            "galangan": "Galangan Jaya, Tegal",
+        })
+
     async def test_vision_unconfigured_leaves_vessel_blank(self):
         mod = types.ModuleType("services.gemini_vision")
         mod.extract_structured = None

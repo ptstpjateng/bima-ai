@@ -20,6 +20,7 @@ raises to the caller — a template miss is a graceful None, never a broken flow
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -35,6 +36,12 @@ _ENABLED = os.getenv("BIMA_SIAP_TEMPLATES_ENABLED", "true").lower() in ("1", "tr
 _STORAGE_BASE = os.getenv("SIAP_STORAGE_BASE", "https://beta-siap.nolongin.com").rstrip("/")
 _FETCH_TIMEOUT = float(os.getenv("BIMA_SIAP_TEMPLATE_TIMEOUT", "20"))
 _MAX_TEMPLATE_BYTES = int(os.getenv("BIMA_SIAP_TEMPLATE_MAX_BYTES", str(8 * 1024 * 1024)))
+# How many applicant docs one Vision fill pass reads. The vessel/permit specs are
+# spread ACROSS documents (Desain Kapal → GT/tipe/bahan/galangan, Spesifikasi →
+# alat, Surat Pesanan → thn_bangun, SIUP → no_siup …), so reading a single doc
+# leaves most of the form blank. We read up to this many (spec-docs first) in
+# parallel and merge. Bounds latency/cost; PKPP has ~8 applicant docs.
+_VISION_MAX_DOCS = int(os.getenv("BIMA_VISION_MAX_DOCS", "8"))
 
 _ID_MONTHS = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
               "Agustus", "September", "Oktober", "November", "Desember"]
@@ -758,11 +765,14 @@ _GENERIC_VISION_PROMPT = (
 async def _extract_vision_fields(
     vision_keys: list[str], documents: Optional[dict]
 ) -> dict[str, str]:
-    """Run ONE best-effort Gemini Vision pass over the submission docs to pull
-    the VISION-classified keys. Schema is built from `vision_keys` so it is
-    licence-agnostic. Returns {key: value} for the non-empty reads only, or {}
-    when Vision is unconfigured / fails / there are no bytes / no vision keys.
-    NEVER raises. Bytes never logged.
+    """Run a best-effort Gemini Vision pass over the submission docs to pull the
+    VISION-classified keys. Reads up to `_VISION_MAX_DOCS` applicant docs
+    (spec-bearing first) concurrently and MERGES their reads — the vessel/permit
+    specs live in DIFFERENT documents, so a single-doc pass leaves most fields
+    blank. Schema is built from `vision_keys` so it is licence-agnostic. Returns
+    {key: value} for the non-empty reads only, or {} when Vision is unconfigured
+    / fails / there are no bytes / no vision keys. NEVER raises. Bytes never
+    logged.
 
     `documents` is the copilot `_doc_context` shape:
       {file_id: {"filename","mime_type","content","claimed_type","detected_type"}}
@@ -786,12 +796,21 @@ async def _extract_vision_fields(
             str(d.get(k) or "") for k in ("detected_type", "claimed_type", "filename")
         ).lower()
 
-    preferred = next(
-        (d for d in docs_with_bytes
-         if any(w in _label(d) for w in
-                ("permohonan", "siup", "kapal", "izin usaha", "spesifikasi", "teknis"))),
-        docs_with_bytes[0],
+    # Read EACH applicant doc and MERGE — the vessel/permit specs are spread
+    # across documents (GT/tipe/bahan/galangan in the Desain Kapal, alat in the
+    # Spesifikasi, thn_bangun in the Surat Pesanan, no_siup/tgl_siup in the SIUP,
+    # dates/perihal in the Surat Permohonan). A single-doc pass left most of the
+    # form blank (exactly what the officer saw). Spec-bearing docs go first so
+    # their value wins a per-key tie; still NO hallucination — each pass extracts
+    # only what is literally in that one doc, and merging real reads stays real.
+    _spec_words = (
+        "desain", "rancang", "gambar", "spesifikasi", "teknis", "kapal",
+        "pesanan", "kontrak", "permohonan", "siup", "izin usaha", "nib",
     )
+    ordered = sorted(
+        docs_with_bytes,
+        key=lambda d: 0 if any(w in _label(d) for w in _spec_words) else 1,
+    )[:_VISION_MAX_DOCS]
 
     schema: dict[str, Any] = {
         "type": "object",
@@ -802,24 +821,36 @@ async def _extract_vision_fields(
         "required": [],
     }
 
-    try:
-        parsed = await extract_structured(
-            image_bytes=preferred["content"],
-            mime_type=preferred.get("mime_type", "application/octet-stream"),
-            prompt=_GENERIC_VISION_PROMPT,
-            response_schema=schema,
-        )
-    except Exception:  # pragma: no cover — extract_structured already guards
-        logger.exception("generic Vision extract raised (degrading to blanks)")
-        return {}
-    if not parsed or not isinstance(parsed, dict):
-        return {}
+    async def _extract_one(d: dict) -> Optional[dict]:
+        try:
+            return await extract_structured(
+                image_bytes=d["content"],
+                mime_type=d.get("mime_type", "application/octet-stream"),
+                prompt=_GENERIC_VISION_PROMPT,
+                response_schema=schema,
+            )
+        except Exception:  # pragma: no cover — extract_structured already guards
+            logger.exception("generic Vision extract raised on one doc (skipped)")
+            return None
+
+    # Run the per-doc passes concurrently (wall-clock ≈ one pass); gather keeps
+    # `ordered` order so the spec-doc-first, first-non-blank-wins merge is stable.
+    results = await asyncio.gather(*[_extract_one(d) for d in ordered])
+
     out: dict[str, str] = {}
-    for key in vision_keys:
-        val = str(parsed.get(key) or "").strip()
-        if val:
-            out[key] = val
-    logger.info("generic Vision extract | requested=%d filled=%d", len(vision_keys), len(out))
+    for parsed in results:
+        if not parsed or not isinstance(parsed, dict):
+            continue
+        for key in vision_keys:
+            if key in out:  # first non-blank read (spec-doc order) wins
+                continue
+            val = str(parsed.get(key) or "").strip()
+            if val:
+                out[key] = val
+    logger.info(
+        "generic Vision extract | docs=%d requested=%d filled=%d",
+        len(ordered), len(vision_keys), len(out),
+    )
     return out
 
 
