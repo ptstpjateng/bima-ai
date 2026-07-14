@@ -297,7 +297,10 @@ async def health():
             import chromadb
             import os
             path = os.getenv("CHROMA_DB_PATH", "/app/chroma_db")
-            client = chromadb.PersistentClient(path=path)
+            client = chromadb.PersistentClient(
+                path=path,
+                settings=chromadb.Settings(anonymized_telemetry=False),
+            )
             col = client.get_collection("oss_regulations")
             return col.count(), "ok"
         except Exception as exc:

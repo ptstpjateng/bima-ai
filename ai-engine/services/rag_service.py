@@ -42,7 +42,10 @@ def query_regulations(query_text: str, n_results: int = _DEFAULT_N_RESULTS) -> l
     Returns [] if the collection is empty or ChromaDB is unavailable.
     """
     try:
-        client = chromadb.PersistentClient(path=_CHROMA_PATH)
+        client = chromadb.PersistentClient(
+            path=_CHROMA_PATH,
+            settings=chromadb.Settings(anonymized_telemetry=False),
+        )
         collection = client.get_or_create_collection(
             name=_COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
