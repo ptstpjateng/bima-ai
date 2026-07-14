@@ -1745,13 +1745,32 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
 
     if ticket:
         track = _PORTAL_TRACK_URL.format(ticket=ticket)
+        # Only PROMISE proactive updates when the push path is actually live —
+        # BOTH the transparency poller and the notifications sender must be on
+        # (see transparency_poller / notifications _is_enabled). While either is
+        # off the citizen can only learn of changes via the no-login /track pull
+        # link, so we point them there instead of over-promising a push we can't
+        # send. Reads the flags at reply time, so it auto-corrects the moment the
+        # loop is enabled — no copy change needed later.
+        _truthy = {"1", "true", "yes", "on"}
+        _push_live = (
+            os.getenv("BIMA_NOTIFICATIONS_ENABLED", "false").strip().lower() in _truthy
+            and os.getenv("BIMA_TRANSPARENCY_POLLER_ENABLED", "false").strip().lower()
+            in _truthy
+        )
+        closing = (
+            "Mohon simpan nomor tiket ini. Kami akan kabari saat status "
+            "permohonan berubah. Terima kasih."
+            if _push_live
+            else "Mohon simpan nomor tiket ini. Silakan cek perkembangannya "
+            "kapan saja lewat tautan di atas. Terima kasih."
+        )
         return (
             f"Permohonan Bapak/Ibu berhasil dikirim ke SIAP Jateng.\n\n"
             f"Jenis izin: {sess.license_name}\n"
             f"Nomor tiket: {ticket}\n\n"
-            f"Pantau status permohonan kapan saja di:\n{track}\n\n"
-            "Mohon simpan nomor tiket ini. Kami akan kabari saat status "
-            "permohonan berubah. Terima kasih."
+            f"Pantau status permohonan kapan saja (tanpa login) di:\n{track}\n\n"
+            + closing
         )
     return (
         f"Permohonan Bapak/Ibu berhasil dikirim ke SIAP Jateng.\n\n"
