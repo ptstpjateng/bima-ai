@@ -280,3 +280,12 @@ def configure_logging() -> None:
     for handler in root.handlers:
         if not any(isinstance(existing, SecretRedactingFilter) for existing in handler.filters):
             handler.addFilter(f)
+
+    # Mute ChromaDB's telemetry logger. It spams ~230 ERROR lines/hour —
+    # "Failed to send telemetry event ClientStartEvent: capture() takes 1
+    # positional argument but 3 were given" — a chromadb↔posthog version-mismatch
+    # bug that fires on every client init and is NOT silenced by
+    # ANONYMIZED_TELEMETRY or per-client Settings in this chromadb build. It is
+    # harmless (Chroma works fine; only the telemetry send fails) but drowns real
+    # errors, so we suppress the logger outright.
+    logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
