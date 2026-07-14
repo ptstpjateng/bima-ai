@@ -11,12 +11,14 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 *   **Pillar 3:** Admin-API (FastAPI + SQLAlchemy 2 async, `admin-api/`) — replacing the Laravel admin surface page-by-page
 *   **Legacy Core Backend:** Laravel 13 + Filament v.4 + PostgreSQL (TALL Stack) — still running, being migrated out
 
-### 📊 Current state (as of 2026-05-14, Sprint C.5 shipped)
+### 📊 Current state (as of 2026-07-14, Sprint D in progress)
 
-*   **Sprints completed:** A (stabilize), B.1 (admin-api scaffold + admin shell), B.2 (read-only resource pages), C.4 (ingestion upload UI + reconciler), C.5 (architecture-flows visualizer). **Sprint D (rehearsals + backup video) is next.**
+*   **Sprints completed:** A (stabilize), B.1 (admin-api scaffold + admin shell), B.2 (read-only resource pages), C.4 (ingestion upload UI + reconciler), C.5 (architecture-flows visualizer), **officer-form-fill arc (2026-07, bima-ai PR #131 + SIAP #32)**. **Sprint D (rehearsals + backup video) is IN PROGRESS.**
+*   **Officer copilot (WhatsApp, live on Beta):** the officer copilot fills the SIAP applicant *Formulir Isian* (form 560) from docs + profile via the no-hallucination engine, **computes GT from vessel dimensions** (0.25·L·B·D·f, `BIMA_GT_BLOCK_COEFFICIENT`), reads `thn_bangun` from the Surat Pesanan, drafts the real SK as a **LibreOffice-rendered PDF** (PDF-only), writes the **No. PPKP** to the officer Penomoran form (768, `set_ppkp_number`), **gates the draft** until the form is filled, and **auto-resends** a document on transient Meta 131053. Gemini `thinkingConfig.thinkingBudget:0` for reliable tool-calling. The citizen submission **auto-fills form 560** at submit. Applicant form = 560 (data fields + up_* slots); officer form = 768 (`no_ppkp`); `tgl_penetapan` is SIAP-set at TTE, not a form field.
 *   **Live data:** 1,405 KBLI codes / 6,211 kblis rows / 319 pb_umkus rows / 6,340 ChromaDB chunks / 11 live UMKM users.
 *   **Live URLs:** see Service Map below.
 *   **WhatsApp UX:** sub-second typing acknowledgment (text bubble; APTANA doesn't expose Meta's native indicator — see [[Decisions]] §9). Final reply ~9–13 s.
+*   **⚠️ Infra (2026-07-14):** the VPS is a Xen VM behind a MikroTik router. A reboot once handed the VM a DHCP IP (`10.10.10.2`) that didn't match the MikroTik dst-nat forward for `116.254.113.81` (→`10.10.10.8`), taking BIMA fully offline (no webhook in, no reply out). `eth0` is now **pinned static to `10.10.10.8`** in `/etc/netplan/00-installer-config.yaml`. If BIMA ever goes silent after a reboot, check `ip -brief a` == `.8` first.
 
 ### 🧠 Primary LLM: Gemini 2.5 Flash via Google AI Studio
 *   **Model:** `gemini-2.5-flash` accessed via the Google Generative Language REST API
