@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Literal, Sequence
 from urllib.parse import urlparse
 
-from services.whatsapp_sender import send_text
+from services.whatsapp_sender import normalize_phone, send_text
 from services.whatsapp_template import send_template
 
 logger = logging.getLogger(__name__)
@@ -298,6 +298,29 @@ _engaged_phones: set[str] = _load_set(_ENGAGEMENT_PATH)
 _opted_out_phones: set[str] = _load_set(_OPTED_OUT_PATH)
 
 
+def _canon(phone_or_key: str) -> str:
+    """Canonicalize a WhatsApp phone to E.164 (``62…``) so the SAME citizen
+    matches whether the caller supplies ``08…``, ``+62…`` or ``62…``.
+
+    WHY this exists: the engagement + opt-out gates are exact-string set
+    membership, but the two sides of the loop disagree on format — inbound
+    (`record_engagement`) stores APTANA's ``phoneNumber`` in ``62…`` E.164,
+    while the transparency poller checks with SIAP ``person_profile.mobile_phone``
+    in ``08…`` local form. Without canonicalizing both sides,
+    ``"081234567890" in {"6281234567890"}`` is False for the SAME person, so an
+    engaged citizen is wrongly suppressed as "no engagement" (and STOP/opt-out
+    has the mirror false-negative).
+
+    Channel keys such as Telegram's ``tg:{chat_id}`` contain a ``:`` and are NOT
+    phone numbers — they are returned unchanged so ``normalize_phone`` can't
+    coerce them into a bogus ``62…`` number (it would strip ``tg:`` and prepend
+    ``62``). A real phone never contains ``:``.
+    """
+    if not phone_or_key or ":" in phone_or_key:
+        return phone_or_key
+    return normalize_phone(phone_or_key)
+
+
 def record_engagement(phone: str) -> None:
     """Mark a phone number as having engaged with BIMA (sent at least one
     message). Called from the inbound handlers in routers/aptana.py and
@@ -307,6 +330,7 @@ def record_engagement(phone: str) -> None:
     re-engaging by texting us, so that counts as implicit re-consent.
     """
     global _engaged_phones, _opted_out_phones
+    phone = _canon(phone)
     if phone in _opted_out_phones:
         _opted_out_phones.discard(phone)
         _save_set(_OPTED_OUT_PATH, _opted_out_phones)
@@ -323,6 +347,7 @@ def record_opt_out(phone: str) -> None:
     from the same number auto-reverses this via record_engagement().
     """
     global _opted_out_phones
+    phone = _canon(phone)
     if phone not in _opted_out_phones:
         _opted_out_phones.add(phone)
         _save_set(_OPTED_OUT_PATH, _opted_out_phones)
@@ -331,12 +356,12 @@ def record_opt_out(phone: str) -> None:
 
 def is_engaged(phone: str) -> bool:
     """Return True if this phone has previously sent a message to BIMA."""
-    return phone in _engaged_phones
+    return _canon(phone) in _engaged_phones
 
 
 def is_opted_out(phone: str) -> bool:
     """Return True if this phone has explicitly opted out of notifications."""
-    return phone in _opted_out_phones
+    return _canon(phone) in _opted_out_phones
 
 
 # citizen_progress intermediate-hop flag. OFF by default — only
