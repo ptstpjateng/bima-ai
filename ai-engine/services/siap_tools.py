@@ -1122,6 +1122,75 @@ async def siap_list_licenses_by_sektor(sektor: str) -> dict:
 
 
 # ===========================================================================
+# Tool 6 — siap_get_regulations
+#
+# Legal-basis lookup. Unlike the other tools (which hit SIAP's Postgres via
+# asyncpg), this one semantic-searches the SIAP regulation registry the
+# data-pipeline mirrored into ChromaDB (B2: ptsp.tblregulasi → oss_regulations
+# chunks with section='regulasi'). It closes the gap where a scope=siap
+# legal-basis question ("apa dasar hukum ...") had NO tool, so the agent made
+# zero tool calls and deflected. Over-fetches then keeps only regulation
+# chunks, so licence/KBLI chunks never leak into a "dasar hukum" answer.
+# query_regulations is blocking (embed + Chroma), so we run it in an executor.
+# ===========================================================================
+
+async def siap_get_regulations(query: str, limit: int = 5) -> dict:
+    """
+    Cari dasar hukum / regulasi resmi (UU, PP, Peraturan Gubernur, Peraturan
+    Menteri, Peraturan Daerah) yang relevan dari registri regulasi SIAP Jateng.
+
+    Returns:
+      {
+        "found": bool,
+        "query": str,
+        "count": int,
+        "regulations": [{"teks": str, "distance": float}, ...],
+      }
+    On no match / error: found=False with a `note`. Never raises.
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"found": False, "query": query, "note": "Kata kunci regulasi kosong."}
+    capped = max(1, min(int(limit) if limit else 5, 10))
+    try:
+        import asyncio
+
+        from services.rag_service import query_regulations
+
+        loop = asyncio.get_running_loop()
+        # Over-fetch, then keep only regulation chunks (section='regulasi') so
+        # licence/KBLI chunks in the same collection never leak in.
+        chunks = await loop.run_in_executor(
+            None, lambda: query_regulations(q, n_results=max(12, capped * 3))
+        )
+        regs = [c for c in chunks if c.get("section") == "regulasi"][:capped]
+        logger.info("siap_get_regulations | query=%r | regs=%d", q, len(regs))
+        if not regs:
+            return {
+                "found": False,
+                "query": q,
+                "count": 0,
+                "regulations": [],
+                "note": f"Tidak ada regulasi relevan di registri SIAP untuk '{q}'.",
+            }
+        return {
+            "found": True,
+            "query": q,
+            "count": len(regs),
+            "regulations": [
+                {
+                    "teks": c.get("content", ""),
+                    "distance": round(float(c.get("distance", 0.0)), 3),
+                }
+                for c in regs
+            ],
+        }
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.exception("siap_get_regulations failed | query=%r", q)
+        return {"found": False, "query": q, "note": f"Gagal mencari regulasi: {exc}"}
+
+
+# ===========================================================================
 # Licence catalogue — the WHOLE SIAP licence list, cached in memory.
 #
 # This powers the LLM-driven resolver (services/license_resolver.py): instead

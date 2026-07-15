@@ -45,6 +45,7 @@ import httpx
 from dotenv import load_dotenv
 
 from services.siap_tools import (
+    siap_get_regulations,
     siap_get_requirements,
     siap_get_status,
     siap_get_status_timeline,
@@ -97,14 +98,20 @@ _SYSTEM_PROMPT = (
     "sebutkan kandidatnya dan minta warga memperjelas.\n"
     "3. Untuk pertanyaan status tiket, gunakan `siap_get_status`; untuk "
     "'kenapa lama / mandek di mana', gunakan `siap_get_status_timeline`.\n"
-    "4. Jika tool mengembalikan found=false, sampaikan dengan jujur bahwa "
+    "4. Untuk pertanyaan 'apa dasar hukum / peraturan yang mengatur X' atau "
+    "permintaan rujukan hukum sebuah izin atau proses: panggil "
+    "`siap_get_regulations` dengan kata kunci topik, lalu sebutkan nomor dan "
+    "judul regulasi yang dikembalikan APA ADANYA. Jangan mengarang nomor atau "
+    "judul peraturan; bila found=false, katakan dengan jujur.\n"
+    "5. Jika tool mengembalikan found=false, sampaikan dengan jujur bahwa "
     "data tidak ditemukan — jangan menebak. Sarankan langkah lanjutan "
     "(periksa nomor tiket, hubungi DPMPTSP).\n"
-    "5. Jawab dalam Bahasa Indonesia yang ramah, jelas, dan ringkas. "
+    "6. Jawab dalam Bahasa Indonesia yang ramah, jelas, dan ringkas. "
     "Sajikan persyaratan sebagai daftar bernomor. Sebutkan jangka waktu "
     "penyelesaian dan biaya retribusi bila tersedia.\n"
-    "6. Domain Anda adalah SIAP Jateng, BUKAN OSS RBA nasional. Jangan "
-    "mencampur keduanya."
+    "7. Domain Anda adalah SIAP Jateng, BUKAN OSS RBA nasional. Namun "
+    "regulasi yang dikembalikan `siap_get_regulations` adalah registri resmi "
+    "SIAP dan boleh dirujuk sebagai dasar hukum."
 )
 
 
@@ -118,6 +125,7 @@ _TOOL_DISPATCH: dict[str, Any] = {
     "siap_get_status_timeline": siap_get_status_timeline,
     "siap_lookup_license": siap_lookup_license,
     "siap_list_licenses_by_sektor": siap_list_licenses_by_sektor,
+    "siap_get_regulations": siap_get_regulations,
 }
 
 
@@ -231,6 +239,34 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
                 },
             },
             "required": ["sektor"],
+        },
+    },
+    {
+        "name": "siap_get_regulations",
+        "description": (
+            "Cari dasar hukum / regulasi resmi (Undang-Undang, Peraturan "
+            "Pemerintah, Peraturan Gubernur, Peraturan Menteri, Peraturan "
+            "Daerah) yang relevan dari registri regulasi SIAP Jateng. Gunakan "
+            "untuk pertanyaan 'apa dasar hukum / peraturan yang mengatur ...', "
+            "atau ketika warga meminta rujukan hukum sebuah izin atau proses."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Topik / kata kunci regulasi, mis. 'penyelenggaraan "
+                        "PTSP Jawa Tengah' atau 'perizinan berusaha "
+                        "terintegrasi elektronik'."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Jumlah maksimum regulasi (default 5, maks 10).",
+                },
+            },
+            "required": ["query"],
         },
     },
 ]
