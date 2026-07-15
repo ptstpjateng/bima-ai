@@ -117,7 +117,7 @@ load_dotenv()
 
 logger = logging.getLogger("bima_ai.guided_submission")
 
-_PORTAL_TRACK_URL = "https://portal.nolongin.com/track/{ticket}"
+_PORTAL_TRACK_URL = "https://beta-siap.bimaptsp.com/track/{ticket}"
 
 # The demo-slice license: "Surat Keterangan Penelitian" (Izin Penelitian) on
 # Beta-SIAP. Used as the default license_id for content-scoring when the
@@ -2554,7 +2554,7 @@ _DOC_EXTRACT_SYSTEM = (
 
 
 def _public_base_url() -> str:
-    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://nolongin.com").rstrip("/")
+    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://beta-siap.bimaptsp.com").rstrip("/")
 
 
 def _mekari_sign_url() -> str:

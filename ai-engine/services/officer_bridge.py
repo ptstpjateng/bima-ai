@@ -120,7 +120,7 @@ def _demo_officer_tg() -> str:
 # TODO: user to confirm the exact SIAP signing URL (per-case deep link).
 _SK_SIGN_URL_TEMPLATE = os.getenv(
     "BIMA_SK_SIGN_URL_TEMPLATE",
-    "https://beta-siap.nolongin.com/admin/tanda-tangan-berkas?tableSearch={ticket}",
+    "https://beta-siap.bimaptsp.com/admin/tanda-tangan-berkas?tableSearch={ticket}",
 ).strip()
 
 
@@ -915,7 +915,7 @@ async def load_case_from_siap(
 # Officer brief rendering
 # ===========================================================================
 
-_PORTAL_TRACK_URL = "https://portal.nolongin.com/track/{ticket}"
+_PORTAL_TRACK_URL = "https://beta-siap.bimaptsp.com/track/{ticket}"
 
 
 def _render_brief(
@@ -1513,7 +1513,7 @@ async def maybe_handle_officer_reply(
 def _public_base_url() -> str:
     """Public base for the `/dl/{token}` short-lived download links (mirrors
     guided_submission._public_base_url)."""
-    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://nolongin.com").rstrip("/")
+    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://beta-siap.bimaptsp.com").rstrip("/")
 
 
 async def _deliver_documents(

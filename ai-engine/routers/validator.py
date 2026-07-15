@@ -196,7 +196,7 @@ class ValidateResponse(BaseModel):
 # minor_issues result still worth a "please fix" WhatsApp.
 _NEEDS_FIX_SEVERITIES = {"critical", "high"}
 
-_PORTAL_TRACK_URL = "https://portal.nolongin.com/track/{ticket}"
+_PORTAL_TRACK_URL = "https://beta-siap.bimaptsp.com/track/{ticket}"
 
 
 def _is_needs_fix(result: ValidationResult) -> bool:

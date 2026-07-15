@@ -583,7 +583,7 @@ async def aptana_greeting(path_secret: str, request: Request, background: Backgr
 
     Configure the matching APTANA Worker:
         Trigger: WhatsApp → Receive a Greeting Request from Meta
-        Action:  HTTP POST → https://nolongin.com/webhook/aptana/greeting/<APTANA_PATH_SECRET>
+        Action:  HTTP POST → https://bimaptsp.com/webhook/aptana/greeting/<APTANA_PATH_SECRET>
         Body:    {"phoneNumber": "{{phoneNumber}}", "name": "{{name}}"}
     """
     _check_path_secret(path_secret)

@@ -36,7 +36,7 @@ logger = logging.getLogger("bima_ai.siap_templates")
 
 # Master switch + tunables (env-overridable, no redeploy to flip).
 _ENABLED = os.getenv("BIMA_SIAP_TEMPLATES_ENABLED", "true").lower() in ("1", "true", "yes")
-_STORAGE_BASE = os.getenv("SIAP_STORAGE_BASE", "https://beta-siap.nolongin.com").rstrip("/")
+_STORAGE_BASE = os.getenv("SIAP_STORAGE_BASE", "https://beta-siap.bimaptsp.com").rstrip("/")
 _FETCH_TIMEOUT = float(os.getenv("BIMA_SIAP_TEMPLATE_TIMEOUT", "20"))
 _MAX_TEMPLATE_BYTES = int(os.getenv("BIMA_SIAP_TEMPLATE_MAX_BYTES", str(8 * 1024 * 1024)))
 # How many applicant docs one Vision fill pass reads. The vessel/permit specs are

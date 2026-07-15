@@ -136,10 +136,10 @@ _TOOL_TIMEOUT_SECONDS: float = float(os.getenv("GEMINI_TOOL_TIMEOUT_SECONDS", "3
 # Filament admin panel — the "Tanda Tangan Berkas" resource lives at
 # `<base>/admin/tanda-tangan-berkas`. Defaults to Beta-SIAP so a missing
 # env var still produces a working rehearsal link rather than a dead one.
-#   Beta:       https://beta-siap.nolongin.com
+#   Beta:       https://beta-siap.bimaptsp.com
 #   Production: https://perizinan.jatengprov.go.id  (gated — do not auto-use)
 _SIAP_SIGNING_BASE: str = os.getenv(
-    "SIAP_SIGNING_URL_BASE", "https://beta-siap.nolongin.com"
+    "SIAP_SIGNING_URL_BASE", "https://beta-siap.bimaptsp.com"
 ).rstrip("/")
 
 # Hard ceiling on tool-call rounds inside a single chat() invocation. Five is
