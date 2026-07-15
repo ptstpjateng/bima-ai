@@ -1,16 +1,20 @@
 """
-BIMA data-pipeline — SIAP persyaratan corpus builder (B1).
+BIMA data-pipeline — SIAP corpus builder (B1 persyaratan + B3 workflow/SOP).
 
-Reads SIAP Jateng's OWN authoritative regulatory data
-(`ptsp.license × license_requirements × requirements`) and upserts one semantic
-chunk per licence into the shared ChromaDB `oss_regulations` collection — so
-BIMA's RAG answers about persyaratan come straight from SIAP (authoritative,
-zero-drift) instead of a separately-maintained Excel/OSS dump. This is the
-"BIMA is a layer" thesis made concrete: point BIMA at any province's SIAP and
-its corpus builds itself.
+Reads SIAP Jateng's OWN authoritative data and upserts one rich chunk per
+licence into the shared ChromaDB `oss_regulations` collection — so BIMA's RAG
+answers (persyaratan + alur proses + jangka waktu) come straight from SIAP, the
+source of truth, instead of a separately-maintained Excel/OSS dump. Each chunk:
 
-Idempotent + additive: stable ids ("siap-license-{id}") mean re-runs UPSERT
-(no duplicates), and it NEVER delete_collection — the KBLI/PB-UMKU chunks stay.
+    - jenis izin, kode, sektor, jangka waktu penerbitan
+    - persyaratan  (ptsp.license × license_requirements × requirements)
+    - alur/tahapan proses  (ptsp.license_approval_step, ordered, with unit)
+
+The "BIMA is a layer" thesis made concrete: point BIMA at any province's SIAP
+and its corpus builds itself.
+
+Idempotent + additive: stable "siap-license-{id}" ids (re-runs UPSERT, no dup),
+and it NEVER delete_collection — the KBLI/PB-UMKU chunks are preserved.
 
 Run inside the data-pipeline container:
     python siap_corpus.py
@@ -44,24 +48,41 @@ def _get_embedder() -> SentenceTransformer:
     return _EMBEDDER
 
 
-# One row per licence that has >= 1 requirement, with its persyaratan aggregated
-# in stable order, plus jangka waktu + sektor (parent licence name).
+# One row per licence that has persyaratan and/or a workflow. Persyaratan and
+# alur are aggregated in separate CTEs so the two one-to-many joins don't
+# multiply each other (Cartesian). Steps skip sort_order=0 (the PENOLAKAN
+# rejection branch) and are labelled "AKSI (Unit)".
 _QUERY = """
-    SELECT
-        l.license_id,
-        l.code,
-        l.name,
-        l.description,
-        l.properties ->> 'time_period' AS time_period,
-        parent.name AS sektor,
-        array_agg(r.name ORDER BY lr.license_requirements_id) AS syarat
+    WITH syarat AS (
+        SELECT lr.license_id,
+               array_agg(r.name ORDER BY lr.license_requirements_id) AS syarat
+        FROM ptsp.license_requirements lr
+        JOIN ptsp.requirements r ON r.requirements_id = lr.requirements_id
+        WHERE r.name IS NOT NULL
+        GROUP BY lr.license_id
+    ),
+    alur AS (
+        SELECT las.license_id,
+               array_agg(
+                   CASE WHEN g.name IS NOT NULL AND g.name <> ''
+                        THEN las.stereotype || ' (' || g.name || ')'
+                        ELSE las.stereotype END
+                   ORDER BY las.sort_order
+               ) AS steps
+        FROM ptsp.license_approval_step las
+        LEFT JOIN framework.groups g ON g.group_id = las.group_id
+        WHERE las.stereotype IS NOT NULL AND las.sort_order > 0
+        GROUP BY las.license_id
+    )
+    SELECT l.license_id, l.code, l.name, l.description,
+           l.properties ->> 'time_period' AS time_period,
+           parent.name AS sektor,
+           s.syarat, a.steps
     FROM ptsp.license l
-    JOIN ptsp.license_requirements lr ON lr.license_id = l.license_id
-    JOIN ptsp.requirements r ON r.requirements_id = lr.requirements_id
+    LEFT JOIN syarat s ON s.license_id = l.license_id
+    LEFT JOIN alur a ON a.license_id = l.license_id
     LEFT JOIN ptsp.license AS parent ON l.parent_id = parent.license_id
-    WHERE l.name IS NOT NULL
-    GROUP BY l.license_id, l.code, l.name, l.description,
-             l.properties ->> 'time_period', parent.name
+    WHERE l.name IS NOT NULL AND (s.syarat IS NOT NULL OR a.steps IS NOT NULL)
 """
 
 
@@ -73,11 +94,17 @@ def _build_chunk(row: dict) -> str:
         lines.append(f"Sektor/Bidang: {row['sektor']}")
     if row.get("time_period"):
         lines.append(f"Jangka waktu penerbitan: {row['time_period']} hari kerja")
+
     syarat = [s.strip() for s in (row.get("syarat") or []) if s and s.strip()]
     if syarat:
         lines.append(f"Persyaratan yang harus dipenuhi ({len(syarat)} syarat):")
-        for i, s in enumerate(syarat, 1):
-            lines.append(f"{i}. {s}")
+        lines.extend(f"{i}. {s}" for i, s in enumerate(syarat, 1))
+
+    steps = [s.strip() for s in (row.get("steps") or []) if s and s.strip()]
+    if steps:
+        lines.append("Alur/tahapan proses:")
+        lines.extend(f"{i}. {s}" for i, s in enumerate(steps, 1))
+
     desc = (row.get("description") or "").strip()
     if desc:
         lines.append(f"Keterangan: {desc}")
@@ -98,7 +125,7 @@ def build_siap_corpus() -> int:
     finally:
         conn.close()
 
-    log.info("SIAP licences with persyaratan: %d", len(rows))
+    log.info("SIAP licences with persyaratan and/or workflow: %d", len(rows))
     if not rows:
         log.warning("No rows returned — nothing to ingest.")
         return 0
@@ -109,7 +136,7 @@ def build_siap_corpus() -> int:
         docs.append(_build_chunk(row))
         metas.append({
             "kbli_code": (row.get("code") or ""),
-            "section": "persyaratan",
+            "section": "izin",
             "skala": "",
             "source_url": "SIAP Jateng",
             "source": "siap_db",
