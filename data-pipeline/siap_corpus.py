@@ -249,8 +249,9 @@ def _build_reg_chunk(row: dict) -> str:
     return "\n".join(lines)
 
 
-def build_regulation_corpus() -> int:
-    status_filter = "" if _REG_INCLUDE_INACTIVE else "AND tblregulasi_status = 'T'"
+def build_regulation_corpus(include_inactive: bool | None = None) -> int:
+    inc = _REG_INCLUDE_INACTIVE if include_inactive is None else include_inactive
+    status_filter = "" if inc else "AND tblregulasi_status = 'T'"
     query = _REG_QUERY.format(status_filter=status_filter)
 
     conn = psycopg2.connect(
@@ -268,7 +269,7 @@ def build_regulation_corpus() -> int:
 
     log.info(
         "SIAP regulations to ingest: %d (include_inactive=%s)",
-        len(rows), _REG_INCLUDE_INACTIVE,
+        len(rows), inc,
     )
     if not rows:
         log.warning("No regulation rows returned — nothing to ingest.")
@@ -318,7 +319,33 @@ def build_regulation_corpus() -> int:
     return len(docs)
 
 
+def main(scope: str = "all", include_inactive: bool = False) -> None:
+    n_lic = n_reg = 0
+    if scope in ("all", "licenses"):
+        n_lic = build_siap_corpus()
+    if scope in ("all", "regulations"):
+        n_reg = build_regulation_corpus(include_inactive=include_inactive)
+    # Machine-parseable completion beacon — the /pipeline/siap-corpus endpoint
+    # anchors on "[siap-corpus] done" to surface the counts back to the caller.
+    log.info(
+        "[siap-corpus] done scope=%s licences=%d regulations=%d",
+        scope, n_lic, n_reg,
+    )
+
+
 if __name__ == "__main__":
-    n_lic = build_siap_corpus()
-    n_reg = build_regulation_corpus()
-    log.info("TOTAL upserted: %d licences + %d regulations", n_lic, n_reg)
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Build the SIAP corpus (licences B1/B3 + regulations B2)."
+    )
+    ap.add_argument(
+        "--scope", choices=("all", "licenses", "regulations"), default="all",
+        help="Which sub-corpus to (re)build. Default: all.",
+    )
+    ap.add_argument(
+        "--include-inactive", action="store_true",
+        help="Also ingest de-activated regulations (default: active only).",
+    )
+    args = ap.parse_args()
+    main(scope=args.scope, include_inactive=args.include_inactive)
