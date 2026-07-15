@@ -69,7 +69,7 @@ _GEMINI_FALLBACK_MODELS: list[str] = [
     if m.strip()
 ]
 
-_PORTAL_URL = "https://portal.nolongin.com"
+_PORTAL_URL = "https://beta-siap.bimaptsp.com"
 
 # ---------------------------------------------------------------------------
 # Rate limiter  (A4 — 5 messages per user per 60s, in-memory)
@@ -210,7 +210,7 @@ ATURAN DASAR
         sudah dikembalikan di turn sebelumnya — pengguna sedang berproses,
         bukan baru mulai),
     (b) arahkan ke portal BIMA untuk status real-time
-        (https://portal.nolongin.com), atau
+        (https://beta-siap.bimaptsp.com), atau
     (c) tawarkan untuk meneruskan pertanyaan ke petugas BIMA via WhatsApp
         ("Saya bisa teruskan pertanyaan Bapak/Ibu ke petugas DPMPTSP, mau
         dilanjutkan?").
@@ -274,7 +274,7 @@ jawaban OSS. Hemat token: pengguna butuh arah, bukan ceramah.
 • Berikan panduan bernomor yang jelas dan actionable.
 • Kutip dokumen persyaratan spesifik dari data OSS yang tersedia.
 • WAJIB sertakan link portal di setiap respons Fase 2:
-  "[Buka Portal BIMA-AI →](https://portal.nolongin.com)"
+  "[Buka Portal BIMA-AI →](https://beta-siap.bimaptsp.com)"
   (Untuk Telegram: kirim sebagai inline button jika memungkinkan)
 • Jika pengguna mengalami hambatan (dokumen kurang, field membingungkan),
   berikan solusi spesifik. Kalau di luar kemampuanmu, tawarkan untuk
@@ -289,7 +289,7 @@ nama layanan DPMPTSP Jawa Tengah.
 
 Ini DOMAIN UTAMAMU. Gunakan data SIAP yang tersedia di konteks.
 • Jika ada nomor tiket di pesan atau riwayat: rujuk status real-time-nya
-  dan arahkan ke https://portal.nolongin.com/track/<tiket>.
+  dan arahkan ke https://beta-siap.bimaptsp.com/track/<tiket>.
 • Jika pengguna tanya persyaratan/detail sebuah izin sektoral SIAP dan
   datanya BELUM tersedia di konteks: jangan mengarang. Akui jujur bahwa
   detail spesifiknya belum bisa kamu tarik saat ini, lalu:
@@ -359,7 +359,7 @@ atas; ATAU (2) pertanyaan OSS RBA umum yang basis datanya belum lengkap.
 ATURAN KETAT untuk kasus (2):
 • Jawab dengan pengetahuan umum OSS RBA Indonesia yang KAMU YAKIN benar.
 • JANGAN mengarang URL, nomor pasal, biaya spesifik, atau jangka waktu spesifik.
-• Satu-satunya URL yang boleh kamu sebut: https://portal.nolongin.com (portal
+• Satu-satunya URL yang boleh kamu sebut: https://beta-siap.bimaptsp.com (portal
   BIMA) dan https://perizinan.jatengprov.go.id (portal SIAP Jateng).
 • JANGAN suruh pengguna datang ke kantor — tawarkan WhatsApp escalation.
 • TAMBAHKAN catatan ini di akhir (persis):

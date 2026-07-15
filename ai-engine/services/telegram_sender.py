@@ -77,7 +77,7 @@ async def send_text(
     occasionally emits Markdown-ish text; passing parse_mode="Markdown" or
     "MarkdownV2" would require careful escaping, which we skip.
 
-    `disable_web_page_preview=True` because BIMA links to nolongin.com
+    `disable_web_page_preview=True` because BIMA links to bimaptsp.com
     tracking URLs and the link preview card clutters the chat with stale
     OG metadata.
     """

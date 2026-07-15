@@ -116,7 +116,7 @@ _TEMPLATES: dict[EventKind, TemplateSpec] = {
         # — Meta rejected a 4-param send with "The body has 6 parameters"):
         #   "🔔 Halo {{1}}, izin {{2}} ({{3}}) sudah naik tahap ke {{4}}.
         #    Estimasi selesai {{5}} hari kerja. Cek di
-        #    nolongin.com/track/{{6}} kapan saja."
+        #    beta-siap.bimaptsp.com/track/{{6}} kapan saja."
         # {{3}} (inline) and {{6}} (URL path) are BOTH the ticket — so
         # "ticket" appears twice in the tuple. The caller still supplies a
         # single "ticket" key; _coerce_params fills both positions from it.
@@ -124,7 +124,7 @@ _TEMPLATES: dict[EventKind, TemplateSpec] = {
         freeform_body=(
             "🔔 Halo {name}, izin {license_type} ({ticket}) sudah naik "
             "tahap ke {next_stage}. Estimasi selesai {eta_days} hari kerja. "
-            "Cek di nolongin.com/track/{ticket} kapan saja."
+            "Cek di beta-siap.bimaptsp.com/track/{ticket} kapan saja."
         ),
     ),
     "citizen_completed": TemplateSpec(
@@ -132,13 +132,13 @@ _TEMPLATES: dict[EventKind, TemplateSpec] = {
         # Approved Meta body has FOUR params (verified by test-fire 2026-05-21
         # — Meta rejected a 3-param send with "The body has 4 parameters"):
         #   "🎉 Selamat {{1}}, izin {{2}} ({{3}}) sudah TERBIT. Unduh SK
-        #    ber-TTE di nolongin.com/track/{{4}} sekarang."
+        #    ber-TTE di beta-siap.bimaptsp.com/track/{{4}} sekarang."
         # {{3}} (inline) and {{4}} (URL path) are BOTH the ticket — see the
         # citizen_progress note above.
         params=("name", "license_type", "ticket", "ticket"),
         freeform_body=(
             "🎉 Selamat {name}, izin {license_type} ({ticket}) sudah "
-            "TERBIT. Unduh SK ber-TTE di nolongin.com/track/{ticket} "
+            "TERBIT. Unduh SK ber-TTE di beta-siap.bimaptsp.com/track/{ticket} "
             "sekarang."
         ),
     ),
@@ -174,6 +174,12 @@ def _is_enabled() -> bool:
 # ---------------------------------------------------------------------------
 _ALLOWED_URL_HOSTS: frozenset[str] = frozenset(
     {
+        # Primary (bimaptsp cutover 2026-07-15) — citizen /track lives in SIAP.
+        "beta-siap.bimaptsp.com",
+        "bimaptsp.com",
+        "portal.bimaptsp.com",
+        # Legacy nolongin — kept allowlisted during the soak so any links
+        # already delivered still validate; drop after nolongin retires.
         "portal.nolongin.com",
         "nolongin.com",
         "beta-siap.nolongin.com",
