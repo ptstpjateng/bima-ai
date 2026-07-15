@@ -11,6 +11,8 @@ Endpoints
   POST /pipeline/trigger        — trigger KBLI scraper (Playwright)
   POST /pipeline/pdf/{job_id}   — trigger PDF multi-agent pipeline for one job
   GET  /pipeline/pdf/{job_id}   — status of a running PDF pipeline job
+  POST /pipeline/siap-corpus    — rebuild SIAP corpus (licences B1/B3 + regulations B2)
+  GET  /pipeline/siap-corpus/status
 
 Runs on port 9000 inside the bima-internal Docker network.
 """
@@ -290,6 +292,131 @@ async def _run_etl_pipeline(
     finally:
         _etl_state["running"]     = False
         _etl_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+# ── SIAP corpus (licences B1/B3 + regulations B2) → ChromaDB ──────────────────
+
+_siap_corpus_state: dict = {
+    "running":      False,
+    "status":       "idle",   # idle | running | done | error
+    "started_at":   None,
+    "finished_at":  None,
+    "last_message": "",
+    "scope":        None,
+    "licences":     None,
+    "regulations":  None,
+}
+
+# siap_corpus.py emits this exact beacon on success, e.g.
+# `[siap-corpus] done scope=all licences=379 regulations=56`. Anchor on the
+# bracketed tag so ordinary log noise never matches.
+_SIAP_CORPUS_DONE_RE = re.compile(
+    r"\[siap-corpus\]\s+done\s+scope=(\S+)\s+licences=(\d+)\s+regulations=(\d+)"
+)
+
+
+@app.post("/pipeline/siap-corpus", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_siap_corpus(
+    background_tasks: BackgroundTasks,
+    body: dict | None = Body(default=None),
+) -> JSONResponse:
+    """
+    Rebuild the SIAP corpus (BIMA's RAG source-of-truth) from SIAP's own DB —
+    persyaratan + workflow (B1/B3) and the regulation registry (B2). Additive,
+    idempotent upsert on stable ids; the KBLI/PB-UMKU chunks are untouched.
+
+    Body (optional, JSON):
+        scope:            "all" (default) | "licenses" | "regulations"
+        include_inactive: bool — also ingest de-activated regulations (default false)
+
+    Non-blocking — returns 409 if a build is already running.
+    """
+    if _siap_corpus_state["running"]:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"message": "SIAP corpus build already running", **_siap_corpus_state},
+        )
+
+    scope = (body or {}).get("scope", "all") if isinstance(body, dict) else "all"
+    if scope not in ("all", "licenses", "regulations"):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "message": 'scope must be "all", "licenses", or "regulations".',
+                "received": scope,
+            },
+        )
+    include_inactive = (
+        bool((body or {}).get("include_inactive", False)) if isinstance(body, dict) else False
+    )
+
+    background_tasks.add_task(_run_siap_corpus, scope, include_inactive)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "message": "SIAP corpus build started",
+            "status": "accepted",
+            "scope": scope,
+            "include_inactive": include_inactive,
+        },
+    )
+
+
+@app.get("/pipeline/siap-corpus/status")
+def siap_corpus_status() -> dict:
+    return dict(_siap_corpus_state)
+
+
+async def _run_siap_corpus(scope: str, include_inactive: bool) -> None:
+    """Run siap_corpus.py as a subprocess and surface the upsert counts."""
+    _siap_corpus_state.update({
+        "running":     True,
+        "status":      "running",
+        "started_at":  datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "scope":       scope,
+        "licences":    None,
+        "regulations": None,
+    })
+    logger.info(
+        "SIAP corpus build started | scope=%s | include_inactive=%s",
+        scope, include_inactive,
+    )
+
+    argv: list[str] = [sys.executable, "siap_corpus.py", "--scope", scope]
+    if include_inactive:
+        argv.append("--include-inactive")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd="/app",
+        )
+        output_lines = []
+        async for raw_line in proc.stdout:
+            line = raw_line.decode(errors="replace").rstrip()
+            output_lines.append(line)
+            logger.info("[siap_corpus] %s", line)
+            m = _SIAP_CORPUS_DONE_RE.search(line)
+            if m:
+                _siap_corpus_state["licences"]    = int(m.group(2))
+                _siap_corpus_state["regulations"] = int(m.group(3))
+
+        rc = await proc.wait()
+        _siap_corpus_state["status"]       = "done" if rc == 0 else "error"
+        _siap_corpus_state["last_message"] = output_lines[-1] if output_lines else f"exit={rc}"
+        logger.info("SIAP corpus build finished | returncode=%d", rc)
+
+    except Exception as exc:
+        logger.exception("SIAP corpus build raised an exception")
+        _siap_corpus_state["status"]       = "error"
+        _siap_corpus_state["last_message"] = str(exc)
+
+    finally:
+        _siap_corpus_state["running"]     = False
+        _siap_corpus_state["finished_at"] = datetime.now(timezone.utc).isoformat()
 
 
 # ── Background runners ────────────────────────────────────────────────────────

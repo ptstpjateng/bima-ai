@@ -1,5 +1,5 @@
 """
-BIMA data-pipeline — SIAP corpus builder (B1 persyaratan + B3 workflow/SOP).
+BIMA data-pipeline — SIAP corpus builder (B1 persyaratan + B2 regulasi + B3 workflow/SOP).
 
 Reads SIAP Jateng's OWN authoritative data and upserts one rich chunk per
 licence into the shared ChromaDB `oss_regulations` collection — so BIMA's RAG
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 import chromadb
 import psycopg2
@@ -172,5 +173,179 @@ def build_siap_corpus() -> int:
     return len(docs)
 
 
+# ===========================================================================
+# B2 — regulation corpus  (ptsp.tblregulasi metadata)
+# ===========================================================================
+# The regulation PDFs referenced by ptsp.tblregulasi.tblregulasi_file are NOT
+# migrated to Beta-SIAP's storage (audited 2026-07-15: 85/86 absent), and prod
+# is off-limits — so B2 ingests the authoritative *metadata* SIAP already holds
+# (kategori + nomor + tentang, plus the sector often embedded in the filename).
+# This is the no-hallucination guardrail against invented regulation citations;
+# full PDF text is a later enhancement if/when the files become available.
+#
+# Default is ACTIVE regulations only (tblregulasi_status = 'T') so BIMA never
+# cites a de-activated regulation as current; flip SIAP_REG_INCLUDE_INACTIVE=1
+# to ingest all (each chunk still states its Aktif/Nonaktif status).
+
+_REG_STATUS_LABELS = {"T": "Aktif", "F": "Nonaktif"}
+_REG_INCLUDE_INACTIVE = os.getenv("SIAP_REG_INCLUDE_INACTIVE", "false").lower() in (
+    "1", "true", "yes",
+)
+
+_REG_QUERY = """
+    SELECT tblregulasi_id, tblregulasi_kategori, tblregulasi_nomor,
+           tblregulasi_tentang, tblregulasi_file, tblregulasi_status
+    FROM ptsp.tblregulasi
+    WHERE tblregulasi_tentang IS NOT NULL AND btrim(tblregulasi_tentang) <> ''
+    {status_filter}
+    ORDER BY tblregulasi_id
+"""
+
+
+def _clean_reg_filename(fname: str) -> str:
+    """Surface the sector/topic the 255-char `tentang` often truncates by
+    de-noising the stored filename. Drops a Laravel hash (32 hex) / ULID
+    (26-char) / date-stamp prefix and de-underscores the rest. Returns '' when
+    the filename carries no human title (a bare ULID/hash), so pure-junk names
+    never pollute the chunk."""
+    if not fname:
+        return ""
+    base = fname.rsplit(".", 1)[0]
+    if "_" in base:
+        head, rest = base.split("_", 1)
+        if (
+            re.fullmatch(r"[0-9a-fA-F]{32}", head)      # md5 prefix
+            or re.fullmatch(r"[0-9A-Za-z]{26}", head)   # ULID prefix
+            or head.isdigit()                           # date-stamp prefix
+        ):
+            base = rest
+    cleaned = re.sub(r"\s+", " ", re.sub(r"[_]+", " ", base)).strip()
+    letters = sum(c.isalpha() for c in cleaned)
+    if letters < 8 or len(cleaned.split()) < 3:
+        return ""
+    return cleaned
+
+
+def _build_reg_chunk(row: dict) -> str:
+    kat = (row.get("tblregulasi_kategori") or "").strip()
+    nomor = (row.get("tblregulasi_nomor") or "").strip()
+    tentang = (row.get("tblregulasi_tentang") or "").strip()
+    status = _REG_STATUS_LABELS.get((row.get("tblregulasi_status") or "").strip(), "Tidak diketahui")
+    # `nomor` sometimes already carries the category prefix (e.g. kat="Peraturan
+    # Menteri", nomor="Peraturan Menteri ESDM No 39 ...") — don't double it.
+    if kat and nomor.lower().startswith(kat.lower()):
+        header = nomor
+    else:
+        header = " ".join(p for p in (kat, nomor) if p) or "Regulasi"
+
+    lines = [f"Dasar hukum / regulasi perizinan: {header}"]
+    if tentang:
+        lines.append(f"Tentang: {tentang}")
+    topic = _clean_reg_filename(row.get("tblregulasi_file") or "")
+    if topic and topic.lower() not in tentang.lower():
+        lines.append(f"Rincian judul: {topic}")
+    lines.append(f"Status berlaku: {status}")
+    lines.append("Sumber: registri regulasi resmi SIAP Jateng.")
+    return "\n".join(lines)
+
+
+def build_regulation_corpus(include_inactive: bool | None = None) -> int:
+    inc = _REG_INCLUDE_INACTIVE if include_inactive is None else include_inactive
+    status_filter = "" if inc else "AND tblregulasi_status = 'T'"
+    query = _REG_QUERY.format(status_filter=status_filter)
+
+    conn = psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        dbname=SIAP_DB,
+        user=os.environ["DB_USERNAME"],
+        password=os.environ["DB_PASSWORD"],
+    )
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query)
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    log.info(
+        "SIAP regulations to ingest: %d (include_inactive=%s)",
+        len(rows), inc,
+    )
+    if not rows:
+        log.warning("No regulation rows returned — nothing to ingest.")
+        return 0
+
+    ids, docs, metas = [], [], []
+    for row in rows:
+        ids.append(f"siap-regulasi-{row['tblregulasi_id']}")
+        docs.append(_build_reg_chunk(row))
+        metas.append({
+            "kbli_code": "",
+            "section": "regulasi",
+            "skala": "",
+            "source_url": "SIAP Jateng - tblregulasi",
+            "source": "siap_db_regulasi",
+            "reg_id": int(row["tblregulasi_id"]),
+            "reg_kategori": (row.get("tblregulasi_kategori") or ""),
+            "reg_nomor": (row.get("tblregulasi_nomor") or ""),
+            "reg_status": (row.get("tblregulasi_status") or "").strip(),
+        })
+
+    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+    )
+
+    before = collection.count()
+    BATCH = 64
+    for i in range(0, len(docs), BATCH):
+        b_docs = docs[i:i + BATCH]
+        b_emb = _get_embedder().encode(
+            b_docs, convert_to_numpy=True, normalize_embeddings=True
+        ).tolist()
+        collection.upsert(
+            ids=ids[i:i + BATCH],
+            documents=b_docs,
+            embeddings=b_emb,
+            metadatas=metas[i:i + BATCH],
+        )
+        log.info("reg upserted %d/%d", min(i + BATCH, len(docs)), len(docs))
+
+    after = collection.count()
+    log.info(
+        "Done regulations. '%s' count %d -> %d (regulations upserted: %d)",
+        COLLECTION_NAME, before, after, len(docs),
+    )
+    return len(docs)
+
+
+def main(scope: str = "all", include_inactive: bool = False) -> None:
+    n_lic = n_reg = 0
+    if scope in ("all", "licenses"):
+        n_lic = build_siap_corpus()
+    if scope in ("all", "regulations"):
+        n_reg = build_regulation_corpus(include_inactive=include_inactive)
+    # Machine-parseable completion beacon — the /pipeline/siap-corpus endpoint
+    # anchors on "[siap-corpus] done" to surface the counts back to the caller.
+    log.info(
+        "[siap-corpus] done scope=%s licences=%d regulations=%d",
+        scope, n_lic, n_reg,
+    )
+
+
 if __name__ == "__main__":
-    build_siap_corpus()
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Build the SIAP corpus (licences B1/B3 + regulations B2)."
+    )
+    ap.add_argument(
+        "--scope", choices=("all", "licenses", "regulations"), default="all",
+        help="Which sub-corpus to (re)build. Default: all.",
+    )
+    ap.add_argument(
+        "--include-inactive", action="store_true",
+        help="Also ingest de-activated regulations (default: active only).",
+    )
+    args = ap.parse_args()
+    main(scope=args.scope, include_inactive=args.include_inactive)
