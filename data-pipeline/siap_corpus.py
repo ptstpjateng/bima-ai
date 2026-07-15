@@ -231,7 +231,12 @@ def _build_reg_chunk(row: dict) -> str:
     nomor = (row.get("tblregulasi_nomor") or "").strip()
     tentang = (row.get("tblregulasi_tentang") or "").strip()
     status = _REG_STATUS_LABELS.get((row.get("tblregulasi_status") or "").strip(), "Tidak diketahui")
-    header = " ".join(p for p in (kat, nomor) if p) or "Regulasi"
+    # `nomor` sometimes already carries the category prefix (e.g. kat="Peraturan
+    # Menteri", nomor="Peraturan Menteri ESDM No 39 ...") — don't double it.
+    if kat and nomor.lower().startswith(kat.lower()):
+        header = nomor
+    else:
+        header = " ".join(p for p in (kat, nomor) if p) or "Regulasi"
 
     lines = [f"Dasar hukum / regulasi perizinan: {header}"]
     if tentang:
