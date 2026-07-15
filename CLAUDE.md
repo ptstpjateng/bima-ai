@@ -11,12 +11,13 @@ We are building BIMA-AI, a Hackathon project for DPMPTSP to unravel OSS RBA bure
 *   **Pillar 3:** Admin-API (FastAPI + SQLAlchemy 2 async, `admin-api/`) — replacing the Laravel admin surface page-by-page
 *   **Legacy Core Backend:** Laravel 13 + Filament v.4 + PostgreSQL (TALL Stack) — still running, being migrated out
 
-### 📊 Current state (as of 2026-07-14, Sprint D in progress)
+### 📊 Current state (as of 2026-07-15, Sprint D in progress)
 
 *   **Sprints completed:** A (stabilize), B.1 (admin-api scaffold + admin shell), B.2 (read-only resource pages), C.4 (ingestion upload UI + reconciler), C.5 (architecture-flows visualizer), **officer-form-fill arc (2026-07, bima-ai PR #131 + SIAP #32)**. **Sprint D (rehearsals + backup video) is IN PROGRESS.**
 *   **Officer copilot (WhatsApp, live on Beta):** the officer copilot fills the SIAP applicant *Formulir Isian* (form 560) from docs + profile via the no-hallucination engine, **computes GT from vessel dimensions** (0.25·L·B·D·f, `BIMA_GT_BLOCK_COEFFICIENT`), reads `thn_bangun` from the Surat Pesanan, drafts the real SK as a **LibreOffice-rendered PDF** (PDF-only), writes the **No. PPKP** to the officer Penomoran form (768, `set_ppkp_number`), **gates the draft** until the form is filled, and **auto-resends** a document on transient Meta 131053. Gemini `thinkingConfig.thinkingBudget:0` for reliable tool-calling. The citizen submission **auto-fills form 560** at submit. Applicant form = 560 (data fields + up_* slots); officer form = 768 (`no_ppkp`); `tgl_penetapan` is SIAP-set at TTE, not a form field.
-*   **Live data:** 1,405 KBLI codes / 6,211 kblis rows / 319 pb_umkus rows / 6,340 ChromaDB chunks / 11 live UMKM users.
+*   **Live data:** 1,405 KBLI codes / 6,211 kblis rows / 319 pb_umkus rows / **6,719 ChromaDB chunks** (6,340 KBLI/PB-UMKU + 379 SIAP-license B1/B3 chunks from `data-pipeline/siap_corpus.py`) / 11 live UMKM users.
 *   **Live URLs:** see Service Map below.
+*   **🌐 Domain (2026-07-15):** cut over **`nolongin.com` → `bimaptsp.com`** (webhook + every citizen/SIAP link; bima-ai PR #134, deployed + runtime-verified). **Citizen tracking is now SIAP-hosted at `beta-siap.bimaptsp.com/track/{ticket}`** (no login) — replacing the separate Vercel portal, per the "BIMA is a layer inside SIAP" repositioning. nolongin stays trusted/allowlisted during the soak; retire as a 301-redirect, not a hard-delete. See [[domain-cutover-bimaptsp]].
 *   **WhatsApp UX:** sub-second typing acknowledgment (text bubble; APTANA doesn't expose Meta's native indicator — see [[Decisions]] §9). Final reply ~9–13 s.
 *   **⚠️ Infra (2026-07-14):** the VPS is a Xen VM behind a MikroTik router. A reboot once handed the VM a DHCP IP (`10.10.10.2`) that didn't match the MikroTik dst-nat forward for `116.254.113.81` (→`10.10.10.8`), taking BIMA fully offline (no webhook in, no reply out). `eth0` is now **pinned static to `10.10.10.8`** in `/etc/netplan/00-installer-config.yaml`. If BIMA ever goes silent after a reboot, check `ip -brief a` == `.8` first.
 
@@ -74,16 +75,16 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 ### Service Map
 | Service | Internal | Public | Notes |
 |---|---|---|---|
-| **proxy** (Caddy 2) | — | `:80`, `:443` | Sole public entry point. Auto Let's Encrypt for `nolongin.com`. Replaces `nginx` (legacy config archived in `nginx/`). |
-| **backend** (FrankenPHP) | `backend:80` | `:8000` (direct debug) | Laravel 13 + Filament. Legacy admin at `nolongin.com/admin`. Being migrated out page-by-page. |
+| **proxy** (Caddy 2) | — | `:80`, `:443` | Sole public entry point. Auto Let's Encrypt for `bimaptsp.com` + `beta-siap.bimaptsp.com` (still serves `nolongin.com` during the soak). Replaces `nginx` (legacy config archived in `nginx/`). |
+| **backend** (FrankenPHP) | `backend:80` | `:8000` (direct debug) | Laravel 13 + Filament. Legacy admin at `bimaptsp.com/admin`. Being migrated out page-by-page. |
 | **ai-engine** (FastAPI) | `ai-engine:8000` | via Caddy `/webhook/*` | ChromaDB embedded. Reads `chroma_data` named volume (shared with data-pipeline). APTANA WhatsApp inbound + outbound sender. |
 | **admin-api** (FastAPI) | `admin-api:8001` | via Caddy `/admin-api/*` | NEW — replaces Laravel admin. Auth + dashboard + KBLI + AI interactions + ingestion. Status reconciler loop polls data-pipeline every 5 s. |
 | **data-pipeline** (FastAPI) | `data-pipeline:9000` | — internal only — | ETL (`etl_pipeline.py` deterministic Pandas) + Playwright OSS scraper. Writes to ChromaDB AND mirrors to PostgreSQL `kblis`/`pb_umkus`. |
 | **postgres** (16-alpine) | `postgres:5432` | — | Internal only. Single DB `bima_ai`. |
 | **redis** (7-alpine) | `redis:6379` | — | Internal only. Sessions/cache/queue for Laravel. |
 | **queue** (Laravel worker) | — | — | Same image as backend; runs `artisan queue:work`. |
-| **bima-admin** (Next 16) | — | `admin.nolongin.com` (Vercel) | NEW — Next.js 16 + shadcn/ui + Midnight Government brand. Pages: `/dashboard`, `/ai-interactions`, `/kbli`, `/data` (ingestion), `/architecture` (system-flows visualizer). |
-| **bima-portal** (Next 16) | — | `portal.nolongin.com` (Vercel) | NEW — Public landing in `portal/` dir. Next 16 + Tailwind 4 + Framer Motion. Replaces broken legacy `frontend/`. |
+| **bima-admin** (Next 16) | — | `admin.bimaptsp.com` (Vercel — consolidating into Beta-SIAP) | Next.js 16 + shadcn/ui + Midnight Government brand. Pages: `/dashboard`, `/ai-interactions`, `/kbli`, `/data` (ingestion), `/architecture` (system-flows visualizer). |
+| **bima-portal** (Next 16) | — | `portal.bimaptsp.com` (Vercel — retiring; tracking moved to Beta-SIAP `/track`) | Public landing in `portal/` dir. Next 16 + Tailwind 4 + Framer Motion. Replaces broken legacy `frontend/`. |
 | **legacy `frontend/`** | — | — | Deprecated. Builds broken; do not deploy. Will be deleted in Sprint D cleanup. |
 
 > **Vercel Hobby gotcha:** `bima-admin` and `bima-portal` are on team `pusdatindpmptspjateng-3132` (Hobby plan). Commits authored by anyone NOT on the team are auto-blocked. See [[Decisions]] §10 — local git author identity for the BIMA repo MUST be `pusdatin.dpmptspjateng@gmail.com`, and PRs that touch `admin/` or `portal/` MUST be **rebase-merged**, not squashed.
@@ -101,18 +102,21 @@ that file first before modifying `ai-engine/services/ai_handler.py`.
 *   `/webhook/*` → `ai-engine:8000` (read_timeout 120s for Gemini latency)
 *   `/dl/*` → `ai-engine:8000` (rate-limit 120/min) — PPKP doc-prep PDFs. BIMA generates the sign-required docs (Pakta Integritas etc.), hosts them in-memory at `/dl/{token}` (AES-128-encrypted with the citizen's NIK, unguessable token, 15-min TTL + burns after ~5 fetches, no-store/noindex headers — `ai-engine/services/generated_docs.py` + `routers/downloads.py`), and APTANA fetches them to deliver as WhatsApp **document** messages. ⚠️ **Caddy reload didn't apply this route via `caddy reload` — needed `docker compose restart proxy`** (admin API returns 0 bytes, so `caddy reload` silently no-ops here; restart re-reads the mounted Caddyfile).
 *   `/admin-api/*` → `admin-api:8001` (handle_path strips the prefix)
-*   `/` (bare root) → `301 https://portal.nolongin.com` (anonymous visitors land on the public portal, not the legacy admin login)
+*   `/` (bare root) → `301 https://portal.bimaptsp.com` (anonymous visitors land on the public portal, not the legacy admin login)
 *   everything else (`/api`, `/sanctum`, `/admin`, `/livewire`, `/css`, `/js`, `/fonts`, `/storage`, `/up`, …) → `backend:80` (read_timeout 300s for Filament Excel imports)
 
 ### URLs (current)
-*   **Public portal:** `https://portal.nolongin.com` (Vercel `bima-portal`)
-*   **Admin console:** `https://admin.nolongin.com` (Vercel `bima-admin`) — login `admin@bima.ai` / `BimaAdmin2026!`
-*   **Admin API:** `https://nolongin.com/admin-api/*` (FastAPI on VPS)
-*   **WhatsApp webhook:** `https://nolongin.com/webhook/aptana/inbound/{secret}` (APTANA Autopilot Worker target)
-*   **Legacy Filament admin:** `https://nolongin.com/admin` (still up; being migrated)
-*   **Bare domain:** `https://nolongin.com` → 301 → portal
+> **Domain cutover 2026-07-15:** live domain is now **`bimaptsp.com`** (was `nolongin.com`). nolongin.com is still served/trusted/allowlisted during the soak — retire it later as a **301-redirect**, not a hard-delete, to preserve old `/track` links already in the wild. See [[domain-cutover-bimaptsp]].
+*   **Beta-SIAP (the system BIMA layers *inside*):** `https://beta-siap.bimaptsp.com` (Laravel 13 + Filament, on the VPS)
+*   **Citizen tracking (canonical, no login):** `https://beta-siap.bimaptsp.com/track/{ticket}` — SIAP-hosted (`TrackingController::byTicket` + `track.blade.php`); matches the Meta citizen templates. Replaces the old `portal.*/track`.
+*   **WhatsApp webhook:** `https://bimaptsp.com/webhook/aptana/inbound/{secret}` (APTANA Worker target — cut over + verified 2026-07-15)
+*   **Admin API:** `https://bimaptsp.com/admin-api/*` (FastAPI on VPS)
+*   **Legacy Filament admin:** `https://bimaptsp.com/admin` (still up; being migrated)
+*   **Public portal (Vercel `bima-portal`):** `https://portal.bimaptsp.com` — **being retired**; tracking moved to Beta-SIAP `/track`.
+*   **Admin console (Vercel `bima-admin`):** `https://admin.bimaptsp.com` — login `admin@bima.ai` / `BimaAdmin2026!`; being consolidated into Beta-SIAP.
+*   **Bare domain:** `https://bimaptsp.com` → 301 → portal
 *   **Live WhatsApp:** `+62 851 1755 7091` (APTANA-provisioned)
-*   **CORS:** `admin-api` allows `https://admin.nolongin.com` + `https://nolongin.com` (TrustedHostMiddleware needs both because Caddy proxies preserve `Host: nolongin.com`)
+*   **CORS / TrustedHost:** `admin-api` + `ai-engine` allow `bimaptsp.com` + `*.bimaptsp.com` **and** the nolongin hosts during the soak (Caddy proxies preserve the inbound `Host`).
 
 ---
 
@@ -180,8 +184,8 @@ DB_PASSWORD=<see VPS>
 ### Admin (`admin/.env.local` local / Vercel `bima-admin` production)
 | Key | Local | Production |
 |---|---|---|
-| `NEXT_PUBLIC_ADMIN_API_URL` | `http://localhost:8001` | `https://nolongin.com/admin-api` |
-| `NEXTAUTH_URL` | `http://localhost:3000` | `https://admin.nolongin.com` |
+| `NEXT_PUBLIC_ADMIN_API_URL` | `http://localhost:8001` | `https://bimaptsp.com/admin-api` |
+| `NEXTAUTH_URL` | `http://localhost:3000` | `https://admin.bimaptsp.com` |
 | `NEXTAUTH_SECRET` | dev value | strong random; in Vercel env |
 
 ### Portal (`portal/.env.local` local / Vercel `bima-portal` production)
