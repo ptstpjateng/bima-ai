@@ -3846,9 +3846,16 @@ class OfficerCopilot:
         # Only the tools allowed in `mode` are declared to Gemini — the
         # signature-assistant never sees the write tools.
         declarations = _declarations_for_mode(mode)
+        declarations_names = [
+            d.get("name") for d in declarations if d.get("name")
+        ]
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             empty_retries = 0
             narration_retries = 0
+            # Set for exactly ONE round after we catch the model promising an
+            # action it didn't take (see the narration guard below). A text nudge
+            # asks it to behave; this REMOVES the option of replying with prose.
+            force_tool_call = False
             for round_idx in range(self.max_rounds):
                 payload = {
                     "systemInstruction": system_instruction,
@@ -3867,6 +3874,20 @@ class OfficerCopilot:
                         "thinkingConfig": {"thinkingBudget": 0},
                     },
                 }
+                if force_tool_call:
+                    # mode=ANY makes a functionCall the ONLY legal output, so the
+                    # model cannot talk its way out of acting. Scoped to this
+                    # mode's tools so a signature turn still can't reach a write
+                    # tool. Applied ONLY on the round after a caught false
+                    # promise — never by default, or ordinary questions ("berapa
+                    # skornya?") would be forced into a pointless tool call.
+                    payload["toolConfig"] = {
+                        "functionCallingConfig": {
+                            "mode": "ANY",
+                            "allowedFunctionNames": sorted(declarations_names),
+                        }
+                    }
+                    force_tool_call = False  # one round only
 
                 try:
                     resp = await client.post(self._endpoint(), json=payload)
@@ -3939,10 +3960,18 @@ class OfficerCopilot:
                         # send in an earlier round still counts as done.)
                         if narration_retries < _MAX_NARRATION_RETRIES:
                             narration_retries += 1
+                            # Retry with functionCalling mode=ANY: prose is no
+                            # longer a legal output, so the model must either
+                            # call the tool it just promised or call another one.
+                            # A text-only nudge proved too weak live on
+                            # 2026-07-16 — one instruction lost against three
+                            # worked examples of narration in the model's own
+                            # voice, and it narrated again.
+                            force_tool_call = True
                             logger.info(
                                 "Copilot NARRATED an action without calling a tool "
-                                "— nudging | attempt=%d | mode=%s | ticket=%s | "
-                                "reply_len=%d",
+                                "— retrying with forced tool call | attempt=%d | "
+                                "mode=%s | ticket=%s | reply_len=%d",
                                 narration_retries, mode, ticket, len(reply_text),
                             )
                             contents.append({"role": "model",
