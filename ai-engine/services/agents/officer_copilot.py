@@ -181,6 +181,59 @@ _EMPTY_REPLY_FALLBACK_SIGNATURE = (
 # dead-ending on the capability menu — the empty turn is a transient.
 _MAX_EMPTY_RETRIES = 1
 
+# Tools that DO something the officer can see. If the reply claims one of these
+# happened, one of them had better have actually run this turn.
+_ACTION_TOOL_NAMES = frozenset({
+    "send_document", "draft_sk", "fill_siap_form", "set_ppkp_number",
+    "forward_case", "record_decision",
+})
+
+# The model narrating an action instead of calling the tool. Live 2026-07-16:
+# officer typed "Kirimkan ktp pemohon"; Gemini returned 200 with tool_calls=0
+# and a 48-char reply promising the KTP. BIMA told her it was sending a document
+# it never sent. A 404 is a bad delivery; this is BIMA lying about its own
+# behaviour, which is the one thing the product may not do.
+_ACTION_CLAIM_RE = re.compile(
+    r"(saya\s+(akan\s+)?(kirim|kirimkan|lampirkan|teruskan|sampaikan|"
+    r"buatkan|buat|draf|draftkan|isikan|isi|tuliskan|tulis|catat)"
+    r"|sudah\s+saya\s+(kirim|kirimkan|lampirkan|teruskan|buat|isi|tulis)"
+    r"|(berikut|ini)\s+(dokumen|berkas|draf|drafnya|filenya)"
+    r"|segera\s+saya\s+(kirim|kirimkan|proses))",
+    re.IGNORECASE,
+)
+
+_MAX_NARRATION_RETRIES = 1
+
+# Sent back as a user turn so the model sees its own promise and is told to make
+# it true. Deliberately blunt: the failure is the model *describing* the call.
+_NARRATION_NUDGE = (
+    "STOP. Anda baru saja MENGATAKAN akan melakukan sesuatu, tetapi Anda TIDAK "
+    "memanggil tool apa pun, sehingga TIDAK ADA yang benar-benar terjadi. "
+    "Petugas akan mengira tindakan itu sudah dilakukan padahal belum. "
+    "Jika Anda memang bermaksud melakukannya, PANGGIL TOOL-nya sekarang "
+    "(mis. send_document untuk mengirim dokumen). Jika tidak bisa, katakan "
+    "terus terang bahwa Anda TIDAK melakukannya dan sebutkan alasannya. "
+    "JANGAN pernah mengaku sudah mengirim/membuat/mengisi sesuatu tanpa "
+    "memanggil tool."
+)
+
+
+def _narration_fallback(mode: str) -> str:
+    """Replace an unfulfilled promise with the truth.
+
+    Shipping the model's narration would tell the officer a document is on its
+    way when nothing was sent. Better a visibly failed turn than a false one.
+
+    Worded so it does NOT itself match `_ACTION_CLAIM_RE` — a replacement that
+    trips the very check that produced it is a trap for the next reader.
+    """
+    return (
+        "Mohon maaf, permintaan itu belum berhasil dijalankan — tidak ada "
+        "dokumen yang terkirim dan tidak ada data yang berubah. Boleh diulangi "
+        "dengan menyebut nama dokumennya secara spesifik? Kalau masih gagal, "
+        "berkasnya bisa dibuka langsung di SIAP."
+    )
+
 
 def _empty_reply_fallback(mode: str) -> str:
     """Mode-aware capability menu for the empty-turn mis-parse."""
@@ -3795,6 +3848,7 @@ class OfficerCopilot:
         declarations = _declarations_for_mode(mode)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             empty_retries = 0
+            narration_retries = 0
             for round_idx in range(self.max_rounds):
                 payload = {
                     "systemInstruction": system_instruction,
@@ -3875,6 +3929,33 @@ class OfficerCopilot:
                         # next step — mode-aware, so the signing desk isn't
                         # promised officer-only tools.
                         reply_text = _empty_reply_fallback(mode)
+                    elif _ACTION_CLAIM_RE.search(reply_text) and not any(
+                        c.get("name") in _ACTION_TOOL_NAMES for c in tool_calls_log
+                    ):
+                        # The model PROMISED an action but called no tool, so
+                        # nothing happened. Never ship that: the officer would
+                        # sit waiting for a document that was never sent.
+                        # (Checked against tool_calls_log, not this round, so a
+                        # send in an earlier round still counts as done.)
+                        if narration_retries < _MAX_NARRATION_RETRIES:
+                            narration_retries += 1
+                            logger.info(
+                                "Copilot NARRATED an action without calling a tool "
+                                "— nudging | attempt=%d | mode=%s | ticket=%s | "
+                                "reply_len=%d",
+                                narration_retries, mode, ticket, len(reply_text),
+                            )
+                            contents.append({"role": "model",
+                                             "parts": [{"text": reply_text}]})
+                            contents.append({"role": "user",
+                                             "parts": [{"text": _NARRATION_NUDGE}]})
+                            continue
+                        logger.warning(
+                            "Copilot kept narrating without acting — replacing the "
+                            "false promise | mode=%s | ticket=%s | reply_len=%d",
+                            mode, ticket, len(reply_text),
+                        )
+                        reply_text = _narration_fallback(mode)
                     new_history = list(history or [])
                     new_history.append({"role": "user", "text": message})
                     new_history.append({"role": "model", "text": reply_text})
