@@ -2677,7 +2677,12 @@ _DOC_EXTRACT_SYSTEM = (
 
 
 def _public_base_url() -> str:
-    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://beta-siap.bimaptsp.com").rstrip("/")
+    """Public base for the `/dl/{token}` links. MUST be the host where Caddy
+    routes `/dl/*` to ai-engine (bimaptsp.com) — NOT the tracking host
+    (`beta-siap.bimaptsp.com` is SIAP's Laravel app and 404s every /dl link).
+    Kept distinct from `_PORTAL_TRACK_URL`, which IS beta-siap by design.
+    """
+    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://bimaptsp.com").rstrip("/")
 
 
 def _mekari_sign_url() -> str:

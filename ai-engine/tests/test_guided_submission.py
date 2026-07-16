@@ -467,6 +467,47 @@ class TestConfirmIntent(_GuidedFlowBase):
         self.assertEqual(gs._sessions["wa-633"].stage, gs.Stage.CONFIRM)
 
 
+class TestDownloadLinkHost(unittest.TestCase):
+    """The /dl base must be the host where Caddy routes /dl -> ai-engine.
+
+    Regression: the domain cutover moved tracking to beta-siap.bimaptsp.com and
+    the /dl default came along with it. beta-siap is SIAP's Laravel app — it has
+    no /dl route, so it answered every document link with its own 404 page and
+    APTANA never reached ai-engine at all. Documents "sent" fine and never
+    arrived. Verified live 2026-07-16: beta-siap/dl/<tok> -> Laravel 404,
+    bimaptsp.com/dl/<tok> -> 200 + %PDF.
+    """
+
+    def test_dl_base_is_never_the_siap_laravel_host(self):
+        from services import officer_bridge as ob
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BIMA_PUBLIC_BASE_URL", None)
+            for name, fn in (("citizen", gs._public_base_url),
+                             ("officer", ob._public_base_url)):
+                base = fn()
+                self.assertNotIn(
+                    "beta-siap", base,
+                    f"{name} /dl base points at SIAP's Laravel app, which has no "
+                    f"/dl route and 404s every document link: {base}",
+                )
+                self.assertEqual(base, "https://bimaptsp.com", f"{name} base")
+
+    def test_dl_base_env_override_still_wins(self):
+        from services import officer_bridge as ob
+        with patch.dict(os.environ,
+                        {"BIMA_PUBLIC_BASE_URL": "https://example.test/"},
+                        clear=False):
+            self.assertEqual(gs._public_base_url(), "https://example.test")
+            self.assertEqual(ob._public_base_url(), "https://example.test")
+
+    def test_dl_base_matches_between_citizen_and_officer_paths(self):
+        # Two copies of the same function; they must not drift apart.
+        from services import officer_bridge as ob
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BIMA_PUBLIC_BASE_URL", None)
+            self.assertEqual(gs._public_base_url(), ob._public_base_url())
+
+
 class TestSubThresholdHardGate(_GuidedFlowBase):
     """A sub-threshold packet is never filed — not on the first AFFIRM, not on
     the tenth. The gate has no bypass; the citizen's only exits are to fix the
