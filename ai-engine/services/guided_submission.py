@@ -949,6 +949,11 @@ async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]
         "message": message,
         "issues": issues,
         "blocking": blocking_msgs,
+        # Required doc types the citizen has NOT uploaded yet. Mirrored out of
+        # `result.completeness` because `_score_for_redis` strips the dataclass,
+        # and the escape gate below must survive a rehydrate: without this, a
+        # restarted session forgets whether the citizen ever finished uploading.
+        "missing": list(getattr(result.completeness, "missing", None) or []),
         "result": result,
     }
 
@@ -1124,6 +1129,24 @@ def _data_readback_lines(sess: SubmissionSession) -> list[str]:
 # Hard gate — BLOCKING issues must be fixed before BIMA offers submission.
 # ===========================================================================
 
+def _missing_documents(score: Optional[dict[str, Any]]) -> list[str]:
+    """Required document types the citizen still hasn't uploaded.
+
+    Prefers the rich `result` (fresh score); falls back to the JSON-safe
+    `missing` list that survives a Redis rehydrate. Never raises.
+    """
+    if not isinstance(score, dict):
+        return []
+    result = score.get("result")
+    if result is not None:
+        try:
+            return list(getattr(result.completeness, "missing", None) or [])
+        except Exception:
+            pass
+    raw = score.get("missing")
+    return [str(m) for m in raw] if isinstance(raw, list) else []
+
+
 def _is_submittable(score: Optional[dict[str, Any]]) -> bool:
     """The single gate: may BIMA file this packet?
 
@@ -1230,13 +1253,21 @@ def _fmt_blocking_guidance(
         for rem in reminders:
             lines.append(rem)
 
-    lines += [
-        "",
-        "Silakan lengkapi lalu kirim lagi ya. Jika menurut Bapak/Ibu dokumennya "
-        "sudah benar dan penilaian saya keliru, cukup balas "
-        '"minta tinjau petugas" — nanti saya teruskan ke petugas untuk '
-        "diperiksa langsung.",
-    ]
+    # The escape is offered ONLY once the citizen has actually finished
+    # uploading. Dangling "minta tinjau petugas" in front of someone who has
+    # sent 1 of 8 documents is noise: there is nothing for a human to arbitrate
+    # yet, and it invites an escalation that just tells them to upload the rest.
+    # It earns its place when every required document IS present and the block
+    # is BIMA's *judgement* (cross-document match, name consistency) — the case
+    # where BIMA can genuinely be wrong and the citizen deserves a human.
+    lines += ["", "Silakan lengkapi lalu kirim lagi ya."]
+    if not _missing_documents(score):
+        lines[-1] = (
+            "Silakan perbaiki lalu kirim lagi ya. Semua dokumen wajib sudah "
+            "Bapak/Ibu kirimkan — jadi kalau menurut Bapak/Ibu dokumennya sudah "
+            'benar dan penilaian saya keliru, cukup balas "minta tinjau '
+            'petugas" dan saya teruskan ke petugas untuk diperiksa langsung.'
+        )
     return "\n".join(lines).rstrip()
 
 

@@ -398,11 +398,15 @@ class TestHardGate(unittest.TestCase):
         # Blocked before any SIAP call — client never consulted.
         self.assertEqual(client_probe["configured"], 0)
         fake_client.create_request.assert_not_awaited()
-        # Dropped back to collecting; guidance returned, escape hatch named.
+        # Dropped back to collecting with guidance naming the missing doc.
         self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
         self.assertIn("NPWP", reply)
         self.assertIn("Silakan lengkapi lalu kirim lagi ya.", reply)
-        self.assertIn("minta tinjau petugas", reply.lower())
+        # NPWP is still missing, so the escape must NOT be advertised: there is
+        # nothing for a human to arbitrate until the citizen has actually
+        # finished uploading. (It still WORKS if they ask — see the ESCALATE
+        # tests — it is just not dangled in front of an unfinished upload.)
+        self.assertNotIn("minta tinjau petugas", reply.lower())
 
     def test_sub_threshold_is_hard_blocked_with_no_override(self):
         # A sub-threshold packet is BLOCKED even when every mandatory document
@@ -438,7 +442,52 @@ class TestHardGate(unittest.TestCase):
         fake_client.create_request.assert_not_awaited()
         self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
         self.assertNotIn("apa adanya", reply.lower())
+        # Every mandatory doc IS present here — only the content score is short.
+        # THIS is where the escape earns its place: the block is BIMA's
+        # judgement, which the citizen can legitimately dispute.
         self.assertIn("minta tinjau petugas", reply.lower())
+
+    def test_escape_is_offered_only_once_uploading_is_finished(self):
+        # The two halves of the rule, side by side. Same sub-threshold score;
+        # the ONLY difference is whether a required document is still missing.
+        sess = _make_session(gs.Stage.COLLECTING_DOCS)
+        sess.license_name = "PPKP"
+
+        still_missing = {
+            "ok": False, "status": "needs_fix", "score_percent": 58,
+            "summary": "s", "message": "m", "issues": [],
+            "result": _suitability_result(58, blocking=True),  # missing=["NPWP"]
+        }
+        finished = {
+            "ok": False, "status": "needs_fix", "score_percent": 70,
+            "summary": "s", "message": "m", "issues": [],
+            "result": _suitability_result(70),                 # missing=[]
+        }
+        self.assertEqual(gs._missing_documents(still_missing), ["NPWP"])
+        self.assertEqual(gs._missing_documents(finished), [])
+
+        blocked = gs._blocking_from_score(still_missing)
+        self.assertNotIn(
+            "minta tinjau petugas",
+            gs._fmt_blocking_guidance(sess, still_missing, blocked).lower(),
+        )
+        self.assertIn(
+            "minta tinjau petugas",
+            gs._fmt_blocking_guidance(sess, finished, []).lower(),
+        )
+
+    def test_missing_documents_survives_a_redis_rehydrate(self):
+        # `_score_for_redis` strips the `result` dataclass, so the escape gate
+        # would silently flip on a restart if `missing` didn't round-trip.
+        fresh = {
+            "ok": False, "status": "needs_fix", "score_percent": 58,
+            "summary": "s", "message": "m", "issues": [],
+            "missing": ["NPWP"],
+            "result": _suitability_result(58, blocking=True),
+        }
+        rehydrated = gs._score_for_redis(fresh)
+        self.assertNotIn("result", rehydrated)
+        self.assertEqual(gs._missing_documents(rehydrated), ["NPWP"])
 
 
 class TestHandleInboundDocumentsSilent(unittest.TestCase):
