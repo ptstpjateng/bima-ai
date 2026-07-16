@@ -1612,8 +1612,17 @@ async def maybe_handle_officer_reply(
 
 def _public_base_url() -> str:
     """Public base for the `/dl/{token}` short-lived download links (mirrors
-    guided_submission._public_base_url)."""
-    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://beta-siap.bimaptsp.com").rstrip("/")
+    guided_submission._public_base_url).
+
+    MUST be the host where Caddy routes `/dl/*` to ai-engine — i.e. bimaptsp.com.
+    It is NOT the tracking host: `beta-siap.bimaptsp.com` is the SIAP Laravel app,
+    which has no `/dl` route and answers every such link with its own 404 page.
+    Tracking moved to beta-siap in the domain cutover; this default came along
+    for the ride and silently broke every document delivery — APTANA fetched
+    Laravel, never ai-engine, so the bytes were never even asked for. Verified
+    2026-07-16: beta-siap/dl/<tok> -> Laravel 404; bimaptsp.com/dl/<tok> -> 200 PDF.
+    """
+    return os.getenv("BIMA_PUBLIC_BASE_URL", "https://bimaptsp.com").rstrip("/")
 
 
 async def _deliver_documents(
