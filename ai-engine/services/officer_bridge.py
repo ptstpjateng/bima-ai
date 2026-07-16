@@ -1128,6 +1128,106 @@ async def notify_officer_of_submission(
 
 
 # ===========================================================================
+# 1c) Citizen asked for a HUMAN — the hard gate's safety valve
+# ===========================================================================
+
+
+def _render_escalation_brief(
+    *,
+    citizen_wa: Optional[str],
+    license_name: Optional[str],
+    score: Optional[dict[str, Any]],
+    blocking: Optional[list[dict[str, str]]],
+) -> str:
+    """The message an officer gets when BIMA's gate blocked a citizen who
+    believes it is wrong. Carries the citizen's contact (the actionable bit) and
+    what BIMA objected to — deliberately NOT masked for the number, because the
+    whole point is that a human can call them back. No NIK is included.
+    """
+    pct = score.get("score_percent") if isinstance(score, dict) else None
+    lines = [
+        "PERMINTAAN TINJAUAN PETUGAS",
+        "",
+        "Seorang pemohon meminta permohonannya ditinjau petugas. "
+        "BIMA menilai berkasnya belum lengkap, namun pemohon merasa sudah benar.",
+        "",
+        f"Izin: {license_name or '-'}",
+    ]
+    if isinstance(pct, int):
+        lines.append(f"Estimasi kelayakan BIMA: {pct}%")
+    if citizen_wa:
+        lines.append(f"Kontak pemohon (WhatsApp): {citizen_wa}")
+
+    if blocking:
+        lines += ["", "Yang BIMA nilai belum sesuai:"]
+        for b in blocking:
+            msg = mask_pii(str(b.get("message", "")).strip())
+            if msg:
+                lines.append(f"- {msg}")
+    elif isinstance(score, dict) and score.get("message"):
+        lines += ["", mask_pii(str(score["message"]).strip())]
+
+    lines += [
+        "",
+        "Belum ada permohonan yang dibuat di SIAP — berkas ini tertahan di "
+        "BIMA. Mohon hubungi pemohon untuk memastikan.",
+    ]
+    return "\n".join(lines).rstrip()
+
+
+async def notify_officer_of_escalation(
+    *,
+    citizen_wa: Optional[str],
+    license_name: Optional[str],
+    score: Optional[dict[str, Any]] = None,
+    blocking: Optional[list[dict[str, str]]] = None,
+) -> bool:
+    """Hand a gate-blocked citizen to a human officer.
+
+    There is **no SIAP request** here — the packet never passed the gate, so
+    there is no ticket, no request_id, and nothing to resolve a flow-step
+    officer from. This goes to the configured fallback officer channel and the
+    officer takes it from there out-of-band.
+
+    ⚠️ Known limit (WhatsApp): this is a FREE-FORM send, so it only reaches an
+    officer inside Meta's 24h service window. No approved template exists for an
+    escalation, and the new-submission template's arity is (izin, tiket, skor) —
+    there is no ticket to put in it. Telegram has no window and always lands.
+    Best-effort by design: never raises; returns False when it could not send.
+    """
+    if not is_enabled():
+        logger.info("escalation notify suppressed (flag off)")
+        return False
+
+    wa = _demo_officer_wa()
+    tg = _demo_officer_tg()
+    if not wa and not tg:
+        logger.warning(
+            "escalation notify: no officer channel configured "
+            "(BIMA_OFFICER_WA_PHONE / BIMA_OFFICER_TG_CHAT)"
+        )
+        return False
+
+    channel = CHANNEL_WHATSAPP if wa else CHANNEL_TELEGRAM
+    channel_id = _normalize_wa(wa) if wa else tg
+
+    brief = _render_escalation_brief(
+        citizen_wa=citizen_wa,
+        license_name=license_name,
+        score=score,
+        blocking=blocking,
+    )
+    sent = await _send(channel, channel_id, brief)
+    logger.info(
+        "escalation notify | channel=%s | officer=%s | citizen=%s | sent=%s | "
+        "blocking=%d",
+        channel, _mask(channel_id), _mask(citizen_wa or ""), sent,
+        len(blocking or []),
+    )
+    return sent
+
+
+# ===========================================================================
 # 1b) Auto-notify the NEXT desk when a request ADVANCES ([[Multi-step Copilot]])
 # ===========================================================================
 

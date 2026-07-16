@@ -314,9 +314,11 @@ class SubmissionSession:
     documents: list[SessionDocument] = field(default_factory=list)
     # the last content-scoring result (so a re-confirm + officer brief reuse it).
     last_score: Optional[dict[str, Any]] = None
-    # True once a sub-threshold "ajukan apa adanya?" override has been offered,
-    # so the NEXT AFFIRM force-submits past the ok-gate (no submit dead-end).
-    override_offered: bool = False
+    # True once this citizen has been handed to a human officer for review, so
+    # a repeated ask doesn't spam the officer. Latched for the session's life;
+    # the session stays at COLLECTING_DOCS so a later re-upload still self-heals
+    # (the gate re-runs and can clear them without the officer doing anything).
+    escalation_requested: bool = False
     # When a citizen sends a clear NEW-submission intent mid-form, we stash the
     # raw text here and offer to switch; a later AFFIRM-to-switch re-resolves.
     pending_new_intent: Optional[str] = None
@@ -391,7 +393,7 @@ def _encode_session(sess: SubmissionSession) -> str:
         "fields": sess.fields,
         "documents": docs,
         "last_score": _score_for_redis(sess.last_score),
-        "override_offered": sess.override_offered,
+        "escalation_requested": sess.escalation_requested,
         "pending_new_intent": sess.pending_new_intent,
         "last_doc_at": sess.last_doc_at,
         "ticket": sess.ticket,
@@ -430,7 +432,7 @@ def _decode_session(blob: str) -> SubmissionSession:
         fields=dict(raw.get("fields") or {}),
         documents=docs,
         last_score=raw.get("last_score"),
-        override_offered=bool(raw.get("override_offered", False)),
+        escalation_requested=bool(raw.get("escalation_requested", False)),
         pending_new_intent=raw.get("pending_new_intent"),
         last_doc_at=float(raw.get("last_doc_at", 0.0) or 0.0),
         ticket=raw.get("ticket"),
@@ -1122,6 +1124,17 @@ def _data_readback_lines(sess: SubmissionSession) -> list[str]:
 # Hard gate — BLOCKING issues must be fixed before BIMA offers submission.
 # ===========================================================================
 
+def _is_submittable(score: Optional[dict[str, Any]]) -> bool:
+    """The single gate: may BIMA file this packet?
+
+    True only when the scorer says `ok` — i.e. content is at/above threshold AND
+    no blocking issue was raised. There is deliberately no override: the whole
+    value of the gate is that an unready packet never reaches SIAP's queue. A
+    citizen who thinks the judgement is wrong gets a human, not a bypass.
+    """
+    return bool(isinstance(score, dict) and score.get("ok"))
+
+
 def _blocking_from_score(score: Optional[dict[str, Any]]) -> list[dict[str, str]]:
     """Extract the HARD-block issues from a normalised score dict.
 
@@ -1184,8 +1197,10 @@ def _fmt_blocking_guidance(
 ) -> str:
     """The BLOCKED reply: list exactly what's missing/wrong + how to fix, plus
     the SLA + format reminders. NEVER offers submission — ends by inviting the
-    citizen to complete and resend. Stays in COLLECTING_DOCS (the caller sets
-    the stage). Officer-grounded, warm, WhatsApp-friendly, emoji-free.
+    citizen to complete and resend, AND by naming the escape hatch so a blocked
+    citizen is never cornered by a judgement they disagree with. Stays in
+    COLLECTING_DOCS (the caller sets the stage). Officer-grounded, warm,
+    WhatsApp-friendly, emoji-free.
     """
     pct = score.get("score_percent") if isinstance(score, dict) else None
     lines: list[str] = []
@@ -1196,10 +1211,15 @@ def _fmt_blocking_guidance(
     lines.append(head)
 
     lines.append("")
-    for b in blocking:
-        msg = mask_pii(str(b.get("message", "")).strip())
-        if msg:
-            lines.append(f"- {msg}")
+    if blocking:
+        for b in blocking:
+            msg = mask_pii(str(b.get("message", "")).strip())
+            if msg:
+                lines.append(f"- {msg}")
+    elif isinstance(score, dict) and score.get("message"):
+        # Sub-threshold with no hard blocker — the scorer's own prose is the
+        # most specific thing we have to show.
+        lines.append(mask_pii(str(score["message"]).strip()))
 
     sla = _sla_reminder(sess)
     reminders = _procedural_reminders(score)
@@ -1210,7 +1230,13 @@ def _fmt_blocking_guidance(
         for rem in reminders:
             lines.append(rem)
 
-    lines += ["", "Silakan lengkapi lalu kirim lagi ya."]
+    lines += [
+        "",
+        "Silakan lengkapi lalu kirim lagi ya. Jika menurut Bapak/Ibu dokumennya "
+        "sudah benar dan penilaian saya keliru, cukup balas "
+        '"minta tinjau petugas" — nanti saya teruskan ke petugas untuk '
+        "diperiksa langsung.",
+    ]
     return "\n".join(lines).rstrip()
 
 
@@ -1449,20 +1475,22 @@ async def _process_collected_documents(sess: SubmissionSession) -> str:
         )
         return _ask_missing_field(sess, missing)
 
-    # HARD GATE — if a blocking issue exists (missing mandatory doc / wrong
-    # type / sign-doc missing meterai-ttd-stamp), BIMA must NOT offer to submit.
-    # Stay at COLLECTING_DOCS and guide the citizen to complete first; a later
-    # re-upload re-arms the debounce and re-runs this pass.
+    # HARD GATE — BIMA does not offer to submit a packet it judges unready.
+    # Two ways to be unready, both non-overridable:
+    #   * a BLOCKING issue (missing mandatory doc / wrong type / sign-doc
+    #     missing meterai-ttd-stamp), or
+    #   * a sub-threshold content score (`ok` false).
+    # Stay at COLLECTING_DOCS and guide the citizen to fix it; a later re-upload
+    # re-arms the debounce and re-runs this pass. If BIMA has it wrong, the
+    # citizen's exit is a human — see `_escalate_to_officer`.
     blocking = _blocking_from_score(score)
-    if blocking:
+    if blocking or not _is_submittable(score):
         sess.stage = Stage.COLLECTING_DOCS
-        # Not an override situation — clear any stale soft-override flag.
-        sess.override_offered = False
         sess.touch()
         await _put_session(sess)
         logger.info(
-            "Guided-submission BLOCKED after scoring | user=%s | blocking=%d",
-            _mask(sess.user_id), len(blocking),
+            "Guided-submission BLOCKED after scoring | user=%s | blocking=%d | ok=%s",
+            _mask(sess.user_id), len(blocking), bool((score or {}).get("ok")),
         )
         return _fmt_blocking_guidance(sess, score, blocking)
 
@@ -1472,16 +1500,85 @@ async def _process_collected_documents(sess: SubmissionSession) -> str:
     return _fmt_confirm_message(sess, score)
 
 
+async def _escalate_to_officer(sess: SubmissionSession) -> str:
+    """The hard gate's safety valve: hand this citizen to a human.
+
+    BIMA's gate is deliberately non-overridable, but its judgement is not
+    infallible — the cross-document / name-match checks are the subjective ones.
+    Rather than leave a citizen stuck arguing with a model, we notify an officer
+    with their contact and what BIMA objected to, and the human decides.
+
+    NOTHING is written to SIAP: no request, no ticket. The packet stays parked
+    in BIMA at COLLECTING_DOCS, so if the citizen simply re-uploads a fixed
+    document the gate re-runs and can clear them without the officer lifting a
+    finger. Latched via `escalation_requested` so asking twice doesn't spam.
+    Never raises — a failed notify still gets the citizen an honest reply.
+    """
+    if sess.escalation_requested:
+        return (
+            "Permintaan Bapak/Ibu sudah saya teruskan ke petugas ya, mohon "
+            "ditunggu. Kalau sementara ini Bapak/Ibu ingin memperbaiki "
+            "dokumennya, silakan kirim ulang saja — nanti saya periksa lagi."
+        )
+
+    score = sess.last_score
+    blocking = _blocking_from_score(score)
+    sent = False
+    try:
+        from services import officer_bridge
+
+        sent = await officer_bridge.notify_officer_of_escalation(
+            citizen_wa=_msisdn_from_user_id(sess.user_id),
+            license_name=sess.license_name,
+            score=score,
+            blocking=blocking,
+        )
+    except Exception:
+        logger.exception(
+            "Escalation notify crashed | user=%s", _mask(sess.user_id)
+        )
+
+    # Latch regardless of send success: the citizen asked, and re-asking must
+    # not retry-storm the officer channel. We stay at COLLECTING_DOCS so a
+    # re-upload still self-heals.
+    sess.escalation_requested = True
+    sess.stage = Stage.COLLECTING_DOCS
+    sess.touch()
+    await _put_session(sess)
+    logger.info(
+        "Guided-submission ESCALATED to officer | user=%s | sent=%s | blocking=%d",
+        _mask(sess.user_id), sent, len(blocking),
+    )
+
+    if sent:
+        return (
+            "Baik Bapak/Ibu. Permohonan ini sudah saya teruskan ke petugas "
+            "untuk ditinjau langsung, beserta catatan penilaian saya. Petugas "
+            "akan menghubungi Bapak/Ibu melalui nomor WhatsApp ini. Sementara "
+            "menunggu, kalau Bapak/Ibu ingin memperbaiki dokumennya, silakan "
+            "kirim ulang saja."
+        )
+    # Honest failure — never claim a hand-off that didn't happen.
+    return (
+        "Mohon maaf Bapak/Ibu, saat ini saya belum berhasil meneruskan "
+        "permintaan tinjauan ke petugas. Mohon hubungi petugas DPMPTSP secara "
+        "langsung ya. Kalau Bapak/Ibu ingin memperbaiki dokumennya, silakan "
+        "kirim ulang di sini — nanti saya periksa lagi."
+    )
+
+
 # ===========================================================================
 # Submit to SIAP — preserved end to end (officer notify, PII, fallbacks).
 # ===========================================================================
 
-async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
-    """CONFIRM + citizen affirmed: score/validate, then submit to SIAP.
+async def _submit(sess: SubmissionSession) -> str:
+    """CONFIRM + citizen affirmed: re-score/validate, then submit to SIAP.
 
-    Sub-threshold + not forced → offer "ajukan apa adanya" and remember it, so
-    the next AFFIRM force-submits (no submit dead-end). Clean → POST to SIAP,
-    return ticket + portal track link. Fires the officer hand-off on success.
+    The gate is HARD and has no override: an unready packet is never filed, no
+    matter how firmly the citizen affirms. There is no `force` — a citizen who
+    believes BIMA is wrong asks for a human instead (`_escalate_to_officer`),
+    which is the only exit that isn't "fix it". Clean → POST to SIAP, return
+    ticket + track link. Fires the officer hand-off on success.
     """
     from services.siap_submission_client import get_siap_submission_client
 
@@ -1499,41 +1596,22 @@ async def _submit(sess: SubmissionSession, *, force: bool = False) -> str:
         result = {"ok": False, "status": "unverified", "score_percent": 0,
                   "message": "", "issues": [], "blocking": []}
 
-    # HARD GATE — a blocking issue (missing mandatory doc / wrong-type doc /
-    # sign-doc missing meterai-ttd-stamp) is NON-OVERRIDABLE. Even a forced
-    # AFFIRM ("ajukan apa adanya") cannot bypass it: BIMA lists what's missing
-    # and stays collecting until it's fixed. This is the core verificator gate.
+    # HARD GATE — non-overridable, and the ONLY gate. A blocking issue (missing
+    # mandatory doc / wrong-type doc / sign-doc missing meterai-ttd-stamp) or a
+    # sub-threshold content score both stop the filing outright: BIMA lists what
+    # is wrong and stays collecting until it's fixed. An AFFIRM cannot buy past
+    # it — this is the core verificator gate, and 84% of real SIAP rejections
+    # (99% for PKPP) are exactly the document faults it catches.
     blocking = _blocking_from_score(result)
-    if blocking:
+    if blocking or not _is_submittable(result):
         sess.stage = Stage.COLLECTING_DOCS
-        # Reset any prior soft-override offer — the packet is now hard-blocked,
-        # so a later AFFIRM must not force-submit past it.
-        sess.override_offered = False
         sess.touch()
         await _put_session(sess)
         logger.info(
-            "Guided-submission BLOCKED at submit | user=%s | blocking=%d",
-            _mask(sess.user_id), len(blocking),
+            "Guided-submission BLOCKED at submit | user=%s | blocking=%d | ok=%s",
+            _mask(sess.user_id), len(blocking), bool(result.get("ok")),
         )
         return _fmt_blocking_guidance(sess, result, blocking)
-
-    # SOFT shortfall — everything mandatory is present+valid but the content
-    # score is sub-threshold. Offer "ajukan apa adanya" once; the next AFFIRM
-    # force-submits (no submit dead-end).
-    if not result.get("ok") and not force:
-        sess.stage = Stage.CONFIRM
-        sess.override_offered = True
-        sess.touch()
-        await _put_session(sess)
-        body = result.get("message") or (
-            "Dokumen Bapak/Ibu belum sepenuhnya lengkap sesuai persyaratan."
-        )
-        return (
-            body
-            + "\n\nSemua dokumen wajib sudah ada. Kalau Bapak/Ibu ingin tetap "
-            "mengajukan apa adanya, beri tahu saya saja, atau silakan lengkapi "
-            "dulu lalu kirim lagi."
-        )
 
     # --- Step 2: submit to SIAP ---
     client = get_siap_submission_client()
@@ -2198,18 +2276,22 @@ def _citizen_autofill_note(
 
 async def _handle_confirm(sess: SubmissionSession, message: str) -> str:
     """Classify the citizen's CONFIRM-stage reply by INTENT and act:
-      AFFIRM   → submit
+      AFFIRM   → submit (still subject to the hard gate — see _submit)
       DECLINE  → warmly hold/cancel (clears the session)
       CORRECT  → update the field, re-show the summary, re-ask
       QUESTION → brief answer, then re-ask
+      ESCALATE → hand to a human officer (the gate's safety valve)
       UNCLEAR  → gentle clarifying question
     """
     from services import submission_intent
 
     intent = await submission_intent.classify_confirm_intent(message)
 
+    if intent == submission_intent.ESCALATE:
+        return await _escalate_to_officer(sess)
+
     if intent == submission_intent.AFFIRM:
-        return await _submit(sess, force=sess.override_offered)
+        return await _submit(sess)
 
     if intent == submission_intent.DECLINE:
         await _clear_session(sess.user_id)
@@ -2392,6 +2474,7 @@ _DONE_HINT_RE = re.compile(
 
 async def _handle_collecting_docs_text(sess: SubmissionSession, message: str) -> str:
     """A text message arrived at COLLECTING_DOCS. Possibilities:
+      * the citizen asks for a human ('minta tinjau petugas') → escalate;
       * the citizen is supplying a missing field we asked for (a name or NIK) →
         capture it, then process if both are now present;
       * the citizen says 'sudah semua' → process now if docs exist;
@@ -2400,6 +2483,15 @@ async def _handle_collecting_docs_text(sess: SubmissionSession, message: str) ->
     Document arrival itself is handled out-of-band by the debounce, not here.
     """
     msg = message.strip()
+
+    # The escape valve, checked FIRST. This is where a gate-blocked citizen
+    # actually sits, so this — not CONFIRM — is the path that matters most.
+    # It must precede _capture_typed_field, which would otherwise happily read
+    # "minta tinjau petugas" as the applicant's name.
+    from services import submission_intent
+
+    if submission_intent.is_escalation_request(msg):
+        return await _escalate_to_officer(sess)
 
     # Capture a typed correction/answer for a missing field (name / NIK).
     captured = _capture_typed_field(sess, msg)
