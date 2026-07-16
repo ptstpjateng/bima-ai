@@ -34,7 +34,19 @@ INTENTS (CONFIRM stage)
   CORRECT  — the citizen is fixing a field ("NIK saya yang benar 33..", "nama
              usaha PT Maju Jaya", "namanya Budi bukan Budy").
   QUESTION — the citizen is asking something ("ini buat apa?", "berapa lama?").
+  ESCALATE — the citizen wants a HUMAN to look at it, typically because they
+             believe BIMA's gate is wrong ("minta tinjau petugas", "tolong
+             dicek petugas saja", "menurut saya sudah benar").
   UNCLEAR  — none of the above with confidence → ask a gentle clarifier.
+
+WHY ESCALATE EXISTS
+  The completeness gate is a HARD block — BIMA will not file a packet it judges
+  incomplete. That is the right default (84% of real SIAP rejections are
+  document problems), but the judgement is not infallible, especially on the
+  subjective cross-document/name-match checks. ESCALATE is the safety valve: it
+  hands the case to a human instead of leaving the citizen stuck. It is an
+  INTENT, not a keyword, precisely so a citizen who phrases it their own way
+  still finds the exit.
 """
 
 from __future__ import annotations
@@ -63,9 +75,10 @@ AFFIRM = "AFFIRM"
 DECLINE = "DECLINE"
 CORRECT = "CORRECT"
 QUESTION = "QUESTION"
+ESCALATE = "ESCALATE"
 UNCLEAR = "UNCLEAR"
 
-_VALID = {AFFIRM, DECLINE, CORRECT, QUESTION, UNCLEAR}
+_VALID = {AFFIRM, DECLINE, CORRECT, QUESTION, ESCALATE, UNCLEAR}
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +107,34 @@ _AFFIRM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Escalate cues — SEARCHED anywhere in the reply, not lead-anchored: the ask
+# usually trails a justification ("menurut saya sudah benar, tolong dicek
+# petugas"). Checked BEFORE affirm/decline for exactly that reason — "ya, minta
+# tinjau petugas" leads with an affirm token but is NOT a submit instruction,
+# and "tidak, minta tinjau petugas" is not a cancel.
+_ESCALATE_RE = re.compile(
+    r"(minta\s+tinjau|tinjau\s+petugas|ditinjau\s+petugas|"
+    r"(?:di)?cek\s+(?:oleh\s+)?petugas|(?:di)?periksa\s+(?:oleh\s+)?petugas|"
+    r"hubungi\s+petugas|bicara\s+(?:dengan\s+)?petugas|tanya\s+petugas|"
+    r"lapor\s+petugas|petugas\s+saja|bantuan\s+petugas|"
+    r"review\s+petugas|minta\s+(?:tolong\s+)?(?:di)?review)",
+    re.IGNORECASE,
+)
+
 # A literal "batal" check exposed for callers that want a hard cancel signal
 # independent of the LLM (the flow uses this so the word always cancels).
 _BATAL_WORD_RE = re.compile(
     r"^\s*(batal|batalkan|cancel|stop|berhenti)\s*[.!]*\s*$", re.IGNORECASE
 )
+
+
+def is_escalation_request(message: str) -> bool:
+    """True when the reply clearly asks for a human to review the packet.
+
+    Exposed so the COLLECTING_DOCS handler can offer the escape without paying
+    for an LLM round-trip — a blocked citizen is already waiting.
+    """
+    return bool(_ESCALATE_RE.search((message or "").strip()))
 
 
 def is_hard_cancel(message: str) -> bool:
@@ -113,13 +149,21 @@ def is_hard_cancel(message: str) -> bool:
 def _keyword_intent(message: str) -> str:
     """Conservative keyword classifier — the LLM-down fallback.
 
-    Order matters: DECLINE before AFFIRM so 'tidak jadi' isn't swallowed by a
-    loose affirm token. Returns UNCLEAR for anything that isn't an obvious
-    yes/no — the flow then asks a gentle clarifier rather than guessing.
+    Order matters:
+      * ESCALATE first — it is the most specific ask, and it routinely rides
+        along with an affirm/decline token ("ya, minta tinjau petugas"). If
+        AFFIRM ran first we would SUBMIT a packet the citizen wanted a human
+        to look at, which is the exact failure this valve exists to prevent.
+      * DECLINE before AFFIRM so 'tidak jadi' isn't swallowed by a loose affirm
+        token.
+    Returns UNCLEAR for anything that isn't obvious — the flow then asks a
+    gentle clarifier rather than guessing.
     """
     msg = (message or "").strip()
     if not msg:
         return UNCLEAR
+    if _ESCALATE_RE.search(msg):
+        return ESCALATE
     if _DECLINE_RE.match(msg):
         return DECLINE
     if _AFFIRM_RE.match(msg):
@@ -151,13 +195,21 @@ _SYSTEM = (
     "corrected name / NIK / business name value.\n"
     "  QUESTION - is asking something before deciding (e.g. 'ini untuk apa?', "
     "'berapa lama prosesnya?', 'aman tidak datanya?').\n"
+    "  ESCALATE - wants a HUMAN OFFICER to review the packet, usually because "
+    "they think BIMA's assessment is wrong (e.g. 'minta tinjau petugas', "
+    "'tolong dicek petugas saja', 'menurut saya dokumen saya sudah benar', "
+    "'saya mau bicara dengan petugas', 'minta diperiksa orangnya').\n"
     "  UNCLEAR  - none of the above, or genuinely ambiguous.\n"
     "\n"
-    "If the reply both asks AND corrects, prefer CORRECT. If it both asks AND "
-    "affirms, prefer AFFIRM.\n"
+    "Precedence when a reply fits more than one:\n"
+    "  * ESCALATE beats everything. 'ya, tapi minta tinjau petugas' is ESCALATE, "
+    "not AFFIRM — the citizen wants a human, not a submission.\n"
+    "  * If the reply both asks AND corrects, prefer CORRECT.\n"
+    "  * If it both asks AND affirms, prefer AFFIRM.\n"
     "\n"
     "Exact schema:\n"
-    '{"intent": "AFFIRM" | "DECLINE" | "CORRECT" | "QUESTION" | "UNCLEAR"}'
+    '{"intent": "AFFIRM" | "DECLINE" | "CORRECT" | "QUESTION" | "ESCALATE" | '
+    '"UNCLEAR"}'
 )
 
 
@@ -166,9 +218,13 @@ async def classify_confirm_intent(message: str) -> str:
 
     Strategy:
       1. The literal strong-cancel word ('batal') is ALWAYS DECLINE — no LLM.
-      2. Otherwise ask the lightweight Gemma JSON classifier.
-      3. On any LLM error / unparseable output → conservative keyword fallback
-         (a clear 'ya'/'tidak' still works; everything else → UNCLEAR).
+      2. An unambiguous ask for a human is ALWAYS ESCALATE — no LLM. Same
+         reasoning as 'batal': the safety valve must not depend on the model
+         being up or in a good mood. The LLM still catches the phrasings the
+         regex misses.
+      3. Otherwise ask the lightweight Gemma JSON classifier.
+      4. On any LLM error / unparseable output → conservative keyword fallback
+         (a clear 'ya'/'tidak'/escalate still works; everything else → UNCLEAR).
 
     NEVER raises — returns one of the canonical intent strings.
     """
@@ -180,6 +236,11 @@ async def classify_confirm_intent(message: str) -> str:
     # the model's availability or mood.
     if is_hard_cancel(msg):
         return DECLINE
+
+    # The escape valve gets the same guarantee — a citizen the gate has blocked
+    # is already stuck; they must not also depend on a model call succeeding.
+    if is_escalation_request(msg):
+        return ESCALATE
 
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:

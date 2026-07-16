@@ -22,7 +22,7 @@ What this covers:
       - upload burst -> ONE consolidated reply (out-of-band send), masked NIK
       - phone taken from the msisdn (never asked)
       - AFFIRM intent -> submit -> ticket; DECLINE -> hold; CORRECT -> re-confirm
-      - sub-threshold -> offer "ajukan apa adanya", second AFFIRM force-submits
+      - sub-threshold -> HARD blocked (no bypass); ESCALATE hands to a human
       - hard "batal" cancels anywhere
       - no emoji in the new citizen-facing messages
 
@@ -250,6 +250,13 @@ def _flow_patches(*, score=96, ktp=_KTP, confirm_intent="AFFIRM",
         patch("services.citizen_scorer.score_session_documents",
               new=AsyncMock(return_value=_suitability_result(score))),
         patch("services.gemini_vision.extract_ktp_fields", new=AsyncMock(return_value=ktp)),
+        # Patched for the same reason as extract_ktp_fields: unpatched, the
+        # business-doc extractor made a REAL Gemini call on every flow test. It
+        # 403s without a key and the round-trip raced the debounce's fixed sleep,
+        # so test_three_docs_one_consolidated_reply_with_masked_nik failed ~1 run
+        # in 3 depending on network latency. No test should touch the network.
+        patch("services.gemini_vision.extract_business_fields",
+              new=AsyncMock(return_value={})),
         patch("services.gemini_vision.is_configured", return_value=True),
         patch("services.submission_intent.classify_confirm_intent", ci),
     ]
@@ -460,18 +467,23 @@ class TestConfirmIntent(_GuidedFlowBase):
         self.assertEqual(gs._sessions["wa-633"].stage, gs.Stage.CONFIRM)
 
 
-class TestSubThresholdOverride(_GuidedFlowBase):
-    """A sub-threshold packet is not auto-submitted on the first AFFIRM; BIMA
-    offers 'ajukan apa adanya' and the next AFFIRM force-submits."""
+class TestSubThresholdHardGate(_GuidedFlowBase):
+    """A sub-threshold packet is never filed — not on the first AFFIRM, not on
+    the tenth. The gate has no bypass; the citizen's only exits are to fix the
+    packet or to ask for a human."""
 
-    def test_first_affirm_offers_override_second_submits(self):
+    def test_sub_threshold_never_confirms_and_insisting_never_files(self):
         gs._sessions.clear()
         with _Ctx(_flow_patches(score=62)):
             uid = "wa-634"
             _run(gs.maybe_handle(uid, "saya mau ajukan izin pemakaian tanah"))
             _run(gs.handle_inbound_documents(uid, [_doc()]))
-            _run(gs._process_collected_documents(gs._sessions[uid]))
-        self.assertEqual(gs._sessions[uid].stage, gs.Stage.CONFIRM)
+            reply = _run(gs._process_collected_documents(gs._sessions[uid]))
+        # Blocked at collecting — it never reaches CONFIRM — and the reply tells
+        # the citizen the escape exists rather than cornering them.
+        self.assertEqual(gs._sessions[uid].stage, gs.Stage.COLLECTING_DOCS)
+        self.assertIn("minta tinjau petugas", reply.lower())
+        self.assertNotIn("apa adanya", reply.lower())
 
         mc = MagicMock()
         mc.is_configured.return_value = True
@@ -483,15 +495,52 @@ class TestSubThresholdOverride(_GuidedFlowBase):
                    return_value=mc), \
              patch("services.officer_bridge.notify_officer_of_submission",
                    new=AsyncMock(return_value=True)):
-            # First AFFIRM on a sub-threshold packet → override offered, no submit.
+            # Insisting buys nothing — there is no override to reach.
             r1 = _run(gs.maybe_handle(uid, "ya lanjut"))
-            self.assertIn("apa adanya", r1.lower())
-            mc.create_request.assert_not_awaited()
-            self.assertTrue(_run(gs.has_active_session(uid)))
-            # Second AFFIRM → force-submit past the gate.
             r2 = _run(gs.maybe_handle(uid, "ya kirim saja"))
-        self.assertIn("000077001", r2)
-        mc.create_request.assert_awaited_once()
+        mc.create_request.assert_not_awaited()
+        self.assertNotIn("apa adanya", f"{r1}{r2}".lower())
+
+    def test_escalation_hands_to_officer_files_nothing_and_latches(self):
+        gs._sessions.clear()
+        with _Ctx(_flow_patches(score=62)):
+            uid = "wa-635"
+            _run(gs.maybe_handle(uid, "saya mau ajukan izin pemakaian tanah"))
+            _run(gs.handle_inbound_documents(uid, [_doc()]))
+            _run(gs._process_collected_documents(gs._sessions[uid]))
+        self.assertEqual(gs._sessions[uid].stage, gs.Stage.COLLECTING_DOCS)
+
+        notify = AsyncMock(return_value=True)
+        mc = MagicMock()
+        mc.is_configured.return_value = True
+        mc.create_request = AsyncMock()
+        with patch("services.officer_bridge.notify_officer_of_escalation", new=notify), \
+             patch("services.siap_submission_client.get_siap_submission_client",
+                   return_value=mc):
+            r1 = _run(gs.maybe_handle(uid, "menurut saya sudah benar, minta tinjau petugas"))
+            # Asking twice must not spam the officer.
+            r2 = _run(gs.maybe_handle(uid, "minta tinjau petugas"))
+
+        notify.assert_awaited_once()
+        mc.create_request.assert_not_awaited()  # nothing reaches SIAP
+        sess = gs._sessions[uid]
+        self.assertTrue(sess.escalation_requested)
+        # Held at collecting so a later re-upload still self-heals.
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+        self.assertIn("petugas", r1.lower())
+        self.assertIn("petugas", r2.lower())
+
+    def test_escalation_beats_a_leading_affirm_token(self):
+        # "ya, minta tinjau petugas" must escalate, NOT submit — the whole point
+        # of checking ESCALATE before AFFIRM.
+        self.assertTrue(si.is_escalation_request("ya, minta tinjau petugas"))
+        self.assertEqual(
+            si._keyword_intent("ya, minta tinjau petugas"), si.ESCALATE)
+        self.assertEqual(
+            si._keyword_intent("tidak, minta tinjau petugas"), si.ESCALATE)
+        # Plain affirm/decline still classify normally.
+        self.assertEqual(si._keyword_intent("ya lanjut"), si.AFFIRM)
+        self.assertEqual(si._keyword_intent("batal"), si.DECLINE)
 
 
 class TestApplicantProfileBinding(_GuidedFlowBase):

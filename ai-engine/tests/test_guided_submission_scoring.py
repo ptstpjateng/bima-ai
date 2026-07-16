@@ -366,15 +366,14 @@ class TestHardGate(unittest.TestCase):
         self.assertIn("ajukan sekarang", reply.lower())
         self.assertIn("7 hari kerja", reply)  # officer grounding on confirm too
 
-    def test_submit_force_cannot_override_blocking(self):
-        # Even a forced AFFIRM ("ajukan apa adanya") must NOT submit past a
-        # blocking issue. The submission client must never be reached.
+    def test_submit_never_overrides_blocking(self):
+        # The gate has NO override: an AFFIRM on a blocking packet must not
+        # submit, however firmly it is given. The client is never reached.
         sess = _make_session(gs.Stage.CONFIRM)
         sess.license_id = 459
         sess.license_name = "PPKP"
         sess.sla_working_days = 7
         sess.documents = [gs.SessionDocument("d1", "ktp", "ktp.jpg", "image/jpeg", b"x")]
-        sess.override_offered = True  # a prior soft-override was offered
         sess.last_score = {
             "ok": False, "status": "needs_fix", "score_percent": 60,
             "summary": "s", "message": "m", "issues": [],
@@ -395,19 +394,21 @@ class TestHardGate(unittest.TestCase):
         with patch.dict(os.environ, {"GUIDED_SUBMISSION_PROFILE_ID": "12345"}, clear=False):
             with patch("services.siap_submission_client.get_siap_submission_client",
                        return_value=fake_client):
-                reply = _run(gs._submit(sess, force=True))
+                reply = _run(gs._submit(sess))
         # Blocked before any SIAP call — client never consulted.
         self.assertEqual(client_probe["configured"], 0)
         fake_client.create_request.assert_not_awaited()
-        # Dropped back to collecting; override flag reset; guidance returned.
+        # Dropped back to collecting; guidance returned, escape hatch named.
         self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
-        self.assertFalse(sess.override_offered)
         self.assertIn("NPWP", reply)
         self.assertIn("Silakan lengkapi lalu kirim lagi ya.", reply)
+        self.assertIn("minta tinjau petugas", reply.lower())
 
-    def test_soft_shortfall_is_submittable_not_blocked(self):
-        # A sub-threshold packet with everything mandatory present+valid is a
-        # SOFT warning — offered "apa adanya", not hard-blocked.
+    def test_sub_threshold_is_hard_blocked_with_no_override(self):
+        # A sub-threshold packet is BLOCKED even when every mandatory document
+        # is present+valid. The "ajukan apa adanya" bypass is gone: the only
+        # exits are fix it, or ask a human. Guards the 84%-document thesis —
+        # a weak packet must not reach SIAP's queue just because it was insisted on.
         sess = _make_session(gs.Stage.CONFIRM)
         sess.license_id = 459
         sess.license_name = "PPKP"
@@ -415,18 +416,29 @@ class TestHardGate(unittest.TestCase):
         sess.last_score = {
             "ok": False, "status": "needs_fix", "score_percent": 70,
             "summary": "s", "message": "m", "issues": [],
-            "result": _suitability_result(70),  # no blocking issue
+            "result": _suitability_result(70),  # no blocking issue — score alone
         }
         _run(gs._put_session(sess))
-        unconfigured = types.SimpleNamespace(is_configured=lambda: False)
+        probe = {"configured": 0}
+
+        def _is_configured():
+            probe["configured"] += 1
+            return True
+
+        fake_client = types.SimpleNamespace(
+            is_configured=_is_configured,
+            create_request=AsyncMock(return_value={"ok": True, "ticket": "X"}),
+        )
         with patch.dict(os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False):
             with patch("services.siap_submission_client.get_siap_submission_client",
-                       return_value=unconfigured):
-                reply = _run(gs._submit(sess, force=False))
-        # Soft-override offer (not the hard-block guidance), stays CONFIRM.
-        self.assertEqual(sess.stage, gs.Stage.CONFIRM)
-        self.assertTrue(sess.override_offered)
-        self.assertIn("apa adanya", reply.lower())
+                       return_value=fake_client):
+                reply = _run(gs._submit(sess))
+        # Never filed, dropped to collecting, no bypass offered, escape named.
+        self.assertEqual(probe["configured"], 0)
+        fake_client.create_request.assert_not_awaited()
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+        self.assertNotIn("apa adanya", reply.lower())
+        self.assertIn("minta tinjau petugas", reply.lower())
 
 
 class TestHandleInboundDocumentsSilent(unittest.TestCase):
