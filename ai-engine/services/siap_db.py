@@ -196,6 +196,28 @@ _SQL_APPROVAL_STEP = """
      LIMIT 1
 """
 
+# license_id → the FIRST officer desk on that licence's Alur Izin.
+#
+# `resolve_step_officers` needs a request_id: request → approval_step_id →
+# group_id. An ESCALATION has no request — the packet never passed the gate, so
+# nothing was ever filed — but it does know which licence the citizen is trying
+# to file. The verificator desk is a property of the LICENCE, not of any one
+# request, so it is resolvable without one: take the lowest sort_order step
+# whose owning role is not the applicant.
+#
+# For PKPP (459) this is sort_order=1, "Petugas SKPD" — the desk that would have
+# received the submission had it passed.
+_SQL_FIRST_OFFICER_STEP = """
+    SELECT s.group_id,
+           s.sort_order
+      FROM ptsp.license_approval_step s
+      JOIN public.roles r ON r.id = s.group_id
+     WHERE s.license_id = $1
+       AND lower(r.name) <> $2
+     ORDER BY s.sort_order
+     LIMIT 1
+"""
+
 # role id → role name (to detect the applicant role by name)
 _SQL_ROLE_NAME = """
     SELECT name
@@ -243,6 +265,66 @@ def _empty_step_result() -> dict:
         "group_id": None,
         "sort_order": None,
     }
+
+
+async def resolve_license_first_officers(license_id: int) -> list[str]:
+    """Officer WhatsApp numbers for a licence's FIRST officer desk.
+
+    The licence-keyed sibling of `resolve_step_officers`. That one starts from a
+    request_id, which an ESCALATION does not have: the citizen's packet never
+    passed the gate, so no `license_request` was ever created. But BIMA still
+    knows the licence, and the Alur Izin belongs to the LICENCE — so the desk
+    that WOULD have received the submission is resolvable anyway.
+
+    This is why the escape needs no BIMA_OFFICER_WA_PHONE: the officer comes
+    from SIAP's own per-step roster, exactly like a real submission notify, so a
+    roster change in SIAP is picked up with no redeploy and no env edit.
+
+    Returns NORMALIZED (62…) numbers, or [] on any failure. NEVER raises.
+    Numbers are never logged.
+    """
+    if not is_siap_db_configured():
+        logger.info("resolve_license_first_officers: SIAP DB not configured")
+        return []
+    try:
+        lid = int(license_id)
+    except (TypeError, ValueError):
+        logger.warning("resolve_license_first_officers: bad license_id=%r", license_id)
+        return []
+
+    try:
+        pool = await get_siap_pool()
+        if pool is None:
+            return []
+        async with pool.acquire() as conn:
+            step = await conn.fetchrow(
+                _SQL_FIRST_OFFICER_STEP, lid, APPLICANT_ROLE_NAME
+            )
+            if not step or step["group_id"] is None:
+                logger.info(
+                    "resolve_license_first_officers: no officer step | license_id=%s",
+                    lid,
+                )
+                return []
+            rows = await conn.fetch(
+                _SQL_STEP_OFFICER_WHATSAPPS, lid, step["group_id"]
+            )
+            numbers: list[str] = []
+            for r in rows:
+                norm = _normalize_msisdn(r["whatsapp"])
+                if norm and norm not in numbers:
+                    numbers.append(norm)
+            logger.info(
+                "resolve_license_first_officers | license_id=%s group_id=%s "
+                "sort_order=%s resolved=%d",
+                lid, step["group_id"], step["sort_order"], len(numbers),
+            )
+            return numbers
+    except Exception:
+        logger.exception(
+            "resolve_license_first_officers failed | license_id=%s", license_id
+        )
+        return []
 
 
 async def resolve_step_officers(request_id: int) -> dict:
