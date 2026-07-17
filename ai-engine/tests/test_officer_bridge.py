@@ -1582,5 +1582,61 @@ class TestScoreSurvivesTheForward(unittest.TestCase):
         self.assertEqual(sent["params"][2], "-")
 
 
+class TestSubmitPersistsScoreOnEveryPath(unittest.TestCase):
+    """The persist must happen on the LIVE path, not just a helper in isolation.
+
+    The helper tests below passed while production never wrote the key: the call
+    had been added ONLY to the static-env fallback branch, which never runs when
+    officers resolve from SIAP's flow. Symptom on a fresh ticket (000077768):
+        officer notify (flow) | has_score=True     <- the score existed
+        next-step notify      | has_score=False    <- and was never stored
+        bima:case_validation:* -> 0 keys
+    with no error logged, because nothing threw. So these drive
+    notify_officer_of_submission end-to-end and assert the key lands.
+    """
+
+    def _drive(self, *, flow_officers):
+        saved = {}
+
+        async def fake_save(key, obj, *, encode, ttl_seconds):
+            saved[key] = encode(obj)
+            return True
+
+        async def fake_resolve(request_id):
+            return {"officer_whatsapps": list(flow_officers), "wa_active": True,
+                    "is_applicant_step": False, "group_id": 6}
+
+        async def fake_send_template(*, recipient_phone, template_name,
+                                     body_params, language_code):
+            return True
+
+        score = {"score_percent": 92, "ok": True, "message": "m",
+                 "issues": [], "blocking": [], "missing": []}
+
+        with patch.object(ob.session_store, "save", new=fake_save), \
+             patch("services.siap_db.resolve_step_officers", new=fake_resolve), \
+             patch("services.whatsapp_template.send_template", new=fake_send_template), \
+             patch.object(ob, "_demo_officer_wa", new=lambda: "628999000111"), \
+             patch.object(ob, "_demo_officer_tg", new=lambda: None):
+            _run(ob.notify_officer_of_submission(
+                ticket="000077768", request_id=77768, license_id=459,
+                license_name="PKPP", applicant_name="CASMO", score=score,
+                documents=[], applicant_alamat="Jl. Laut 1",
+            ))
+        return saved
+
+    def test_flow_path_persists_the_case_score(self):
+        # THE regression: officers resolved from SIAP's flow — the live path.
+        saved = self._drive(flow_officers=["628111222333"])
+        self.assertIn("bima:case_validation:77768", saved,
+                      "the live flow path did not persist the case score")
+
+    def test_env_fallback_path_persists_the_case_score(self):
+        # No flow officer -> static env fallback. Must persist too.
+        saved = self._drive(flow_officers=[])
+        self.assertIn("bima:case_validation:77768", saved,
+                      "the env fallback path did not persist the case score")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
