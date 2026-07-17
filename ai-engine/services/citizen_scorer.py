@@ -147,12 +147,32 @@ def _completeness_line(result: SuitabilityResult) -> str:
     """"X/N dokumen wajib lengkap" — or a neutral note when the registry was
     unavailable (no structured requirements / SIAP DB down)."""
     comp = result.completeness
-    if not comp.required:
-        # Registry could not be loaded or license has no structured list.
+    # `needed_classes` — NOT `required` — is the set the score is computed
+    # against. `required` is the raw requirement-string list; requirements the
+    # judge could not map to a known DOC_CLASS are absent from `needed_classes`
+    # and can therefore never appear in `missing`. Counting present as
+    # len(required) - len(missing) silently scores those unmappable rows as
+    # SATISFIED, inflating the numerator AND printing a denominator the headline
+    # % was never computed from ("2/8 lengkap" under a 14% score).
+    if not comp.required or not comp.needed_classes:
+        # Registry could not be loaded, the license has no structured list, or
+        # nothing mapped to a known class. Never render a count here: with
+        # `missing` empty by construction, subtraction would claim "N/N lengkap"
+        # while the score sits at 0.0.
         return f"*Kelengkapan:* {comp.note or 'tidak dapat dinilai otomatis'}"
-    total = len(comp.required)
-    present = total - len(comp.missing)
-    return f"*Kelengkapan dokumen wajib:* {present}/{total} lengkap"
+    total = len(comp.needed_classes)
+    # `missing` is derived from `needed_classes`, so this subtraction is now over
+    # one coherent set. Clamped defensively — a count must never go negative.
+    present = max(0, total - len(comp.missing))
+    line = f"*Kelengkapan dokumen wajib:* {present}/{total} lengkap"
+    # Requirements BIMA could not map gate nothing and are absent from the count.
+    # Saying so keeps the number honest — they are real obligations, not passes.
+    if comp.unmapped_required:
+        line += (
+            f"\n_{len(comp.unmapped_required)} persyaratan lain belum bisa "
+            f"diperiksa otomatis — akan dicek petugas._"
+        )
+    return line
 
 
 def _sign_signal_suffix(f) -> str:
@@ -167,10 +187,12 @@ def _sign_signal_suffix(f) -> str:
     parts: list[str] = []
     # Meterai — only for docs that legally need one.
     if f.detected_type in _METERAI_DOC_CLASSES:
+        # Meterai carries its own glyph: it is a distinct legal artefact from a
+        # signature or a cap, and a flat comma-list made all three read alike.
         if f.has_meterai is True:
-            parts.append("meterai terlihat")
+            parts.append("🧾 meterai terlihat")
         elif f.has_meterai is False:
-            parts.append("*meterai belum terlihat*")
+            parts.append("*🧾 meterai belum terlihat*")
     # Cap/stempel — only for stamp-docs (e.g. Surat Pesanan).
     if f.detected_type in _STAMP_DOC_CLASSES:
         if f.has_stamp is True:
@@ -227,7 +249,7 @@ def _type_lines(result: SuitabilityResult) -> list[str]:
     lines: list[str] = []
     for f in _dedup_type_findings(result.type_correctness):
         if f.detected_type in ("Unknown", ""):
-            lines.append(f"- _{_short(f.file)}_: tidak terbaca — unggah ulang yang jelas")
+            lines.append(f"❌ _{_short(f.file)}_: tidak terbaca — unggah ulang yang jelas")
             continue
 
         # Name ANY document: when BIMA didn't map it to a known class ("Other")
@@ -244,11 +266,16 @@ def _type_lines(result: SuitabilityResult) -> list[str]:
         # Clean line when it matches, is unclassified, OR was uploaded unlabeled
         # (claimed "Other") — BIMA detected it, so there's no label conflict to
         # show. Only surface "dilabeli X" on a genuine label conflict.
+        # The leading glyph IS the status: a clean read and a mis-labelled one
+        # looked identical behind a flat "- " bullet. ✅ = read and accepted as-is;
+        # ⚠️ = readable but something needs the citizen's attention. Any per-signal
+        # note (meterai/cap/tanda tangan) still rides in `signals`.
         if f.matches or f.detected_type == "Other" or f.claimed_type == "Other":
-            lines.append(f"- *{label}*{signals}")
+            glyph = "⚠️" if ("belum terlihat" in signals) else "✅"
+            lines.append(f"{glyph} *{label}*{signals}")
         else:
             lines.append(
-                f"- *{label}*{signals} — _{_short(f.file)}_ dilabeli "
+                f"⚠️ *{label}*{signals} — _{_short(f.file)}_ dilabeli "
                 f"{_label(f.claimed_type)}"
             )
     return lines
@@ -294,8 +321,7 @@ def render_score_message(
     """
     percent = int(round(result.overall_suitability_score * 100))
 
-    # Plain-text status band by score — no emoji (WhatsApp replies stay
-    # emoji-free, see Fix B). The band word gives the citizen a quick read of
+    # Plain-text status band by score — the band word gives the citizen a quick read of
     # whether their packet is in good shape.
     if percent >= 85:
         band = "Lengkap"
@@ -320,8 +346,17 @@ def render_score_message(
     # Self-explaining score: when nothing mandatory is missing but the % is
     # below 100, the gap is the AI's read of document TYPE + CONTENT quality,
     # not a missing berkas — say so, so the citizen doesn't hunt for a phantom
-    # gap. Only when the registry was actually loaded (required non-empty).
-    if percent < 100 and result.completeness.required and not result.completeness.missing:
+    # gap. Gated on `needed_classes` (not `required`): when nothing mapped,
+    # `missing` is empty because nothing was CHECKED, not because nothing is
+    # absent — asserting "bukan berkas yang kurang" there would be a claim BIMA
+    # cannot support. Same for unmapped rows: a missing berkas may hide among
+    # them, so the reassurance is only honest when every requirement was checked.
+    if (
+        percent < 100
+        and result.completeness.needed_classes
+        and not result.completeness.missing
+        and not result.completeness.unmapped_required
+    ):
         lines.append(
             "_Sisa persentase adalah faktor keterbacaan & kesesuaian isi dokumen "
             "(penilaian awal AI), bukan berkas yang kurang — petugas yang "
