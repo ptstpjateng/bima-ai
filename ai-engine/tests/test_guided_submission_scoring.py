@@ -447,6 +447,52 @@ class TestHardGate(unittest.TestCase):
         # judgement, which the citizen can legitimately dispute.
         self.assertIn("minta tinjau petugas", reply.lower())
 
+    def test_missing_docs_render_as_one_header_plus_a_bullet_list(self):
+        # N missing documents are ONE logical group. The stem "Dokumen wajib
+        # belum diunggah" must appear ONCE as a header, not once per document.
+        sess = _make_session(gs.Stage.COLLECTING_DOCS)
+        sess.license_name = "PPKP"
+        classes = ["Surat_Permohonan", "NPWP", "Pakta_Integritas"]
+        blocking = [
+            {"id": f"completeness:missing:{c}", "severity": "critical",
+             "message": f"Dokumen wajib belum diunggah: {c}"}
+            for c in classes
+        ]
+        # A non-completeness blocker must still render as its own flat bullet.
+        blocking.append({"id": "type:mismatch:f1", "severity": "high",
+                         "message": "Label dokumen tidak cocok: ktp.pdf"})
+        score = {"ok": False, "status": "needs_fix", "score_percent": 12,
+                 "summary": "s", "message": "m", "issues": [],
+                 "missing": classes, "blocking": blocking}
+
+        reply = gs._fmt_blocking_guidance(sess, score, blocking)
+
+        # The stem appears exactly once — as the header.
+        self.assertEqual(reply.lower().count("dokumen wajib"), 1)
+        self.assertIn("Dokumen wajib yang belum diunggah:", reply)
+        # Each class is its own bullet, underscores humanised.
+        for label in ("- Surat Permohonan", "- NPWP", "- Pakta Integritas"):
+            self.assertIn(label, reply)
+        self.assertNotIn("_", reply)
+        # The unrelated blocker survives, still masked + bulleted.
+        self.assertIn("- Label dokumen tidak cocok: ktp.pdf", reply)
+        # Still a hard block: no submit offer, no bypass.
+        self.assertNotIn("apa adanya", reply.lower())
+        # Docs are missing, so the officer escape is NOT dangled.
+        self.assertNotIn("minta tinjau petugas", reply.lower())
+
+    def test_blocking_dicts_without_an_id_still_render(self):
+        # A session written to Redis BEFORE this change has no `id` key (TTL is
+        # 6h, so these exist during the deploy window). They must degrade to the
+        # old flat bullet, never crash and never vanish.
+        sess = _make_session(gs.Stage.COLLECTING_DOCS)
+        legacy = [{"severity": "critical",
+                   "message": "Dokumen wajib belum diunggah: NPWP"}]
+        reply = gs._fmt_blocking_guidance(
+            sess, {"ok": False, "score_percent": 12, "missing": ["NPWP"],
+                   "blocking": legacy}, legacy)
+        self.assertIn("- Dokumen wajib belum diunggah: NPWP", reply)
+
     def test_escape_is_offered_only_once_uploading_is_finished(self):
         # The two halves of the rule, side by side. Same sub-threshold score;
         # the ONLY difference is whether a required document is still missing.

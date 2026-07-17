@@ -72,7 +72,10 @@ def _result(
 ) -> SuitabilityResult:
     return SuitabilityResult(
         completeness=completeness
-        or CompletenessSection(score=1.0, missing=[], required=["KTP", "NIB"]),
+        or CompletenessSection(
+            score=1.0, missing=[], required=["KTP", "NIB"],
+            needed_classes=["KTP", "NIB"],
+        ),
         type_correctness=type_correctness or [],
         suitability=suitability or [],
         compatibility_findings=[],
@@ -112,14 +115,62 @@ class TestRenderScoreMessage(unittest.TestCase):
         res = _result(
             overall=0.86,
             completeness=CompletenessSection(
-                score=0.857, missing=["NPWP"], required=["KTP", "NIB", "NPWP"]
+                score=0.857, missing=["NPWP"], required=["KTP", "NIB", "NPWP"],
+                needed_classes=["KTP", "NIB", "NPWP"],
             ),
         )
         msg = cs.render_score_message(res, license_name="Izin Penelitian")
         self.assertIn("Izin Penelitian", msg)
         self.assertIn("86%", msg)
-        # 3 required, 1 missing → 2/3 lengkap.
+        # 3 needed classes, 1 missing → 2/3 lengkap.
         self.assertIn("2/3", msg)
+
+    def test_denominator_is_needed_classes_not_raw_requirements(self):
+        """The count MUST be rendered against the same set the score used.
+
+        Regression: `_completeness_line` used len(required) — the raw
+        requirement STRINGS — while `missing` holds canonical DOC_CLASSES and
+        the score's denominator is len(needed_classes). A requirement that maps
+        to no known class is absent from needed_classes (so it can never appear
+        in `missing`), yet it inflated the raw-string total — and because
+        present was computed by SUBTRACTION it was silently counted as PRESENT.
+        8 requirement strings, 7 mappable, only a KTP uploaded → the score is
+        1/7 (14%) but the line used to read "2/8 lengkap".
+        """
+        res = _result(
+            overall=0.143,
+            completeness=CompletenessSection(
+                score=0.143,
+                missing=["Pakta_Integritas", "Surat_Permohonan", "NIB",
+                         "Desain_Kapal", "Surat_Pesanan", "Spesifikasi_Alat_Tangkap"],
+                required=["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8-unmappable"],
+                needed_classes=["Pakta_Integritas", "Surat_Permohonan", "NIB", "KTP",
+                                "Desain_Kapal", "Surat_Pesanan",
+                                "Spesifikasi_Alat_Tangkap"],
+                unmapped_required=["r8-unmappable"],
+            ),
+        )
+        msg = cs.render_score_message(res)
+        self.assertIn("1/7 lengkap", msg)
+        self.assertNotIn("2/8", msg)
+        # The unmappable requirement is a real obligation — surfaced, not vanished.
+        self.assertIn("dicek petugas", msg)
+
+    def test_no_count_rendered_when_nothing_mapped(self):
+        """Zero mappable requirements → `missing` is empty because nothing was
+        CHECKED. Subtracting from len(required) used to print "3/3 lengkap"
+        directly under a 0% score. Render the note instead."""
+        res = _result(
+            overall=0.0,
+            completeness=CompletenessSection(
+                score=0.0, missing=[], required=["a", "b", "c"],
+                note="perlu pengecekan manual oleh petugas.",
+                needed_classes=[], unmapped_required=["a", "b", "c"],
+            ),
+        )
+        msg = cs.render_score_message(res)
+        self.assertNotIn("3/3", msg)
+        self.assertIn("petugas", msg)
 
     def test_type_mismatch_line(self):
         res = _result(
@@ -506,8 +557,26 @@ class TestEvidencePiiMasked(unittest.TestCase):
 
 
 class TestNoEmojiInScoreMessage(unittest.TestCase):
-    """FIX B — the rendered score message carries no emoji (plain-text status
-    bands + bullets only)."""
+    """FIX B, narrowed 2026-07-16 — NO DECORATIVE emoji in the score message.
+
+    The original rule was "no emoji at all". Live feedback asked for two things
+    that only look contradictory: "make it a check list emoji" for the read
+    documents, and "reduce the use of emoji" overall. The distinction is
+    FUNCTION, not count:
+
+      * a STATUS GLYPH carries meaning the text otherwise buries — ✅ read and
+        accepted, ⚠️ readable but needs attention, ❌ unreadable, 🧾 meterai.
+        Behind a flat "- " bullet a clean KTP and a mis-labelled one looked
+        identical, which is the whole reason the tester couldn't scan the list.
+      * a DECORATIVE emoji (🔎 on the ack, 👋 on the greeting) adds nothing and
+        is the noise the feedback objected to.
+
+    So: the four status glyphs are allowed ANYWHERE in the message; every other
+    emoji is still a failure. Keep this list closed — if it grows past a handful
+    the rule has stopped meaning anything.
+    """
+
+    _ALLOWED_STATUS_GLYPHS = ("✅", "⚠️", "❌", "🧾")
 
     _EMOJI = re.compile(
         "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
@@ -515,7 +584,20 @@ class TestNoEmojiInScoreMessage(unittest.TestCase):
     )
 
     def _assert_clean(self, text):
-        self.assertEqual(self._EMOJI.findall(text), [], f"emoji in: {text!r}")
+        stripped = text
+        for glyph in self._ALLOWED_STATUS_GLYPHS:
+            stripped = stripped.replace(glyph, "")
+        self.assertEqual(
+            self._EMOJI.findall(stripped), [],
+            f"decorative emoji (outside the status-glyph allowlist) in: {text!r}",
+        )
+
+    def test_status_glyphs_are_the_only_emoji_allowed(self):
+        """The allowlist is a ceiling, not a floor — a stray decorative emoji
+        must still fail even though ✅/⚠️/❌/🧾 are permitted."""
+        self._assert_clean("✅ *KTP* 🧾 meterai terlihat\n⚠️ *NIB*\n❌ tidak terbaca")
+        with self.assertRaises(AssertionError):
+            self._assert_clean("🔎 Dokumen sedang diperiksa")
 
     def test_full_message_is_emoji_free(self):
         res = _result(
@@ -622,21 +704,24 @@ class TestSelfExplainingScore(unittest.TestCase):
     def test_note_shown_when_complete_below_100(self):
         res = _result(
             overall=0.91,
-            completeness=CompletenessSection(score=1.0, missing=[], required=["KTP", "NIB"]),
+            completeness=CompletenessSection(score=1.0, missing=[], required=["KTP", "NIB"],
+                                        needed_classes=["KTP", "NIB"]),
         )
         self.assertIn(self._NOTE, cs.render_score_message(res))
 
     def test_note_absent_when_docs_missing(self):
         res = _result(
             overall=0.8,
-            completeness=CompletenessSection(score=0.6, missing=["NPWP"], required=["KTP", "NIB", "NPWP"]),
+            completeness=CompletenessSection(score=0.6, missing=["NPWP"], required=["KTP", "NIB", "NPWP"],
+                                        needed_classes=["KTP", "NIB", "NPWP"]),
         )
         self.assertNotIn(self._NOTE, cs.render_score_message(res))
 
     def test_note_absent_at_100(self):
         res = _result(
             overall=1.0,
-            completeness=CompletenessSection(score=1.0, missing=[], required=["KTP", "NIB"]),
+            completeness=CompletenessSection(score=1.0, missing=[], required=["KTP", "NIB"],
+                                        needed_classes=["KTP", "NIB"]),
         )
         self.assertNotIn(self._NOTE, cs.render_score_message(res))
 

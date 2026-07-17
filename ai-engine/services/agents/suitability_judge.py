@@ -156,6 +156,16 @@ class CompletenessSection:
     missing: list[str]            # required doc types absent from the upload set
     required: list[str]           # DOCUMENT requirements only (procedural notes excluded)
     note: Optional[str] = None    # set when the registry was unavailable
+    # The canonical DOC_CLASSES the registry's `required` strings mapped to —
+    # THE denominator `score` is computed against. `required` is the raw
+    # requirement-string list and has a DIFFERENT cardinality: requirements that
+    # `_requirement_implies_class` cannot map are dropped here. Any surface that
+    # renders "X/N lengkap" MUST count against this list, never len(required),
+    # or unmappable requirements silently read as satisfied.
+    needed_classes: list[str] = field(default_factory=list)
+    # Requirement strings that mapped to NO known class — real obligations BIMA
+    # cannot check automatically. They gate nothing; surface them to the officer.
+    unmapped_required: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -582,20 +592,57 @@ _SUITABILITY_SCHEMA: dict[str, Any] = {
 }
 
 
-def _suitability_prompt(requirement: str) -> str:
-    """Per-call prompt — embeds the requirement text verbatim."""
+def _suitability_prompt(requirement: str, expected_class: Optional[str] = None) -> str:
+    """Per-call prompt — embeds the requirement text verbatim.
+
+    Scoped to what a single document can physically evidence. Registry
+    requirements routinely name a ROLE the page never states — PKPP's line is
+    «KTP Pemilik / Penanggung Jawab Perusahaan», and a KTP shows identity, never
+    that its holder owns a company. Asked "does this satisfy that?", the model
+    answered honestly — "plausibly relevant but missing a key detail" = partial —
+    and BIMA rendered a valid, correct KTP as "KTP kurang lengkap" (live
+    2026-07-16). The document was never the problem; the question was impossible.
+
+    So: the type half of the requirement is already settled by
+    `detect_doc_type`, and role/relationship qualifiers are the officer's job.
+    This prompt asks ONLY whether the document itself is a complete, readable
+    instance of what was asked for.
+    """
     safe_req = (requirement or "").strip().replace("\n", " ")
-    return (
-        f"Given this requirement text for an Indonesian permit application:\n"
-        f"  «{safe_req}»\n\n"
-        f"Does the attached document satisfy that requirement? "
-        f"Reply with judgement = 'match' (clearly satisfies), 'partial' "
-        f"(plausibly relevant but missing a key detail), or 'mismatch' "
-        f"(the document is unrelated or contradicts the requirement). "
-        f"Quote one short piece of evidence from the document, and a "
-        f"0.0-1.0 confidence score. Be strict — a KTP does not satisfy "
-        f"'Surat Domisili' even if both contain an address."
-    )
+    lines = [
+        "Given this requirement text for an Indonesian permit application:",
+        f"  «{safe_req}»",
+        "",
+    ]
+    if expected_class:
+        lines.append(
+            f"The document's TYPE has ALREADY been verified separately as "
+            f"{expected_class}. Do NOT re-judge what kind of document this is — "
+            f"judge only whether its CONTENT satisfies the requirement."
+        )
+        lines.append("")
+    lines += [
+        "JUDGE ONLY WHAT THIS DOCUMENT CAN PHYSICALLY SHOW.",
+        "A requirement often names a role, relationship or status that the "
+        "document itself never states — e.g. «KTP Pemilik / Penanggung Jawab "
+        "Perusahaan»: a KTP proves identity, it can never show that the holder "
+        "is a company's owner. A human officer verifies those facts against "
+        "other records; you cannot, and must not penalise the document for it.",
+        "",
+        "  'match'    — the document is a complete, readable instance of what "
+        "the requirement asks for. Answer this EVEN IF a role/relationship "
+        "qualifier in the requirement text cannot be confirmed from the page.",
+        "  'partial'  — the DOCUMENT ITSELF is deficient: a page is missing, a "
+        "field is cut off or blank, a required signature/meterai is absent, or "
+        "it is too blurred to read in part.",
+        "  'mismatch' — the document is unrelated to the requirement or "
+        "contradicts it. Be strict here: a KTP does not satisfy 'Surat "
+        "Domisili' even though both carry an address.",
+        "",
+        "Quote one short piece of evidence from the document, and give a "
+        "0.0-1.0 confidence score.",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -673,8 +720,14 @@ async def detect_doc_type(doc: UploadedDoc) -> TypeCorrectnessFinding:
 async def judge_suitability(
     requirement: str,
     doc: UploadedDoc,
+    expected_class: Optional[str] = None,
 ) -> SuitabilityFinding:
     """Run the suitability prompt for one (requirement, doc) pair.
+
+    `expected_class` is the DOC_CLASS the requirement implies — already resolved
+    by `_match_doc_for_requirement` to pair them. Passing it in stops the prompt
+    re-asking a question `detect_doc_type` has already answered, and lets it say
+    so explicitly. Optional so existing callers/tests keep working.
 
     Returns judgement="unknown" with evidence note on Gemini failure.
     Never raises.
@@ -692,7 +745,7 @@ async def judge_suitability(
     parsed = await extract_structured(
         image_bytes=doc.content,
         mime_type=doc.mime_type,
-        prompt=_suitability_prompt(requirement),
+        prompt=_suitability_prompt(requirement, expected_class),
         response_schema=_SUITABILITY_SCHEMA,
     )
 
@@ -760,9 +813,13 @@ def _completeness(
     # Build the set of canonical classes the registry implies.
     needed_classes: list[str] = []
     seen_set: set[str] = set()
+    unmapped: list[str] = []
     for req in required:
         cls = _requirement_implies_class(req)
-        if cls and cls not in seen_set:
+        if not cls:
+            unmapped.append(req)
+            continue
+        if cls not in seen_set:
             needed_classes.append(cls)
             seen_set.add(cls)
 
@@ -787,6 +844,8 @@ def _completeness(
                 "Persyaratan tercatat tidak bisa dipetakan ke jenis dokumen "
                 "yang dikenal — perlu pengecekan manual oleh petugas."
             ),
+            needed_classes=[],
+            unmapped_required=unmapped,
         )
 
     present = total - len(missing)
@@ -794,11 +853,32 @@ def _completeness(
         score=round(present / total, 3),
         missing=missing,
         required=required,
+        needed_classes=needed_classes,
+        unmapped_required=unmapped,
     )
 
 
-def _type_avg_score(findings: list[TypeCorrectnessFinding]) -> float:
-    """Average match-with-confidence across uploaded docs. 0.0 when none."""
+def _type_avg_score(
+    findings: list[TypeCorrectnessFinding], n_required: int = 0
+) -> float:
+    """Match-with-confidence as a fraction of the REQUIRED set.
+
+    `n_required` is the count of canonical DOC_CLASSes the registry implies —
+    `CompletenessSection.needed_classes`, the same denominator `completeness`
+    uses. It is NOT len(requirements): the registry is free-text Indonesian and
+    routinely maps 8 requirement strings onto ~3 classes.
+
+    Averaging over `findings` alone (what happened to ARRIVE) was the 58%-for-
+    1-of-8 bug: a document that was never uploaded produced no finding, so it
+    was omitted from the mean instead of counted as a zero. One good KTP then
+    scored ~0.95 here and banked the full 0.25 weight while 7 requirements were
+    absent. Now an un-uploaded document scores ZERO, exactly like completeness.
+
+    `max()` matters twice: extra/supporting docs beyond the required set must not
+    dilute a complete packet, and it makes this a provable no-op at
+    completeness == 1.0 (docs >= classes ⇒ denominator unchanged), which is what
+    keeps the 0.85 hard gate calibrated exactly as before.
+    """
     if not findings:
         return 0.0
     score = 0.0
@@ -815,10 +895,15 @@ def _type_avg_score(findings: list[TypeCorrectnessFinding]) -> float:
                 score += 0.5
             else:
                 score += 0.0
-    return round(score / n, 3) if n else 0.0
+    denom = max(n, n_required)
+    return round(score / denom, 3) if denom else 0.0
 
 
-def _suitability_avg_score(findings: list[SuitabilityFinding]) -> float:
+def _suitability_avg_score(
+    findings: list[SuitabilityFinding], n_required: int = 0
+) -> float:
+    """Suitability as a fraction of the REQUIRED set — see `_type_avg_score`
+    for why the denominator is `needed_classes` and not what arrived."""
     if not findings:
         return 0.0
     weights = {"match": 1.0, "partial": 0.5, "mismatch": 0.0, "unknown": 0.5}
@@ -827,7 +912,8 @@ def _suitability_avg_score(findings: list[SuitabilityFinding]) -> float:
     for f in findings:
         n += 1
         total += weights.get(f.judgement, 0.5) * max(0.5, f.confidence)
-    return round(total / n, 3) if n else 0.0
+    denom = max(n, n_required)
+    return round(total / denom, 3) if denom else 0.0
 
 
 def _build_issues(
@@ -1009,6 +1095,8 @@ def _match_doc_for_requirement(
     needed = _requirement_implies_class(requirement)
     if needed is None:
         return None
+    # NOTE: callers that need the class use `_requirement_implies_class`
+    # directly — see judge_submission, which threads it into the prompt.
     finding_by_id = {f.file_id: f for f in type_findings}
     # First pass — detected type matches.
     for d in docs:
@@ -1057,17 +1145,21 @@ async def judge_submission(
     # We only ask Gemini when we can pair a DOCUMENT requirement with a doc;
     # un-paired requirements are surfaced as completeness gaps, not
     # suitability questions. Procedural notes are excluded entirely.
-    suitability_tasks: list[tuple[str, UploadedDoc]] = []
+    suitability_tasks: list[tuple[str, UploadedDoc, Optional[str]]] = []
     for req in requirements:
         doc = _match_doc_for_requirement(req, documents, type_findings)
         if doc is not None:
-            suitability_tasks.append((req, doc))
+            # The class is what paired them in the first place; pass it so the
+            # prompt doesn't re-litigate the document TYPE (already settled by
+            # detect_doc_type) and can scope the question to CONTENT only.
+            suitability_tasks.append((req, doc, _requirement_implies_class(req)))
 
     suit_findings: list[SuitabilityFinding] = []
     if suitability_tasks:
         suit_findings = list(
             await asyncio.gather(*[
-                judge_suitability(req, d) for req, d in suitability_tasks
+                judge_suitability(req, d, expected_class=cls)
+                for req, d, cls in suitability_tasks
             ])
         )
 
@@ -1075,8 +1167,12 @@ async def judge_submission(
         documents, requirements, registry_note,
         detected_classes={f.detected_type for f in type_findings},
     )
-    type_score = _type_avg_score(type_findings)
-    suit_score = _suitability_avg_score(suit_findings)
+    # ONE denominator for all three dimensions: the canonical classes the
+    # registry implies. Anything absent scores zero rather than being excluded
+    # from the mean (the 58%-for-1-of-8 bug).
+    _n_required = len(completeness.needed_classes or [])
+    type_score = _type_avg_score(type_findings, n_required=_n_required)
+    suit_score = _suitability_avg_score(suit_findings, n_required=_n_required)
 
     # Unified score — completeness dominates by design.
     overall = round(

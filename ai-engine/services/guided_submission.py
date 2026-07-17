@@ -773,7 +773,7 @@ _SCORING_ACK_ENABLED = os.getenv("BIMA_SCORING_ACK_ENABLED", "true").lower() in 
 _SCORING_ACK_DELAY_SECONDS = float(os.getenv("BIMA_SCORING_ACK_DELAY_SECONDS", "2.5"))
 _SCORING_ACK_TEXT = os.getenv(
     "BIMA_SCORING_ACK_TEXT",
-    "🔎 Dokumen Anda sedang saya periksa, mohon tunggu sebentar ya…",
+    "Dokumen Anda sedang saya periksa, mohon tunggu sebentar ya…",
 )
 
 
@@ -935,7 +935,9 @@ async def _run_content_score(sess: SubmissionSession) -> Optional[dict[str, Any]
     # flow refuses to offer submission and "ajukan apa adanya" can't bypass
     # them (soft/content-only shortfalls are NOT included here).
     blocking = suitability_judge.blocking_issues(result)
-    blocking_msgs = [{"severity": i.severity, "message": i.title} for i in blocking]
+    blocking_msgs = [
+        {"id": i.id, "severity": i.severity, "message": i.title} for i in blocking
+    ]
     logger.info(
         "Guided-submission content-score | user=%s | license_id=%s | "
         "percent=%d | ready=%s | issues=%d | blocking=%d",
@@ -1172,7 +1174,7 @@ def _blocking_from_score(score: Optional[dict[str, Any]]) -> list[dict[str, str]
         try:
             from services.agents import suitability_judge
             return [
-                {"severity": i.severity, "message": i.title}
+                {"id": i.id, "severity": i.severity, "message": i.title}
                 for i in suitability_judge.blocking_issues(result)
             ]
         except Exception:  # pragma: no cover — defensive; fall back to the trim
@@ -1225,20 +1227,40 @@ def _fmt_blocking_guidance(
     COLLECTING_DOCS (the caller sets the stage). Officer-grounded, warm,
     WhatsApp-friendly, emoji-free.
     """
-    pct = score.get("score_percent") if isinstance(score, dict) else None
     lines: list[str] = []
-    head = "Baik Bapak/Ibu, dokumennya sudah kami terima"
-    if pct is not None:
-        head += f", dengan estimasi kelayakan {pct}%"
-    head += ". Namun masih ada yang perlu dilengkapi/diperbaiki sebelum bisa diajukan:"
-    lines.append(head)
+    # No percentage in the head. When there ARE hard blockers the list below is
+    # the answer, and a bare "58%" on a 1-of-8 packet is noise. When there are
+    # none, the scorer's own message is appended below and it owns the headline
+    # (title + "*Skor kelayakan: N%*") — restating it here printed it twice.
+    lines.append(
+        f"Baik {_salutation(sess)}, dokumennya sudah kami terima. Masih ada "
+        "yang perlu dilengkapi/diperbaiki sebelum bisa diajukan:"
+    )
 
     lines.append("")
     if blocking:
+        # The N "Dokumen wajib belum diunggah: X" issues are ONE logical group —
+        # the sentence stem belongs in a header printed once, not repeated per
+        # bullet. Group on the issue id (a stable machine key), never on the
+        # Indonesian prose in the title. The doc class is the id's tail and is
+        # drawn from the closed DOC_CLASSES vocabulary, so it carries no PII and
+        # needs no masking; every other issue still renders via mask_pii.
+        missing_docs: list[str] = []
+        other: list[str] = []
         for b in blocking:
+            issue_id = str(b.get("id", ""))
+            if issue_id.startswith("completeness:missing:"):
+                missing_docs.append(issue_id.split(":", 2)[-1].replace("_", " "))
+                continue
             msg = mask_pii(str(b.get("message", "")).strip())
             if msg:
-                lines.append(f"- {msg}")
+                other.append(msg)
+        if missing_docs:
+            lines.append("Dokumen wajib yang belum diunggah:")
+            lines += [f"- {d}" for d in missing_docs]
+            if other:
+                lines.append("")
+        lines += [f"- {m}" for m in other]
     elif isinstance(score, dict) and score.get("message"):
         # Sub-threshold with no hard blocker — the scorer's own prose is the
         # most specific thing we have to show.
@@ -1271,6 +1293,31 @@ def _fmt_blocking_guidance(
     return "\n".join(lines).rstrip()
 
 
+def _salutation(sess: SubmissionSession) -> str:
+    """'Pak Budi' / 'Bu Siti' once the KTP has been read — 'Bapak/Ibu' before.
+
+    Both inputs come from the KTP Vision extraction in
+    `_extract_fields_from_documents`, so this only resolves AFTER the upload
+    burst is scored. Every pre-upload message keeps the neutral form on purpose:
+    the only name available earlier is the WhatsApp display name, which the
+    sender sets themselves. Addressing someone by an unverified name — or
+    guessing their honorific from it — is exactly the kind of small invention
+    this product does not make. When gender is absent we degrade to
+    "Bapak/Ibu <Nama>" rather than guess Pak or Bu.
+    """
+    name = (sess.fields.get("applicant_name") or "").strip()
+    if not name:
+        return "Bapak/Ibu"
+    # KTP names are ALL CAPS; take the first token as the address form.
+    first = name.split()[0].title()
+    gender = (sess.fields.get("gender") or "").upper()
+    if "LAKI" in gender:
+        return f"Pak {first}"
+    if "PEREMPUAN" in gender or "WANITA" in gender:
+        return f"Bu {first}"
+    return f"Bapak/Ibu {first}"
+
+
 def _fmt_confirm_message(sess: SubmissionSession, score: Optional[dict[str, Any]]) -> str:
     """The consolidated, warm reply after the upload burst settles.
 
@@ -1287,28 +1334,18 @@ def _fmt_confirm_message(sess: SubmissionSession, score: Optional[dict[str, Any]
         # session at COLLECTING_DOCS so a re-upload/typed fix continues the flow.
         return _fmt_blocking_guidance(sess, score, blocking)
 
-    pct = score.get("score_percent") if isinstance(score, dict) else None
     complete = bool(score and score.get("ok"))
 
-    lines: list[str] = []
-    if complete:
-        head = (
-            "Baik Bapak/Ibu, semua dokumen wajib sudah lengkap & sesuai "
-            "persyaratan"
-        )
-        if pct is not None:
-            head += f", dengan estimasi kelayakan {pct}%"
-        head += "."
-        lines.append(head)
-    else:
-        head = "Baik Bapak/Ibu, dokumen sudah kami terima"
-        if pct is not None:
-            head += f", dengan estimasi kelayakan {pct}%"
-        head += "."
-        lines.append(head)
+    # Pure lead-in — no percentage, no completeness claim. `citizen_scorer.
+    # render_score_message` owns the headline: it already opens with its own
+    # title ("*Hasil pemeriksaan dokumen X*"), its own "*Skor kelayakan: N%*"
+    # line and its own "*Kelengkapan dokumen wajib:* 8/8 lengkap" line. Restating
+    # the % here printed it twice (and the completeness claim a second time).
+    lines: list[str] = ["Baik Bapak/Ibu, dokumennya sudah saya baca. Ini hasil pemeriksaannya:"]
 
-    # The detailed per-document score message (completeness, type checks,
-    # suitability, issues) — already PII-masked + emoji-free by citizen_scorer.
+    # The detailed per-document score message (title, score, completeness, type
+    # checks, suitability, issues) — already PII-masked + emoji-free by
+    # citizen_scorer. Do NOT restate the percentage above or it prints twice.
     if score and score.get("message"):
         lines += ["", score["message"]]
 
