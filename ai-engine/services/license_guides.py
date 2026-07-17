@@ -16,6 +16,22 @@ from __future__ import annotations
 PPKP_LICENSE_ID = 459
 
 # Each requirement: key, label, kind ('generate'|'upload'), optional doc_type, note.
+#
+# `where` — WHO ISSUES an upload doc, for when the citizen asks "dimana saya bisa
+# dapat ...". It is OPTIONAL and deliberately sparse. The rule that keeps this
+# honest: **only name an issuer this guide already vouches for.** Every `where`
+# below restates an authority the `label` right next to it already asserts
+# (persetujuan_nama says "Ditjen Hubla"; siup_oss says "OSS") — so it is curated
+# fact being restructured, never a new claim.
+#
+# The omissions are the point. A ship's design drawing and the gear spec plainly
+# come from the galangan, but nothing here vouches for that, so they carry no
+# `where` and BIMA says it does not know and offers the officer instead. This is
+# a citizen being told where to obtain a government document: a plausible-sounding
+# wrong office sends a real person to the wrong building. An honest "saya belum
+# punya info itu" costs them one question to a human; a confident wrong answer
+# costs them a trip. Do NOT fill these in from general knowledge — add a `where`
+# only when someone who owns the process has confirmed it.
 _PPKP_REQUIREMENTS: list[dict] = [
     {"key": "pakta_integritas", "label": "Pakta Integritas", "kind": "generate",
      "doc_type": "pakta_integritas",
@@ -26,11 +42,13 @@ _PPKP_REQUIREMENTS: list[dict] = [
     {"key": "surat_pesanan", "label": "Surat Pesanan/Kontrak dengan galangan", "kind": "generate",
      "doc_type": "surat_pesanan",
      "note": "BIMA buatkan draf — Anda & galangan tanda tangani + e-meterai."},
-    {"key": "siup_oss", "label": "SIUP OSS (NIB/izin berusaha)", "kind": "upload"},
+    {"key": "siup_oss", "label": "SIUP OSS (NIB/izin berusaha)", "kind": "upload",
+     "where": "sistem OSS (yang menerbitkan NIB/izin berusaha Anda)"},
     {"key": "ktp", "label": "KTP Pemilik/Penanggung Jawab", "kind": "upload"},
     {"key": "gambar_kapal", "label": "Gambar rancang bangun kapal", "kind": "upload"},
     {"key": "spek_alat", "label": "Spesifikasi teknis alat penangkapan ikan", "kind": "upload"},
-    {"key": "persetujuan_nama", "label": "Surat Persetujuan nama kapal (Ditjen Hubla)", "kind": "upload"},
+    {"key": "persetujuan_nama", "label": "Surat Persetujuan nama kapal (Ditjen Hubla)", "kind": "upload",
+     "where": "Ditjen Perhubungan Laut (Hubla)"},
 ]
 
 # Extra data fields (beyond name/NIK/business_name BIMA already collects) the
