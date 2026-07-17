@@ -1179,15 +1179,22 @@ async def notify_officer_of_escalation(
     *,
     citizen_wa: Optional[str],
     license_name: Optional[str],
+    license_id: Optional[int] = None,
     score: Optional[dict[str, Any]] = None,
     blocking: Optional[list[dict[str, str]]] = None,
 ) -> bool:
     """Hand a gate-blocked citizen to a human officer.
 
     There is **no SIAP request** here — the packet never passed the gate, so
-    there is no ticket, no request_id, and nothing to resolve a flow-step
-    officer from. This goes to the configured fallback officer channel and the
-    officer takes it from there out-of-band.
+    there is no ticket and no request_id. But the officer is NOT a static env
+    phone: SIAP's Alur Izin (`license_approval_step`) hangs off the LICENCE, so
+    the desk that WOULD have received this submission is resolvable from
+    `license_id` alone (`resolve_license_first_officers`). For PKPP that is
+    sort_order=1, "Petugas SKPD" — the same verificator a real submission would
+    reach, read live from SIAP's roster, so a staffing change in SIAP needs no
+    redeploy and no env edit. BIMA_OFFICER_WA_PHONE remains only as a
+    last-resort fallback for when the SIAP DB is unreachable or the licence has
+    no officer desk.
 
     ⚠️ Known limit (WhatsApp): this is a FREE-FORM send, so it only reaches an
     officer inside Meta's 24h service window. No approved template exists for an
@@ -1199,17 +1206,19 @@ async def notify_officer_of_escalation(
         logger.info("escalation notify suppressed (flag off)")
         return False
 
-    wa = _demo_officer_wa()
-    tg = _demo_officer_tg()
-    if not wa and not tg:
-        logger.warning(
-            "escalation notify: no officer channel configured "
-            "(BIMA_OFFICER_WA_PHONE / BIMA_OFFICER_TG_CHAT)"
-        )
-        return False
+    # 1) Preferred: the licence's real first officer desk, straight from SIAP.
+    officer_whatsapps: list[str] = []
+    if license_id is not None:
+        try:
+            from services.siap_db import resolve_license_first_officers
 
-    channel = CHANNEL_WHATSAPP if wa else CHANNEL_TELEGRAM
-    channel_id = _normalize_wa(wa) if wa else tg
+            officer_whatsapps = await resolve_license_first_officers(int(license_id))
+        except Exception:
+            logger.exception(
+                "escalation notify: officer resolution crashed | license_id=%s",
+                license_id,
+            )
+            officer_whatsapps = []
 
     brief = _render_escalation_brief(
         citizen_wa=citizen_wa,
@@ -1217,6 +1226,41 @@ async def notify_officer_of_escalation(
         score=score,
         blocking=blocking,
     )
+
+    if officer_whatsapps:
+        # Make every resolved officer recognisable on their first reply, exactly
+        # as the submission path does — otherwise their answer would fall through
+        # to the citizen router until the next directory refresh.
+        global _officer_cache
+        _officer_cache |= {n for n in officer_whatsapps if n}
+        any_sent = False
+        for wa_num in officer_whatsapps:
+            sent_one = await _send(CHANNEL_WHATSAPP, wa_num, brief)
+            any_sent = any_sent or sent_one
+            logger.info(
+                "escalation notify (SIAP roster) | license_id=%s | officer=%s | "
+                "sent=%s | citizen=%s | blocking=%d",
+                license_id, _mask(wa_num), sent_one, _mask(citizen_wa or ""),
+                len(blocking or []),
+            )
+        return any_sent
+
+    # 2) Fallback: the configured demo channel (SIAP DB down / no officer desk).
+    wa = _demo_officer_wa()
+    tg = _demo_officer_tg()
+    if not wa and not tg:
+        logger.warning(
+            "escalation notify: no officer resolved from SIAP (license_id=%s) "
+            "AND no fallback channel configured "
+            "(BIMA_OFFICER_WA_PHONE / BIMA_OFFICER_TG_CHAT)",
+            license_id,
+        )
+        return False
+
+    channel = CHANNEL_WHATSAPP if wa else CHANNEL_TELEGRAM
+    channel_id = _normalize_wa(wa) if wa else tg
+
+    # `brief` was already rendered above — the fallback sends the same text.
     sent = await _send(channel, channel_id, brief)
     logger.info(
         "escalation notify | channel=%s | officer=%s | citizen=%s | sent=%s | "

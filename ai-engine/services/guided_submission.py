@@ -1598,6 +1598,9 @@ async def _escalate_to_officer(sess: SubmissionSession) -> str:
         sent = await officer_bridge.notify_officer_of_escalation(
             citizen_wa=_msisdn_from_user_id(sess.user_id),
             license_name=sess.license_name,
+            # The licence resolves the real verificator desk from SIAP's Alur
+            # Izin — no request_id needed, and no static officer phone.
+            license_id=sess.license_id,
             score=score,
             blocking=blocking,
         )
