@@ -2218,6 +2218,10 @@ async def _upload_docs_to_siap(sess: SubmissionSession, request_id: int) -> None
 
 # Human labels for the Formulir-Isian text field keys, for the citizen note.
 # Warm, plain-Indonesian labels (Bapak/Ibu audience).
+# A blank-field roll-call is a wall of text the citizen cannot act on anyway
+# (see _citizen_autofill_note). Name a few so the note stays concrete, then count.
+_MAX_BLANK_LABELS = 4
+
 _CITIZEN_FORM_FIELD_LABELS: dict[str, str] = {
     "nama_kapal": "Nama Kapal",
     "gt": "Ukuran Kapal (GT)",
@@ -2452,7 +2456,9 @@ async def _auto_fill_siap_form_for_citizen(
             len(filled_keys), len(blank_keys),
         )
 
-        note = _citizen_autofill_note(sess.license_name, filled_keys, blank_keys)
+        note = _citizen_autofill_note(
+            sess.license_name, filled_keys, blank_keys, _salutation(sess)
+        )
 
         # 6) Send ONE warm follow-up to the citizen. Route through the
         # channel-aware _send_to_user: sess.user_id is prefixed ('wa-{msisdn}' /
@@ -2471,33 +2477,52 @@ async def _auto_fill_siap_form_for_citizen(
 
 
 def _citizen_autofill_note(
-    license_name: Optional[str], filled_keys: list, blank_keys: list
+    license_name: Optional[str],
+    filled_keys: list,
+    blank_keys: list,
+    salutation: str = "Bapak/Ibu",
 ) -> str:
-    """Compose the warm citizen follow-up: BIMA auto-filled the Formulir Isian
-    from their documents; here are the filled fields; please complete the blanks.
-    Field labels only — never the VALUES."""
-    filled_labels = ", ".join(_citizen_form_label(k) for k in filled_keys)
-    blank_labels = ", ".join(_citizen_form_label(k) for k in blank_keys)
-    izin = license_name or "permohonan"
+    """The post-submit follow-up: BIMA auto-filled the SIAP Formulir Isian.
 
-    lines = [
-        f"Bapak/Ibu, kabar baik: BIMA telah mengisikan sebagian Formulir Isian "
-        f"{izin} di SIAP secara otomatis dari dokumen yang Bapak/Ibu kirimkan.",
-    ]
-    if filled_labels:
-        lines.append(f"Sudah terisi: {filled_labels}.")
-    if blank_labels:
-        lines.append(
-            f"Yang masih perlu Bapak/Ibu lengkapi: {blank_labels}. Mohon "
-            "kirimkan datanya kepada saya, atau isi langsung di SIAP agar "
-            "permohonan dapat segera diproses."
-        )
-    else:
-        lines.append(
-            "Seluruh data yang diperlukan sudah terisi. Petugas akan memeriksa "
-            "dan memproses permohonan Bapak/Ibu."
-        )
-    return " ".join(lines)
+    This lands as a SECOND message, moments after the ticket + track reply. It
+    cannot be merged into that reply: the ticket is returned synchronously while
+    the auto-fill runs fire-and-forget behind the SIAP upload + Vision pass, so
+    merging would make the citizen stare at nothing until SIAP answers. Since it
+    costs a whole extra notification, it earns that cost in two lines or not at
+    all — it never restates the ticket, the track link, or the requirements the
+    citizen just satisfied.
+
+    Two rules learned the hard way:
+
+    * Counts, not roll-calls. Enumerating every filled label rendered a second
+      wall of text listing work the citizen no longer had to think about.
+    * Never ask for data we cannot receive. `_submit` calls `_clear_session` and
+      leaves the session `Stage.DONE`, and every entry point bails on DONE — a
+      reply like "Nomor SIUP saya 123" falls through to the general chat handler
+      and never reaches form 560. The old copy's "kirimkan datanya kepada saya"
+      promised an intake that does not exist. The blanks are visible to the
+      officer, whose own review step is where they actually get resolved.
+
+    Field labels only — never the VALUES.
+    """
+    izin = license_name or "permohonan"
+    n_filled = len(filled_keys)
+    total = n_filled + len(blank_keys)
+
+    filled_note = (
+        f"{salutation}, {n_filled} dari {total} data di Formulir Isian {izin} "
+        f"sudah saya isikan otomatis di SIAP dari dokumen tadi."
+    )
+    if not blank_keys:
+        return f"{filled_note} Tidak ada lagi yang perlu dilengkapi."
+
+    shown = [_citizen_form_label(k) for k in blank_keys[:_MAX_BLANK_LABELS]]
+    rest = len(blank_keys) - len(shown)
+    labels = ", ".join(shown) + (f", dan {rest} lainnya" if rest else "")
+    return (
+        f"{filled_note} Yang belum terisi: {labels}. "
+        "Petugas akan memeriksanya saat verifikasi berkas."
+    )
 
 
 # ===========================================================================
