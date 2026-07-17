@@ -361,10 +361,20 @@ class _DraftGateBase(unittest.TestCase):
     get_applicant_form_id + get_form_value_properties so the gate is exercised."""
 
     def _stub(self, *, form_id=560, form_value=None, rendered_data=None,
-              rendered_classes=None):
+              rendered_classes=None, merged_form_values=None):
         self._patched = []
         self._calls: dict = {}
         _fv = dict(form_value) if form_value is not None else {}
+        # The licence-wide 560+768 merge. MUST be stubbed: the real
+        # `get_all_form_values` resolves the licence's bound form_ids with a live
+        # query against the SIAP database, so leaving it unstubbed made this
+        # suite pass where no SIAP DB exists and fail inside the container (where
+        # licence 459 really does resolve to [560, 768]).
+        # Default: the merge yields exactly the applicant form's values — i.e.
+        # Penomoran 768 is empty, the normal state before an officer assigns a
+        # No. PPKP. Pass `merged_form_values` to model 768 carrying data.
+        _merged = (dict(merged_form_values)
+                   if merged_form_values is not None else dict(_fv))
         _data = dict(rendered_data if rendered_data is not None else {})
         _classes = dict(rendered_classes if rendered_classes is not None else {})
 
@@ -384,8 +394,17 @@ class _DraftGateBase(unittest.TestCase):
             return form_id
 
         async def _get_form_value(fid, rid):
+            # Record EVERY read, not just the last. Keying by name alone is what
+            # hid this: the merge read 560 then 768, and 768 silently overwrote
+            # the entry — so "get_form_value was called" could not distinguish
+            # the applicant gate read from the licence-wide merge.
+            self._calls.setdefault("get_form_value_calls", []).append((fid, rid))
             self._calls["get_form_value"] = (fid, rid)
             return dict(_fv)
+
+        async def _get_all_form_values(license_id, request_id):
+            self._calls["get_all_form_values"] = (license_id, request_id)
+            return dict(_merged)
 
         async def _get_profile(profile_id):
             return {"full_name": "CASMO", "address": "Jl. Laut No. 1"}
@@ -417,6 +436,7 @@ class _DraftGateBase(unittest.TestCase):
         _do(stools_mod, "siap_resolve_request_id", _resolve_request_id)
         _do(sdb_mod, "get_applicant_form_id", _get_applicant_form_id)
         _do(sdb_mod, "get_form_value_properties", _get_form_value)
+        _do(sdb_mod, "get_all_form_values", _get_all_form_values)
         _do(sdb_mod, "get_person_profile_properties", _get_profile)
         _do(sdb_mod, "get_request_case_meta", _get_case_meta)
         _do(sdb_mod, "get_license_name", _get_license_name)
@@ -501,9 +521,57 @@ class TestDraftSkGate(_DraftGateBase):
         self.assertTrue(len(queue) >= 1)
         self.assertIn("render_output_docx", self._calls)
         self.assertIsNone(self._calls["render_output_docx"]["overrides"])
-        # get_form_value was never called (form_id None short-circuits).
-        self.assertNotIn("get_form_value", self._calls)
+        # What form_id=None actually short-circuits: the APPLICANT form is never
+        # read, so the gate cannot fire. It does NOT stop the licence-wide merge
+        # below — an earlier version of this test asserted that it did, which was
+        # true until get_all_form_values landed two hours later the same day.
+        self.assertEqual(self._calls.get("get_form_value_calls", []), [])
+        # The 560+768 merge is REQUEST-scoped, not form_id-scoped, and still
+        # runs: the officer's Penomoran form (768, no_ppkp) is a DIFFERENT form
+        # and its number belongs on the draft whether or not the applicant form
+        # is discoverable. It never raises and returns {} on a miss, so overrides
+        # degrades to None here.
+        self.assertEqual(self._calls.get("get_all_form_values"), (459, 777))
         self.assertIn("Rekomendasi", out)
+
+    def test_gate_reads_only_the_applicant_form(self):
+        # The companion to the above: when the applicant form IS discoverable it
+        # is read exactly once, for the gate, with the applicant form_id.
+        fv = {"nama_pemohon": "CASMO", "nama_kapal": "KM BERKAH", "gt": "12",
+              "thn_bangun": "2020", "tipe": "Motor", "alat": "Pukat",
+              "bahan": "Kayu", "galangan": "Rembang"}
+        self._run_draft(form_id=560, form_value=fv,
+                        rendered_data={"nama_pemohon": "CASMO"},
+                        rendered_classes={"nama_pemohon": st_mod.SOURCE_FORM})
+        self.assertEqual(self._calls.get("get_form_value_calls"), [(560, 777)])
+
+    def test_penomoran_number_reaches_the_draft(self):
+        # The contract the stale assertion was masking, and which nothing else
+        # covered: no_ppkp lives on the OFFICER's Penomoran form (768), not on
+        # the applicant's 560, and must reach the draft via the merge.
+        fv = {"nama_pemohon": "CASMO", "nama_kapal": "KM BERKAH", "gt": "12",
+              "thn_bangun": "2020", "tipe": "Motor", "alat": "Pukat",
+              "bahan": "Kayu", "galangan": "Rembang"}
+        merged = dict(fv, no_ppkp="503/PPKP/2026/001")
+        self._run_draft(
+            form_id=560, form_value=fv, merged_form_values=merged,
+            rendered_data={"nama_pemohon": "CASMO"},
+            rendered_classes={"nama_pemohon": st_mod.SOURCE_FORM})
+        overrides = self._calls["render_output_docx"]["overrides"]
+        self.assertEqual(overrides.get("no_ppkp"), "503/PPKP/2026/001")
+
+    def test_merge_failure_degrades_to_the_applicant_form(self):
+        # get_all_form_values returns {} on a miss/transient error; the draft
+        # must then still use the applicant form_value read for the gate rather
+        # than lose every field.
+        fv = {"nama_pemohon": "CASMO", "nama_kapal": "KM BERKAH", "gt": "12",
+              "thn_bangun": "2020", "tipe": "Motor", "alat": "Pukat",
+              "bahan": "Kayu", "galangan": "Rembang"}
+        self._run_draft(
+            form_id=560, form_value=fv, merged_form_values={},
+            rendered_data={"nama_pemohon": "CASMO"},
+            rendered_classes={"nama_pemohon": st_mod.SOURCE_FORM})
+        self.assertEqual(self._calls["render_output_docx"]["overrides"], fv)
 
 
 # ===========================================================================
