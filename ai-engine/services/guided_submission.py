@@ -165,10 +165,11 @@ def is_enabled() -> bool:
 
 _SUBMISSION_INTENT_PATTERN = re.compile(
     r"\b("
-    r"(?:mau|ingin|pengen|hendak|akan|tolong|bantu|bisa)\s+"
+    r"(?:mau|ingin|pengen|pingin|hendak|akan|rencana|tolong|bantu|bisa)\s+"
     r"(?:saya\s+)?"
     r"(?:di)?(?:ajukan|mengajukan|ajuin|daftar(?:kan)?|mendaftar(?:kan)?|"
-    r"buat(?:kan)?|urus(?:kan)?|proses(?:kan)?)"
+    r"buat(?:kan)?|bikin(?:kan)?|buka|urus(?:kan)?|ngurus|proses(?:kan)?|"
+    r"punya|mulai)"
     r"|"
     r"(?:apply\s+for|submit)\s+(?:a\s+|an\s+)?(?:new\s+)?"
     r"|"
@@ -196,6 +197,32 @@ def detect_submission_intent(message: str) -> bool:
         _SUBMISSION_INTENT_PATTERN.search(message)
         and _LICENSING_OBJECT_PATTERN.search(message)
     )
+
+
+def detect_soft_submission_intent(message: str) -> bool:
+    """A filing verb with NO licensing noun — "saya mau bikin kapal".
+
+    The strict gate above demands the citizen already say "izin"/"permohonan".
+    That inverts the entire product: **the citizen does not know the permit
+    name — that is what BIMA is for.** Requiring the bureaucratic word means
+    only people who already speak bureaucracy get the licensing flow, and
+    everyone else is quietly handed to the generic OSS/KBLI answer.
+
+    Verified live 2026-07-17: BIMA's own greeting invites "saya mau bikin
+    kapal", and that exact sentence scored False on the strict gate — so BIMA
+    replied with KBLI 50133 and pointed the citizen at oss.go.id, when it can
+    file the PKPP itself. Both examples the greeting advertises failed.
+
+    This is a PRE-FILTER, not a decision: it only says "worth one resolver
+    call". The caller MUST let `license_resolver` decide and fall through to
+    normal chat when nothing resolves — otherwise "saya mau bikin kopi"
+    hijacks a coffee question into the licensing flow.
+    """
+    if not message or not message.strip():
+        return False
+    if _LICENSING_OBJECT_PATTERN.search(message):
+        return False  # the strict gate already owns this
+    return bool(_SUBMISSION_INTENT_PATTERN.search(message))
 
 
 # A numeric pick from a disambiguation shortlist ("2").
@@ -1554,15 +1581,33 @@ def _ask_missing_field(sess: SubmissionSession, missing: list[str]) -> str:
 # State transitions
 # ===========================================================================
 
-async def _start_session(user_id: str, message: str) -> str:
+async def _start_session(
+    user_id: str, message: str, *, soft: bool = False
+) -> Optional[str]:
     """Begin a new guided submission: resolve the licence the citizen named via
-    the LLM resolver grounded in the whole SIAP catalogue."""
+    the LLM resolver grounded in the whole SIAP catalogue.
+
+    `soft=True` — the citizen never said "izin"; we inferred the intent from a
+    filing verb alone ("saya mau bikin kapal"). Then the RESOLVER is the
+    decision, not the regex: if it resolves nothing, return None and leave the
+    turn to normal chat rather than answering "which permit did you mean?" to
+    someone who was asking about coffee. A resolved-but-ambiguous result still
+    engages — showing the shortlist IS the right answer for a vague ask.
+    """
     from services.license_resolver import resolve_license_intent
 
     sess = SubmissionSession(user_id=user_id)
     lookup = await resolve_license_intent(message)
 
     if not lookup.get("found"):
+        if soft:
+            # Inferred intent + nothing resolved = we were probably wrong about
+            # the intent. Do not seize the conversation; no session is stored.
+            logger.info(
+                "Guided-submission soft intent — nothing resolved, deferring to "
+                "chat | user=%s", _mask(user_id),
+            )
+            return None
         sess.stage = Stage.RESOLVING_LICENSE
         await _put_session(sess)
         note = lookup.get("note", "")
@@ -3426,6 +3471,26 @@ async def maybe_handle(user_id: str, message: str) -> Optional[str]:
                 logger.exception("Guided-submission start crashed | user=%s", _mask(user_id))
                 await _clear_session(user_id)
                 return None
+        # A filing verb with no licensing noun — "saya mau bikin kapal". The
+        # citizen does not know the permit name; that is what BIMA is for. Let
+        # the RESOLVER decide: it engages when a licence resolves (locking a
+        # confident match, or showing the shortlist for a vague ask), and
+        # returns None when nothing does, leaving the turn to normal chat.
+        if detect_soft_submission_intent(msg):
+            logger.info(
+                "Guided-submission SOFT intent — asking the resolver | user=%s",
+                _mask(user_id),
+            )
+            try:
+                started = await _start_session(user_id, msg, soft=True)
+            except Exception:
+                logger.exception("Guided-submission soft start crashed | user=%s", _mask(user_id))
+                await _clear_session(user_id)
+                return None
+            if started is not None:
+                return started
+            await _clear_session(user_id)
+            return None
         return None
 
     # --- Active session ---

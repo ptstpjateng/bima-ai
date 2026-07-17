@@ -1197,5 +1197,91 @@ class TestRequirementQuestions(unittest.TestCase):
         self.assertIsNone(s.fields.get("applicant_name"))
 
 
+class TestGreetingPromiseIsHonoured(unittest.TestCase):
+    """BIMA's greeting invites "saya mau bikin kapal". The gate must accept it.
+
+    Live 2026-07-17: it did not. Both examples the greeting advertises scored
+    False, so BIMA answered with KBLI 50133 and pointed the citizen at
+    oss.go.id — deflecting to OSS the exact permit it can file itself. Copy
+    that promises a capability the code does not have is the same failure class
+    as a narrated action that never happened.
+    """
+
+    def test_the_greetings_own_examples_reach_the_licensing_flow(self):
+        from routers import aptana
+        for phrase in ["saya mau bikin kapal", "mau buka warung makan"]:
+            self.assertIn(phrase, aptana._GREETING_BODY,
+                          "greeting no longer advertises this — update the test")
+            self.assertTrue(
+                gs.detect_submission_intent(phrase)
+                or gs.detect_soft_submission_intent(phrase),
+                f"greeting invites {phrase!r} but the gate ignores it",
+            )
+
+    def test_colloquial_filing_verbs(self):
+        for t in ["saya mau bikin kapal, gimana ya", "mau bikin kapal",
+                  "pengen ngurus kapal", "saya mau buka warung makan"]:
+            self.assertTrue(gs.detect_soft_submission_intent(t), t)
+
+    def test_strict_gate_still_owns_explicit_asks(self):
+        for t in ["saya mau mengajukan izin PKPP", "mau urus izin kapal",
+                  "saya mau bikin izin kapal"]:
+            self.assertTrue(gs.detect_submission_intent(t), t)
+            # Soft must NOT also claim these — the strict gate owns them.
+            self.assertFalse(gs.detect_soft_submission_intent(t), t)
+
+    def test_soft_intent_is_a_prefilter_not_a_decision(self):
+        # Chatter with no filing verb never reaches the resolver.
+        for t in ["apa itu izin usaha", "halo", "terima kasih",
+                  "berapa lama prosesnya"]:
+            self.assertFalse(gs.detect_soft_submission_intent(t), t)
+
+
+class TestSoftIntentDefersToChat(unittest.TestCase):
+    """A soft intent that resolves nothing must NOT seize the conversation.
+
+    setUp is not optional: an earlier class's tearDown POPS
+    BIMA_GUIDED_SUBMISSION_ENABLED — a var the container itself supplies — so a
+    class without its own setUp passes alone and fails in the full run, with
+    `maybe_handle` short-circuiting to None on `is_enabled()`. Own the env here.
+    """
+
+    def setUp(self):
+        self._env = patch.dict(
+            os.environ, {"BIMA_GUIDED_SUBMISSION_ENABLED": "true"}, clear=False
+        )
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_unresolved_soft_intent_returns_none(self):
+        async def _no_match(message):
+            return {"found": False, "note": ""}
+
+        with patch("services.license_resolver.resolve_license_intent", new=_no_match):
+            r = _run(gs.maybe_handle("wa-soft-1", "saya mau bikin kopi susu"))
+        self.assertIsNone(r, "hijacked a non-licensing question into the flow")
+
+    def test_unresolved_soft_intent_stores_no_session(self):
+        async def _no_match(message):
+            return {"found": False, "note": ""}
+
+        with patch("services.license_resolver.resolve_license_intent", new=_no_match):
+            _run(gs.maybe_handle("wa-soft-2", "saya mau bikin kopi susu"))
+        self.assertFalse(_run(gs.has_active_session("wa-soft-2")))
+
+    def test_strict_unresolved_still_answers(self):
+        # An explicit "mau ajukan izin" that resolves nothing DOES get the
+        # "which permit?" reply — the citizen clearly asked for licensing.
+        async def _no_match(message):
+            return {"found": False, "note": ""}
+
+        with patch("services.license_resolver.resolve_license_intent", new=_no_match):
+            r = _run(gs.maybe_handle("wa-soft-3", "saya mau mengajukan izin"))
+        self.assertIsNotNone(r)
+        self.assertIn("nama izin", r.lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
