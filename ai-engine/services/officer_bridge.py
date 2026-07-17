@@ -1057,6 +1057,15 @@ async def notify_officer_of_submission(
         validation=validation,
     )
 
+    # Persist the score against the CASE, BEFORE either delivery branch below.
+    # It must land on BOTH paths: the flow-resolved officers (the live one) and
+    # the static env fallback. It was originally added only to the fallback
+    # branch — which never runs in production — so the key was never written and
+    # the Kabid still saw "Skor BIMA: -" on a fresh ticket, with no error to show
+    # for it. Placed here, after `validation` is final (documents_digest and all)
+    # and before any `return`, so there is exactly ONE persist site.
+    await _put_case_validation(request_id, validation)
+
     # --- Flow-based resolution (primary) -------------------------------------
     # Resolve the officer(s) who own the request's CURRENT approval step on
     # this izin (Privilege Izin ∩ the step's role), gated by the step's
@@ -1146,11 +1155,6 @@ async def notify_officer_of_submission(
     # Prefer WhatsApp when configured; Telegram otherwise.
     channel = CHANNEL_WHATSAPP if wa else CHANNEL_TELEGRAM
     channel_id = _normalize_wa(wa) if wa else tg
-
-    # Persist the score against the CASE before it is handed to any one officer.
-    # Their session is deleted when they forward; this copy is what every later
-    # desk reads (see notify_next_step).
-    await _put_case_validation(request_id, validation)
 
     sess = OfficerCaseSession(
         channel_id=channel_id,
