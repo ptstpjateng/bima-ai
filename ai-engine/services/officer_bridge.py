@@ -1416,6 +1416,14 @@ async def notify_next_step(request_id: int) -> bool:
             request_id=base_case.request_id,
             license_id=base_case.license_id,
             license_name=base_case.license_name,
+            # base_case carries BOTH of these from load_case_from_siap, and this
+            # constructor dropped them — so every desk AFTER the first ran with
+            # profile_id=None (draft_sk loses its profile-grounded identity) and
+            # step_stereotype=None (per-step template selection silently falls
+            # back, so the SIGNING desk would be handed a Rekomtek instead of
+            # the SK). Both are load-bearing exactly where they were missing.
+            profile_id=base_case.profile_id,
+            step_stereotype=base_case.step_stereotype,
             applicant_name=base_case.applicant_name,
             alamat=base_case.alamat,
             validation=validation,

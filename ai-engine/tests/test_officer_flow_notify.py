@@ -694,5 +694,93 @@ class TestSubmissionDocRefs(unittest.TestCase):
         self.assertEqual(out, [])
 
 
+class TestNextStepCarriesStepContext(unittest.TestCase):
+    """Every desk after the first ran without its step context.
+
+    load_case_from_siap sets profile_id ("grounds draft_sk identity on profile")
+    and step_stereotype ("per-step template selection"); the next-step-notify
+    constructor dropped BOTH. Live 2026-07-17: Lazuardi's session carried None
+    for each. step_stereotype is what distinguishes PENANDATANGANAN BERKAS from
+    REVIEW PERMOHONAN SKPD, i.e. the SK template from the Rekomtek — so the
+    signing desk would have been handed the wrong document.
+    """
+
+    def test_profile_id_and_stereotype_reach_the_next_desk(self):
+        saved: list = []
+
+        async def fake_put(sess):
+            saved.append(sess)
+
+        base = ob.OfficerCaseSession(
+            channel_id="628000000000",
+            channel=ob.CHANNEL_WHATSAPP,
+            ticket="000077769",
+            request_id=77769,
+            license_id=459,
+            license_name="PKPP",
+            profile_id=40209,
+            step_stereotype="PENANDATANGANAN BERKAS",
+            is_final_step=False,
+        )
+
+        async def fake_resolve(request_id):
+            return {"officer_whatsapps": ["628111222333"], "wa_active": True,
+                    "is_applicant_step": False, "group_id": 167}
+
+        async def fake_load(request_id):
+            return base
+
+        async def fake_val(request_id):
+            return {"score_percent": 92}
+
+        async def fake_notify(*a, **k):
+            return True
+
+        with patch.object(ob, "_put_session", new=fake_put), \
+             patch("services.siap_db.resolve_step_officers", new=fake_resolve), \
+             patch.object(ob, "load_case_from_siap", new=fake_load), \
+             patch.object(ob, "_get_case_validation", new=fake_val), \
+             patch.object(ob, "_send_officer_notify", new=fake_notify):
+            _run(ob.notify_next_step(77769))
+
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].profile_id, 40209,
+                         "profile_id dropped — draft_sk loses profile grounding")
+        self.assertEqual(saved[0].step_stereotype, "PENANDATANGANAN BERKAS",
+                         "step_stereotype dropped — signing desk gets the wrong template")
+
+
+class TestSigningRolesMatchRealSiap(unittest.TestCase):
+    """BIMA_SK_SIGNING_ROLES is DATA, not a constant.
+
+    Measured on Beta 2026-07-17: 42 steps carry a PENANDATANGANAN stereotype
+    across 10 roles; the shipped default matched 5. PKPP (459) signs as
+    "Kadin Perikanan", which was absent — so is_final_step was False for every
+    PKPP desk and signature mode could never fire. A name that does not exist
+    costs the signing desk its mode with NO error.
+    """
+
+    def test_pkpp_signing_role_is_configured(self):
+        from services import siap_db as sdb
+        self.assertIn("kadin perikanan", sdb._SK_SIGNING_ROLES,
+                      "PKPP signs as 'Kadin Perikanan' — without it the Kepala "
+                      "Dinas desk never gets signature mode")
+
+    def test_pkpp_signing_desk_is_final(self):
+        from services import siap_db as sdb
+        # PKPP's real Alur: sort 3 of 4 signs; sort 4 is the Pemohon Online
+        # SELESAI bookend, so the positional heuristic (cur >= mx) is False here.
+        # This is exactly why is_final_step keys on the ROLE.
+        self.assertTrue(sdb._is_signing_desk("Kadin Perikanan", 3, 4))
+        self.assertFalse(sdb._is_signing_desk("Petugas SKPD", 1, 4))
+        self.assertFalse(sdb._is_signing_desk("Kabid Perikanan Tangkap", 2, 4))
+
+    def test_applicant_role_is_never_a_signing_desk(self):
+        from services import siap_db as sdb
+        # 'Pemohon Online' owns a PENANDATANGANAN step in Beta. It must NEVER be
+        # configured — it would hand signature mode to an applicant.
+        self.assertNotIn("pemohon online", sdb._SK_SIGNING_ROLES)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
