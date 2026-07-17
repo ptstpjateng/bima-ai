@@ -291,6 +291,13 @@ async def aptana_inbound(path_secret: str, request: Request, background: Backgro
         if _was_recently_greeted(msisdn, window=120.0):
             logger.info("Bare greeting after welcome — skipped | user=%s", _mask(msisdn))
         else:
+            # CLAIM the number before sending. The guard used to be
+            # one-directional: _send_greeting marked, this branch did not — so
+            # when APTANA fired the inbound FIRST and the greeting webhook
+            # second, _send_greeting had nothing to check and the citizen got
+            # BOTH texts. That was the "double answer" in the feedback.
+            _mark_greeted(msisdn)
+            record_engagement(msisdn)   # a greeting reply counts as opt-in
             background.add_task(send_text, recipient_phone=msisdn, body=_SHORT_GREETING)
         return {"ok": True, "skipped": "bare_greeting"}
 
@@ -492,16 +499,29 @@ async def _process_inbound_media(msisdn: str, media, message_id: str | None = No
 # same shapes _extract_text_from_payload uses; in practice the trigger only
 # carries `phoneNumber` (the user) — `payload` may be empty or omitted.
 
-# Static welcome — no AI generation, no per-user RAG. Indonesian, Midnight
-# Government tone (calm, helpful, government-appropriate). One emoji max.
+# THE single welcome — no AI generation, no per-user RAG. Used by BOTH the
+# proactive greeting webhook and the inbound bare-greeting branch, so the two
+# paths can never disagree (they used to carry different text; see the dedup
+# note below).
+#
+# Rewritten 2026-07-16 from live feedback:
+#   * "Don't call UMKM" — the old text said "asisten AI perizinan UMKM", which
+#     mis-frames every applicant who isn't a micro-business. The tester was
+#     filing a fishing-vessel PKPP as a company. BIMA serves the licence, not a
+#     business size.
+#   * "Reduce the use of emoji" — the 👋 is gone.
+#   * "Use casual Indonesian" — "Mau ngurus apa nih?" not "Tanyakan saja apapun".
+#   * "More clear guidance" — the old examples were all OSS/KBLI, which hid the
+#     two things BIMA is actually best at: checking a packet BEFORE it is filed,
+#     and filing + tracking it. Say what BIMA can DO, not just what to type.
 _GREETING_BODY = (
-    "Halo! 👋 Saya BIMA, asisten AI perizinan UMKM dari DPMPTSP Jawa Tengah.\n\n"
-    "Tanyakan saja apapun tentang KBLI, syarat NIB, atau alur OSS RBA — saya "
-    "siap bantu 24 jam, dalam Bahasa Indonesia.\n\n"
-    "Coba mulai dengan:\n"
-    "• \"Saya mau buka warung makan, KBLI berapa?\"\n"
-    "• \"Apa syarat NIB untuk usaha mikro?\"\n"
-    "• \"Berapa lama proses izin OSS RBA?\""
+    "Halo! Saya BIMA, asisten perizinan DPMPTSP Jawa Tengah. Mau ngurus apa nih?\n\n"
+    "Yang bisa saya bantu:\n"
+    "• Cari izin yang pas dan syarat-syaratnya\n"
+    "• Periksa berkas dulu sebelum diajukan, biar nggak ditolak\n"
+    "• Ajukan izinnya dan pantau prosesnya\n\n"
+    "Ceritakan saja kebutuhannya — misalnya \"saya mau bikin kapal\" atau "
+    "\"mau buka warung makan\"."
 )
 
 # ---------------------------------------------------------------------------
@@ -571,10 +591,9 @@ def _is_bare_greeting(text: str) -> bool:
     return t.startswith("assalamu")
 
 
-_SHORT_GREETING = (
-    "Halo! 👋 Saya BIMA, asisten perizinan DPMPTSP Jawa Tengah. Ada yang bisa "
-    "saya bantu seputar KBLI, syarat NIB, atau status izin Anda?"
-)
+# The bare-greeting reply IS the welcome — one text, one voice. Keeping a second
+# shorter variant is what let the two paths drift apart in the first place.
+_SHORT_GREETING = _GREETING_BODY
 
 
 @router.post("/webhook/aptana/greeting/{path_secret}")
@@ -619,15 +638,28 @@ async def _send_greeting(msisdn: str, name: str | None = None) -> None:
         logger.info("APTANA greeting suppressed for officer | user=%s", _mask(msisdn))
         return
 
+    # The OTHER half of the dedup. APTANA can fire the inbound message event
+    # before this greeting event; the inbound bare-greeting branch now claims
+    # the number, so honour that claim here. Without this check the guard is
+    # one-directional and whichever path lost the race sent a second hello.
+    if _was_recently_greeted(msisdn):
+        logger.info(
+            "APTANA greeting skipped (already greeted via inbound) | user=%s",
+            _mask(msisdn),
+        )
+        return
+
     body = _GREETING_BODY
 
     # Personalise if APTANA provided a real display name.
     # Guard: APTANA's ReceiveGreetingRequest trigger may send the literal
     # string "{{name}}" when the variable is unavailable — detect this and
     # fall back to the generic greeting so citizens never see "Halo {{name}}!".
+    # Anchor is "Halo!" — the 👋 the old anchor relied on is gone, so matching
+    # on it would silently no-op and drop personalisation entirely.
     if name and not name.startswith("{{"):
         first_name = name.strip().split(" ")[0][:30]
-        body = body.replace("Halo! 👋", f"Halo {first_name}! 👋", 1)
+        body = body.replace("Halo!", f"Halo {first_name}!", 1)
 
     # Stamp this number as recently greeted BEFORE the send so the inbound
     # handler sees it even if the send is slow.

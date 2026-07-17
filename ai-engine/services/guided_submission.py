@@ -771,6 +771,12 @@ async def _send_to_user(user_id: str, text: str) -> bool:
 # (Decisions §9). One debounce task per session ⇒ at most one ack per burst.
 _SCORING_ACK_ENABLED = os.getenv("BIMA_SCORING_ACK_ENABLED", "true").lower() in ("1", "true", "yes")
 _SCORING_ACK_DELAY_SECONDS = float(os.getenv("BIMA_SCORING_ACK_DELAY_SECONDS", "2.5"))
+# Above this, the resolver's own confidence is trusted to pick the licence
+# instead of asking the citizen to read a numbered menu. Deliberately high: a
+# wrong auto-lock costs a correction, but a menu on an obvious request costs
+# every citizen a step. Env-overridable so it can be tuned without a deploy.
+_AUTOLOCK_CONFIDENCE = float(os.getenv("BIMA_AUTOLOCK_CONFIDENCE", "0.8") or "0.8")
+
 _SCORING_ACK_TEXT = os.getenv(
     "BIMA_SCORING_ACK_TEXT",
     "Dokumen Anda sedang saya periksa, mohon tunggu sebentar ya…",
@@ -1428,6 +1434,34 @@ async def _start_session(user_id: str, message: str) -> str:
         )
 
     matches = lookup.get("matches") or []
+
+    # A CONFIDENT best answer auto-locks, even when alternatives exist.
+    #
+    # This branch used to read `len(matches) > 1` alone, so the shortlist was
+    # shown whenever the model volunteered ANY alternative — which it almost
+    # always does. "Saya mau bikin kapal perikanan" is not ambiguous, and the
+    # resolver already knew that: it returns `confidence` and `best_license_id`,
+    # and the first entry of `matches` IS the best. The number was computed and
+    # discarded, so an obvious answer and a real toss-up were indistinguishable.
+    #
+    # The shortlist stays the safe default: it is shown when confidence is
+    # missing (None = no signal, never "low"), below threshold, or when the
+    # model itself was unsure. Locking is also cheap to undo — _lock_license
+    # names the licence and lists its requirements, and a citizen who wanted
+    # something else just says so (the pending_new_intent path re-resolves).
+    confidence = lookup.get("confidence")
+    if (
+        len(matches) > 1
+        and isinstance(confidence, (int, float))
+        and confidence >= _AUTOLOCK_CONFIDENCE
+    ):
+        logger.info(
+            "Guided-submission auto-locked a confident match | user=%s | "
+            "conf=%.2f | dropped_alternatives=%d",
+            _mask(sess.user_id), confidence, len(matches) - 1,
+        )
+        return await _lock_license(sess, matches[0])
+
     if len(matches) > 1:
         sess.candidates = matches[:8]
         sess.stage = Stage.RESOLVING_LICENSE

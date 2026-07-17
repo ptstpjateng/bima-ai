@@ -109,6 +109,21 @@ _RESOLVER_SYSTEM = (
 )
 
 
+def _coerce_confidence(raw: Any) -> Optional[float]:
+    """Gemini's self-reported 0..1 confidence, or None if it is unusable.
+
+    None means "no signal" and must never be read as low confidence — the
+    caller falls back to showing the shortlist, which is the safe default.
+    """
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if val != val or val < 0.0 or val > 1.0:   # NaN / out of range
+        return None
+    return round(val, 3)
+
+
 # ---------------------------------------------------------------------------
 # Fuzzy-fallback tokenizer
 # ---------------------------------------------------------------------------
@@ -205,7 +220,13 @@ async def resolve_license_intent(message: str) -> dict:
 
     msg = (message or "").strip()
     if not msg:
-        return {"found": False, "matches": [], "note": _NO_MATCH_NOTE}
+        # No message → no LLM call happened, so there is no confidence to
+        # report. None means "no signal" and the caller must show the shortlist.
+        return {
+            "found": False, "matches": [], "note": _NO_MATCH_NOTE,
+            "confidence": None,
+            "best_license_id": None,
+        }
 
     catalogue = await get_license_catalogue()
     if not catalogue:
@@ -263,7 +284,11 @@ async def resolve_license_intent(message: str) -> dict:
             "resolve_license_intent: LLM found no valid match | msg=%s conf=%s",
             _mask_msg(msg), llm_out.get("confidence"),
         )
-        return {"found": False, "matches": [], "note": _NO_MATCH_NOTE}
+        return {
+            "found": False, "matches": [], "note": _NO_MATCH_NOTE,
+            "confidence": _coerce_confidence(llm_out.get("confidence")),
+            "best_license_id": None,
+        }
 
     matches = [
         {
@@ -273,11 +298,26 @@ async def resolve_license_intent(message: str) -> dict:
         }
         for i in ordered_ids
     ]
+    conf = _coerce_confidence(llm_out.get("confidence"))
     logger.info(
         "resolve_license_intent: LLM path | msg=%s matches=%d conf=%s",
-        _mask_msg(msg), len(matches), llm_out.get("confidence"),
+        _mask_msg(msg), len(matches), conf,
     )
-    return {"found": True, "matches": matches, "note": None}
+    # `confidence` and `best_license_id` are RETURNED, not just logged. The
+    # model already tells us how sure it is and which id it means; flattening
+    # [best, *alternatives] into one undifferentiated `matches` list threw that
+    # away, so a confident single answer and a genuine toss-up looked identical
+    # downstream — and the caller, branching only on len(matches) > 1, showed a
+    # menu either way. "Saya mau bikin kapal perikanan" got a numbered list.
+    # Additive keys: existing callers that read only found/matches/note are
+    # unaffected.
+    return {
+        "found": True,
+        "matches": matches,
+        "note": None,
+        "confidence": conf,
+        "best_license_id": ordered_ids[0],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +423,11 @@ async def _fuzzy_fallback(message: str, *, reason: str) -> dict:
             "resolve_license_intent: fuzzy fallback no tokens | reason=%s msg=%s",
             reason, _mask_msg(message),
         )
-        return {"found": False, "matches": [], "note": _NO_MATCH_NOTE}
+        return {
+            "found": False, "matches": [], "note": _NO_MATCH_NOTE,
+            "confidence": None,  # fuzzy matcher: no model ran, so no confidence exists
+            "best_license_id": None,
+        }
 
     if not is_siap_db_configured():
         logger.info(
@@ -391,7 +435,11 @@ async def _fuzzy_fallback(message: str, *, reason: str) -> dict:
             "reason=%s msg=%s",
             reason, _mask_msg(message),
         )
-        return {"found": False, "matches": [], "note": _NO_MATCH_NOTE}
+        return {
+            "found": False, "matches": [], "note": _NO_MATCH_NOTE,
+            "confidence": None,  # fuzzy matcher: no model ran, so no confidence exists
+            "best_license_id": None,
+        }
 
     # Cap token count so a pathological message can't build a huge predicate.
     tokens = tokens[:6]
@@ -431,11 +479,19 @@ async def _fuzzy_fallback(message: str, *, reason: str) -> dict:
             reason, path, len(tokens), len(matches), _mask_msg(message),
         )
         if not matches:
-            return {"found": False, "matches": [], "note": _NO_MATCH_NOTE}
+            return {
+            "found": False, "matches": [], "note": _NO_MATCH_NOTE,
+            "confidence": None,  # fuzzy matcher: no model ran, so no confidence exists
+            "best_license_id": None,
+        }
         return {"found": True, "matches": matches, "note": None}
     except Exception:  # pragma: no cover — defensive; never break the caller
         logger.exception(
             "resolve_license_intent: fuzzy fallback query failed | reason=%s msg=%s",
             reason, _mask_msg(message),
         )
-        return {"found": False, "matches": [], "note": _NO_MATCH_NOTE}
+        return {
+            "found": False, "matches": [], "note": _NO_MATCH_NOTE,
+            "confidence": None,  # fuzzy matcher: no model ran, so no confidence exists
+            "best_license_id": None,
+        }
