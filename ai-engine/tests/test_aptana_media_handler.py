@@ -840,11 +840,24 @@ class TestOfficerNeverGetsCitizenGreeting(unittest.TestCase):
         self.assertEqual(_SENT, [])
 
     def test_greeting_endpoint_still_welcomes_citizen(self):
+        # The number must be un-greeted: _send_greeting now honours the inbound
+        # path's claim (the dedup is bidirectional), so a leftover mark from
+        # another test would suppress the welcome and fake a pass/fail.
+        aptana._recently_greeted.pop("628000111222", None)
         with patch.dict(os.environ, self._OFFICER_ENV, clear=False):
             with _capture_sends():
                 _run(aptana._send_greeting(msisdn="628000111222", name="Warga"))
         self.assertEqual(len(_SENT), 1)
-        self.assertIn("asisten AI perizinan UMKM", _SENT[0]["body"])
+        body = _SENT[0]["body"]
+        # Assert the CONTRACT, not the marketing copy. This test used to pin the
+        # literal "asisten AI perizinan UMKM" — the exact phrase the 2026-07-16
+        # feedback asked us to drop ("Don't call UMKM": it mis-frames every
+        # applicant who isn't a micro-business). A test that pins the copy makes
+        # the copy unfixable, so it pins the identity + personalisation instead.
+        self.assertIn("BIMA", body)
+        self.assertIn("DPMPTSP Jawa Tengah", body)
+        self.assertIn("Warga", body)          # display-name personalisation
+        self.assertNotIn("UMKM", body)        # the label must NOT come back
 
 
 # ===========================================================================
