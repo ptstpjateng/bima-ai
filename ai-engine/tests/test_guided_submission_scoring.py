@@ -315,6 +315,64 @@ class TestProcessCollectedDocuments(unittest.TestCase):
         self.assertIn("belum menerima", reply.lower())
 
 
+class TestEarnedDocPrep(unittest.TestCase):
+    """Doc-prep is EARNED, not the opening move.
+
+    It used to fire at lock time on `guide is not None and not sess.documents` —
+    and at lock time nothing has EVER arrived, so every curated licence opened by
+    demanding nine typed fields sight-unseen. Four of those seven required fields
+    (name, NIK, alamat, business_name) are read off the KTP/NIB the citizen is
+    about to send, so it also made people type what BIMA was about to read.
+    """
+
+    def setUp(self):
+        gs._sessions.clear()
+
+    def _ppkp(self, *, missing, name="BUDI", nik="3374012345678901", drafted=False):
+        sess = _make_session(gs.Stage.COLLECTING_DOCS)
+        sess.license_id = 459           # PPKP — the curated guide
+        sess.license_name = "PPKP"
+        sess.docs_drafted = drafted
+        sess.fields = {"applicant_name": name, "nik": nik} if name else {}
+        sess.last_score = {"ok": False, "score_percent": 40, "message": "m",
+                           "issues": [], "blocking": [], "missing": missing}
+        return sess
+
+    def test_no_identity_yet_does_not_demand_a_form(self):
+        # The bug: BIMA knew nothing and asked for nine fields anyway.
+        sess = self._ppkp(missing=["Pakta_Integritas"], name=None)
+        self.assertIsNone(_run(gs._maybe_offer_doc_prep(sess)))
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+
+    def test_identity_read_and_drafts_needed_enters_prep(self):
+        sess = self._ppkp(missing=["Pakta_Integritas", "Surat_Permohonan"])
+        reply = _run(gs._maybe_offer_doc_prep(sess))
+        self.assertIsNotNone(reply)
+        self.assertEqual(sess.stage, gs.Stage.PREPARING_DOCS)
+        # Leads with what BIMA already knows — never re-asks for name/NIK.
+        self.assertIn("KTP-nya sudah saya baca", reply)
+        self.assertNotIn(gs._DOC_FIELD_LABELS["applicant_name"], reply)
+        self.assertNotIn(gs._DOC_FIELD_LABELS["nik"], reply)
+
+    def test_citizen_already_uploaded_the_draftables_is_left_alone(self):
+        # Regression the suite caught: gating on identity ALONE dragged a citizen
+        # who had already uploaded their signed Pakta + Permohonan back into
+        # doc-prep, to draft documents sitting in their own packet.
+        sess = self._ppkp(missing=["Desain_Kapal"])   # nothing draftable missing
+        self.assertIsNone(_run(gs._maybe_offer_doc_prep(sess)))
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+
+    def test_latched_after_drafting(self):
+        sess = self._ppkp(missing=["Pakta_Integritas"], drafted=True)
+        self.assertIsNone(_run(gs._maybe_offer_doc_prep(sess)))
+
+    def test_non_curated_licence_untouched(self):
+        sess = self._ppkp(missing=["Pakta_Integritas"])
+        sess.license_id = 358           # no curated guide
+        self.assertIsNone(_run(gs._maybe_offer_doc_prep(sess)))
+        self.assertEqual(sess.stage, gs.Stage.COLLECTING_DOCS)
+
+
 class TestHardGate(unittest.TestCase):
     """BIMA-as-verificator: a BLOCKING issue (missing mandatory doc / wrong
     type / sign-doc missing meterai-ttd-stamp) must BLOCK submission — no

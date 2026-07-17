@@ -314,6 +314,10 @@ class SubmissionSession:
     documents: list[SessionDocument] = field(default_factory=list)
     # the last content-scoring result (so a re-confirm + officer brief reuse it).
     last_score: Optional[dict[str, Any]] = None
+    # True once BIMA has drafted the sign-required documents for this session.
+    # Latched so a later re-upload re-scores instead of dragging the citizen back
+    # through doc-prep.
+    docs_drafted: bool = False
     # True once this citizen has been handed to a human officer for review, so
     # a repeated ask doesn't spam the officer. Latched for the session's life;
     # the session stays at COLLECTING_DOCS so a later re-upload still self-heals
@@ -394,6 +398,7 @@ def _encode_session(sess: SubmissionSession) -> str:
         "documents": docs,
         "last_score": _score_for_redis(sess.last_score),
         "escalation_requested": sess.escalation_requested,
+        "docs_drafted": sess.docs_drafted,
         "pending_new_intent": sess.pending_new_intent,
         "last_doc_at": sess.last_doc_at,
         "ticket": sess.ticket,
@@ -433,6 +438,7 @@ def _decode_session(blob: str) -> SubmissionSession:
         documents=docs,
         last_score=raw.get("last_score"),
         escalation_requested=bool(raw.get("escalation_requested", False)),
+        docs_drafted=bool(raw.get("docs_drafted", False)),
         pending_new_intent=raw.get("pending_new_intent"),
         last_doc_at=float(raw.get("last_doc_at", 0.0) or 0.0),
         ticket=raw.get("ticket"),
@@ -1092,9 +1098,17 @@ async def _extract_fields_from_documents(sess: SubmissionSession) -> None:
 # Reply builders — warm Bahasa Indonesia, WhatsApp-friendly, NO emoji.
 # ===========================================================================
 
-def _fmt_requirements_invite(sess: SubmissionSession) -> str:
+def _fmt_requirements_invite(
+    sess: SubmissionSession, guide: Optional[dict[str, Any]] = None
+) -> str:
     """The warm requirements + upload invite shown right after the licence is
-    locked. No readiness gate, no field questions — straight to "upload here"."""
+    locked. No readiness gate, no field questions — straight to "upload here".
+
+    For a CURATED licence it also says which documents BIMA can draft, and asks
+    for the KTP first — because the drafts need real identity data, and asking
+    the citizen to type what a KTP already carries is work BIMA should absorb.
+    It is a promise of help, NOT a form: nothing is demanded here.
+    """
     lines = [
         f"Baik Bapak/Ibu, untuk mengajukan {sess.license_name} lewat SIAP "
         "Jateng ada beberapa syarat yang harus dipenuhi.",
@@ -1103,11 +1117,110 @@ def _fmt_requirements_invite(sess: SubmissionSession) -> str:
         lines += ["", "Berikut dokumen persyaratan yang perlu disiapkan:"]
         for r in sess.requirements[:10]:
             lines.append(f"- {r}")
-    lines += [
+
+    gen = list((guide or {}).get("generate_docs") or [])
+    if gen:
+        labels = ", ".join(d["label"] for d in gen)
+        lines += [
+            "",
+            f"Kabar baiknya, {len(gen)} di antaranya bisa *saya buatkan "
+            f"drafnya* — {labels}.",
+            "",
+            "Mulai saja dengan kirim *foto KTP* Bapak/Ibu dulu. Datanya saya "
+            "baca langsung dari KTP, jadi tidak perlu diketik ulang, lalu saya "
+            "buatkan drafnya. Dokumen lain boleh menyusul.",
+        ]
+    else:
+        lines += [
+            "",
+            "Pastikan semua dokumen tersedia ya, lalu silakan upload dokumennya "
+            "di sini (boleh beberapa sekaligus).",
+        ]
+    return "\n".join(lines).rstrip()
+
+
+async def _maybe_offer_doc_prep(sess: SubmissionSession) -> Optional[str]:
+    """Enter doc-prep ONLY once BIMA has the identity the drafts need.
+
+    The earned follow-up to the requirements invite. Returns the doc-prep reply
+    when it fires, or None to let the normal score/gate flow continue.
+
+    Gated on identity EXISTING (`applicant_name` + `nik`, read off the KTP), not
+    merely on "this licence is curated" — which was the old bug. By the time this
+    runs, `_extract_fields_from_documents` has already filled applicant_name /
+    nik / alamat from the KTP and business_name from the NIB, so `_ask_doc_fields`
+    asks only for what genuinely cannot be read (jabatan, nama kapal, galangan)
+    instead of the full nine.
+
+    Latched on `docs_drafted` so a later re-upload re-scores rather than dragging
+    the citizen back through doc-prep.
+    """
+    if sess.docs_drafted:
+        return None
+    from services import license_guides
+
+    guide = license_guides.get_guide(sess.license_id)
+    if guide is None:
+        return None
+    gen = list(guide.get("generate_docs") or [])
+    if not gen:
+        return None
+    if not (sess.fields.get("applicant_name") and sess.fields.get("nik")):
+        return None   # no identity yet — keep collecting, do not demand a form
+
+    # Only offer drafts the citizen actually still NEEDS. Caught by the suite:
+    # gating on identity alone dragged a citizen who had ALREADY uploaded their
+    # signed Pakta Integritas + Surat Permohonan back into doc-prep, to draft
+    # documents sitting in the packet. `missing` is the canonical DOC_CLASS list
+    # from completeness, mirrored onto the score dict so it survives a Redis
+    # rehydrate. doc_type "pakta_integritas" -> class "Pakta_Integritas".
+    missing_classes = {
+        str(c) for c in ((sess.last_score or {}).get("missing") or [])
+    }
+    draftable_missing = {
+        str(d.get("doc_type", "")).title() for d in gen if d.get("doc_type")
+    } & missing_classes
+    if not draftable_missing:
+        return None   # they already have them — nothing to draft
+
+    sess.stage = Stage.PREPARING_DOCS
+    missing = _missing_doc_fields(sess)
+    logger.info(
+        "Guided-submission -> doc-prep (identity read) | user=%s | license_id=%s "
+        "| still_missing=%d",
+        _mask(sess.user_id), sess.license_id, len(missing),
+    )
+    if missing:
+        sess.touch()
+        await _put_session(sess)
+        return _fmt_doc_prep_ready(sess, guide, missing)
+    return await _generate_and_send_docs(sess)
+
+
+def _fmt_doc_prep_ready(
+    sess: SubmissionSession, guide: dict[str, Any], missing: list[str]
+) -> str:
+    """Doc-prep intro AFTER the KTP is read — leads with what BIMA already knows,
+    then asks only for the gap. Replaces the old cold-open that demanded nine
+    fields sight-unseen."""
+    gen = guide.get("generate_docs") or []
+    labels = ", ".join(d["label"] for d in gen)
+    lines = [
+        f"Terima kasih {_salutation(sess)}, KTP-nya sudah saya baca — nama dan "
+        "NIK sudah saya catat, jadi tidak perlu diketik ulang.",
         "",
-        "Pastikan semua dokumen tersedia ya, lalu silakan upload dokumennya "
-        "di sini (boleh beberapa sekaligus).",
+        f"Sekarang saya bisa buatkan draf {len(gen)} dokumen: {labels}.",
+        "",
     ]
+    if len(missing) == 1:
+        lines.append(
+            f"Tinggal satu data lagi yang belum bisa saya baca dari dokumen: "
+            f"*{_DOC_FIELD_LABELS[missing[0]]}*?"
+        )
+    else:
+        lines.append("Ada beberapa data yang belum bisa saya baca dari dokumen:")
+        lines += [f"- {_DOC_FIELD_LABELS[k]}" for k in missing]
+        lines += ["", "Boleh kirim sekaligus dalam satu pesan."]
     return "\n".join(lines).rstrip()
 
 
@@ -1496,20 +1609,25 @@ async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
 
     sess.touch()
 
-    # Curated licences (e.g. PPKP) get the doc-prep co-pilot: BIMA drafts the
-    # sign-required documents, so collect their data + generate them BEFORE the
-    # upload step. Non-curated licences keep the plain upload flow untouched.
+    # Curated licences (e.g. PPKP) have a doc-prep co-pilot — BIMA drafts the
+    # sign-required documents. It used to fire HERE, gated only on
+    # `guide is not None and not sess.documents`: i.e. purely "is this licence
+    # curated, and has nothing arrived yet?". At lock time NOTHING has ever
+    # arrived, so every curated licence opened by demanding NINE typed fields
+    # before BIMA had seen a single document.
+    #
+    # That is backwards twice over. The citizen asked what the requirements ARE,
+    # not to fill a form. And BIMA reads applicant_name / nik / alamat off the
+    # KTP and business_name off the NIB — 4 of the 7 required fields — so the old
+    # order made people TYPE data BIMA was about to read anyway.
+    #
+    # So: requirements first, upload invite, and the draft offer becomes an
+    # EARNED follow-up once identity actually exists (see
+    # `_maybe_offer_doc_prep`, called after extraction). Non-curated licences
+    # were always on this path and are unchanged.
     from services import license_guides
 
     guide = license_guides.get_guide(sess.license_id)
-    if guide is not None and not sess.documents:
-        sess.stage = Stage.PREPARING_DOCS
-        await _put_session(sess)
-        logger.info(
-            "Guided-submission locked (curated -> doc-prep) | user=%s | license_id=%s",
-            _mask(sess.user_id), sess.license_id,
-        )
-        return _fmt_doc_prep_intro(sess, guide)
 
     sess.stage = Stage.COLLECTING_DOCS
 
@@ -1528,10 +1646,10 @@ async def _lock_license(sess: SubmissionSession, match: dict[str, Any]) -> str:
 
     await _put_session(sess)
     logger.info(
-        "Guided-submission licence locked | user=%s | license_id=%s",
-        _mask(sess.user_id), sess.license_id,
+        "Guided-submission licence locked | user=%s | license_id=%s | curated=%s",
+        _mask(sess.user_id), sess.license_id, guide is not None,
     )
-    return _fmt_requirements_invite(sess)
+    return _fmt_requirements_invite(sess, guide)
 
 
 async def _process_collected_documents(sess: SubmissionSession) -> str:
@@ -1576,6 +1694,13 @@ async def _process_collected_documents(sess: SubmissionSession) -> str:
             _mask(sess.user_id), missing,
         )
         return _ask_missing_field(sess, missing)
+
+    # EARNED doc-prep: identity now exists (read from the KTP), so this is the
+    # moment BIMA can genuinely help with the drafts — not at lock time, when it
+    # knew nothing and asked for nine fields.
+    prep = await _maybe_offer_doc_prep(sess)
+    if prep is not None:
+        return prep
 
     # HARD GATE — BIMA does not offer to submit a packet it judges unready.
     # Two ways to be unready, both non-overridable:
@@ -2925,6 +3050,11 @@ async def _generate_and_send_docs(sess: SubmissionSession) -> str:
             sent += 1
 
     sess.stage = Stage.COLLECTING_DOCS
+    # Latch: the drafts exist now, so a later re-upload re-scores instead of
+    # re-entering doc-prep. Set even when `sent == 0` — the PDFs were generated;
+    # a delivery failure is a delivery problem, and re-asking for the same nine
+    # fields would not fix it.
+    sess.docs_drafted = True
     sess.touch()
     await _put_session(sess)
     logger.info(
