@@ -185,5 +185,79 @@ class DocResendTests(unittest.TestCase):
         self.assertEqual(dr._parse_codes(""), {131053})  # default
 
 
+class TestGiveUpTellsTheOfficer(unittest.TestCase):
+    """Giving up silently leaves a lie standing.
+
+    Live 2026-07-17, Kabid 6285…6789: the copilot said "saya kirim sebagai PDF
+    (Rekomtek_000077769.pdf)" at 09:45:41 — that text goes out immediately —
+    then the media failed 131053 at :51, :57, :46:03 and doc_resend gave up. The
+    officer was left looking at a claim that a document had been sent, with no
+    document and no correction. A promise left standing after the action failed
+    is the same defect as never having tried.
+    """
+
+    def setUp(self):
+        dr._reset_for_tests()
+        self.sent: list = []
+
+        async def fake_send_text(recipient, body, **kw):
+            self.sent.append({"to": recipient, "body": body})
+            return True
+
+        self.p = patch("services.whatsapp_sender.send_text", new=fake_send_text)
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+        dr._reset_for_tests()
+
+    async def _exhaust(self, to="628999111222", link="https://x/dl/tok1",
+                       name="Rekomtek_000077769.pdf"):
+        dr.register(to, link, name)
+        # Two failures schedule the two allowed retries...
+        dr.maybe_resend(to, [131053])
+        dr.maybe_resend(to, [131053])
+        # ...the third hits the cap and must announce it.
+        dr.maybe_resend(to, [131053])
+        await asyncio.sleep(0.05)
+
+    def test_officer_is_told_when_we_give_up(self):
+        _run(self._exhaust())
+        self.assertEqual(len(self.sent), 1, "the officer was never told")
+        body = self.sent[0]["body"]
+        self.assertIn("Rekomtek_000077769.pdf", body)
+        self.assertIn("gagal terkirim", body)
+        # It must not imply the draft was lost — it was made, just not delivered.
+        self.assertIn("sudah selesai dibuat", body)
+
+    def test_notice_is_latched_not_spammed(self):
+        _run(self._exhaust())
+        # More failed statuses for the SAME document must not re-announce.
+        dr.maybe_resend("628999111222", [131053])
+        dr.maybe_resend("628999111222", [131053])
+        _run(asyncio.sleep(0.05))
+        self.assertEqual(len(self.sent), 1, "spammed the officer with notices")
+
+    def test_a_new_document_resets_the_latch(self):
+        _run(self._exhaust())
+        self.assertEqual(len(self.sent), 1)
+        # A genuinely NEW document (different link) must be able to announce too.
+        _run(self._exhaust(link="https://x/dl/tok2", name="SK_000077770.pdf"))
+        self.assertEqual(len(self.sent), 2, "a new document could not announce")
+        self.assertIn("SK_000077770.pdf", self.sent[1]["body"])
+
+    def test_no_notice_while_retries_remain(self):
+        dr.register("628999111222", "https://x/dl/tokA", "a.pdf")
+        dr.maybe_resend("628999111222", [131053])   # attempt 1/2 — still hopeful
+        _run(asyncio.sleep(0.01))
+        self.assertEqual(self.sent, [], "apologised while a retry was still pending")
+
+    def test_non_retryable_code_never_announces(self):
+        dr.register("628999111222", "https://x/dl/tokB", "b.pdf")
+        dr.maybe_resend("628999111222", [131047])   # 24h window — not ours
+        _run(asyncio.sleep(0.01))
+        self.assertEqual(self.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()

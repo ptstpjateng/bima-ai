@@ -96,13 +96,21 @@ def register(
         if not key or not link:
             return
         prev = _records.get(key)
-        retries = prev["retries"] if (prev and prev.get("link") == link) else 0
+        same = bool(prev and prev.get("link") == link)
+        retries = prev["retries"] if same else 0
+        # `notified` latches the give-up notice so a burst of failed statuses
+        # for ONE document can't spam the officer. A genuinely new document
+        # (different link) resets it, exactly like the retry counter — otherwise
+        # the first failure would be announced and every later one silently
+        # swallowed for the life of the process.
+        notified = bool(prev.get("notified")) if same else False
         _records[key] = {
             "link": link,
             "filename": filename or "",
             "caption": caption,
             "sent_at": time.time(),
             "retries": retries,
+            "notified": notified,
         }
         _records.move_to_end(key)
         while len(_records) > _MAX_RECORDS:
@@ -132,6 +140,14 @@ def maybe_resend(recipient: str, error_codes: Optional[list]) -> bool:
                 _mask(recipient), sorted(codes & _RETRYABLE_CODES),
                 rec.get("retries", 0), _MAX_RETRIES,
             )
+            # Giving up SILENTLY leaves a lie standing. The copilot already told
+            # the officer "saya kirim sebagai PDF (Rekomtek_….pdf)" — that text
+            # goes out immediately, while the media fails asynchronously seconds
+            # later. Live 2026-07-17: 131053 × 3, we gave up, and the officer sat
+            # looking at a claim that a document had been sent, with no document
+            # and no correction. A promise left standing after the action failed
+            # is the same defect as never having tried.
+            _notify_give_up(key, rec)
             return False
         # Confirm a running loop BEFORE building the coroutine, so a no-loop path
         # never leaves an un-awaited coroutine (nor counts a retry that never
@@ -163,6 +179,54 @@ def maybe_resend(recipient: str, error_codes: Optional[list]) -> bool:
     except Exception:  # pragma: no cover — never break the webhook handler
         logger.exception("doc_resend.maybe_resend failed (non-fatal)")
         return False
+
+
+def _notify_give_up(key: str, rec: dict[str, Any]) -> None:
+    """Tell the recipient, once, that the document could not be delivered.
+
+    Best-effort and latched. Never raises — a failure to apologise must not
+    break the webhook handler. The filename IS sent to the recipient (it is
+    their document and the copilot already named it) but, per this module's
+    rule, never logged.
+    """
+    try:
+        if rec.get("notified"):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "doc_resend give-up notice not scheduled (no loop) | to=%s",
+                _mask(key),
+            )
+            return
+        rec["notified"] = True
+        task = asyncio.create_task(_send_give_up_notice(key, rec.get("filename") or ""))
+        _resend_tasks.add(task)
+        task.add_done_callback(_discard_task)
+        logger.info("doc_resend give-up notice scheduled | to=%s", _mask(key))
+    except Exception:  # pragma: no cover — never break the webhook handler
+        logger.exception("doc_resend give-up notice failed (non-fatal)")
+
+
+async def _send_give_up_notice(key: str, filename: str) -> None:
+    """Say plainly that the document did not arrive, and what still works."""
+    try:
+        from services.whatsapp_sender import send_text  # lazy: break cycle
+
+        what = f"*{filename}*" if filename else "Dokumen tadi"
+        await send_text(
+            key,
+            f"Mohon maaf — {what} gagal terkirim ke chat ini karena kendala "
+            "pengiriman media di WhatsApp, jadi dokumennya TIDAK jadi masuk. "
+            "Drafnya sudah selesai dibuat, bukan hilang.\n\n"
+            "Silakan minta lagi (mis. \"kirim draf SK\") — biasanya berhasil "
+            "pada percobaan berikutnya. Dokumen final tetap diterbitkan ber-TTE "
+            "oleh SIAP saat berkas disetujui.",
+        )
+        logger.info("doc_resend give-up notice sent | to=%s", _mask(key))
+    except Exception:  # pragma: no cover — best-effort
+        logger.exception("doc_resend give-up notice send raised | to=%s", _mask(key))
 
 
 def _discard_task(task: asyncio.Task) -> None:
