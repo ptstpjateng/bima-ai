@@ -455,6 +455,54 @@ def _decode_officer_session(blob: str) -> OfficerCaseSession:
     )
 
 
+# How long BIMA's score for a case stays retrievable. Generous on purpose: it
+# must outlive the whole approval chain (SLA is 7 working days for PKPP), since
+# the LAST desk still wants the same score the FIRST desk saw.
+_CASE_VALIDATION_TTL = int(os.getenv("BIMA_CASE_VALIDATION_TTL", str(30 * 24 * 3600)))
+
+
+async def _put_case_validation(
+    request_id: Optional[int], validation: Optional[dict[str, Any]]
+) -> None:
+    """Persist BIMA's score for a CASE so it survives the officer who received it.
+
+    Best-effort and never raises: a miss only costs a "-" on a later desk, which
+    is exactly today's behaviour, so failing here must never break a submission.
+    """
+    if request_id is None or not validation:
+        return
+    import json
+
+    try:
+        await session_store.save(
+            session_store.case_validation_key(int(request_id)),
+            json.dumps(validation, ensure_ascii=False),
+            ttl_seconds=_CASE_VALIDATION_TTL,
+        )
+    except Exception:
+        logger.exception(
+            "case validation persist failed (non-fatal) | request_id=%s", request_id
+        )
+
+
+async def _get_case_validation(request_id: Optional[int]) -> Optional[dict[str, Any]]:
+    """BIMA's score for a case, or None. Never raises."""
+    if request_id is None:
+        return None
+    import json
+
+    try:
+        raw = await session_store.load(
+            session_store.case_validation_key(int(request_id)), decode=json.loads
+        )
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        logger.exception(
+            "case validation read failed (non-fatal) | request_id=%s", request_id
+        )
+        return None
+
+
 async def _get_session(channel_id: str) -> Optional[OfficerCaseSession]:
     """Read an officer case: in-memory first, then Redis (rehydrating the LRU
     on a durable hit so a restarted process re-warms on first officer reply)."""
@@ -1098,6 +1146,11 @@ async def notify_officer_of_submission(
     channel = CHANNEL_WHATSAPP if wa else CHANNEL_TELEGRAM
     channel_id = _normalize_wa(wa) if wa else tg
 
+    # Persist the score against the CASE before it is handed to any one officer.
+    # Their session is deleted when they forward; this copy is what every later
+    # desk reads (see notify_next_step).
+    await _put_case_validation(request_id, validation)
+
     sess = OfficerCaseSession(
         channel_id=channel_id,
         channel=channel,
@@ -1331,11 +1384,22 @@ async def notify_next_step(request_id: int) -> bool:
     global _officer_cache
     _officer_cache |= {n for n in officer_whatsapps if n}
 
+    # BIMA's score belongs to the CASE, not to the officer who first saw it.
+    # `base_case` is rebuilt from SIAP, which has no BIMA score, and the desk
+    # that forwarded had their session deleted on the way out — so without this
+    # lookup every desk after the first shows "Skor BIMA: -" and reviews the
+    # file blind. None here degrades to exactly the old behaviour.
+    validation = await _get_case_validation(base_case.request_id)
+    logger.info(
+        "next-step notify | request_id=%s has_score=%s",
+        request_id, validation is not None,
+    )
+
     brief = _render_brief(
         ticket=base_case.ticket,
         license_name=base_case.license_name,
         applicant_name=None,
-        validation=None,
+        validation=validation,
     )
 
     any_sent = False
@@ -1349,7 +1413,7 @@ async def notify_next_step(request_id: int) -> bool:
             license_name=base_case.license_name,
             applicant_name=base_case.applicant_name,
             alamat=base_case.alamat,
-            validation=None,
+            validation=validation,
             documents=dict(base_case.documents),  # per-officer copy
             documents_digest=[],
             is_final_step=base_case.is_final_step,
@@ -1369,7 +1433,7 @@ async def notify_next_step(request_id: int) -> bool:
             sent = await _send_officer_notify(
                 CHANNEL_WHATSAPP, wa_num,
                 license_name=base_case.license_name, ticket=base_case.ticket,
-                validation=None, brief=brief,
+                validation=validation, brief=brief,
             )
         any_sent = any_sent or sent
         logger.info(

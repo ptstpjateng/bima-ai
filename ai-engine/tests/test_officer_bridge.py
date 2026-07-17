@@ -1475,5 +1475,92 @@ class _Ctx_ob:
         return False
 
 
+class TestScoreSurvivesTheForward(unittest.TestCase):
+    """BIMA's score is a property of the CASE, not of one officer's session.
+
+    Live 2026-07-17, ticket 000077767: Betty forwarded to the Kabid, whose alert
+    read "Skor BIMA: -" and whose session carried validation=None. Root cause:
+    the score lived ONLY inside the officer session; the forward CLOSES (deletes)
+    that session (logged closed=True), and notify_next_step rebuilds the next
+    desk from SIAP — which has no BIMA score. So every desk after the first
+    reviewed the file blind, and the first desk's score was unrecoverable.
+    """
+
+    def setUp(self):
+        ob._sessions.clear() if hasattr(ob, "_sessions") else None
+
+    def test_validation_round_trips_by_request_id(self):
+        store = {}
+
+        async def fake_save(key, blob, *, ttl_seconds):
+            store[key] = blob
+            return True
+
+        async def fake_load(key, *, decode):
+            raw = store.get(key)
+            return decode(raw) if raw is not None else None
+
+        v = {"score_percent": 92, "status": "lengkap", "issues": []}
+        with patch.object(ob.session_store, "save", new=fake_save), \
+             patch.object(ob.session_store, "load", new=fake_load):
+            _run(ob._put_case_validation(77767, v))
+            got = _run(ob._get_case_validation(77767))
+        self.assertEqual(got, v)
+        # Keyed by the CASE, never by an officer channel.
+        self.assertIn("bima:case_validation:77767", store)
+
+    def test_missing_validation_degrades_to_none_not_crash(self):
+        async def fake_load(key, *, decode):
+            return None
+
+        with patch.object(ob.session_store, "load", new=fake_load):
+            self.assertIsNone(_run(ob._get_case_validation(77767)))
+        self.assertIsNone(_run(ob._get_case_validation(None)))
+
+    def test_persist_is_best_effort_and_never_raises(self):
+        # A store failure must never break a submission — it only costs a "-".
+        async def boom(key, blob, *, ttl_seconds):
+            raise RuntimeError("redis down")
+
+        with patch.object(ob.session_store, "save", new=boom):
+            _run(ob._put_case_validation(77767, {"score_percent": 92}))  # no raise
+
+    def test_nothing_persisted_without_a_score(self):
+        store = {}
+
+        async def fake_save(key, blob, *, ttl_seconds):
+            store[key] = blob
+            return True
+
+        with patch.object(ob.session_store, "save", new=fake_save):
+            _run(ob._put_case_validation(77767, None))
+            _run(ob._put_case_validation(77767, {}))
+            _run(ob._put_case_validation(None, {"score_percent": 92}))
+        self.assertEqual(store, {})
+
+    def test_the_template_renders_the_score_when_present(self):
+        # The exact symptom: score_percent -> "92%", absent -> "-".
+        sent = {}
+
+        async def fake_send_template(*, recipient_phone, template_name,
+                                     body_params, language_code):
+            sent["params"] = body_params
+            return True
+
+        with patch("services.whatsapp_template.send_template", new=fake_send_template):
+            _run(ob._send_officer_notify(
+                ob.CHANNEL_WHATSAPP, "628123",
+                license_name="PKPP", ticket="000077767",
+                validation={"score_percent": 92}, brief="x"))
+        self.assertEqual(sent["params"][2], "92%")
+
+        with patch("services.whatsapp_template.send_template", new=fake_send_template):
+            _run(ob._send_officer_notify(
+                ob.CHANNEL_WHATSAPP, "628123",
+                license_name="PKPP", ticket="000077767",
+                validation=None, brief="x"))
+        self.assertEqual(sent["params"][2], "-")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
