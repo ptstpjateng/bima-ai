@@ -476,7 +476,8 @@ async def _put_case_validation(
     try:
         await session_store.save(
             session_store.case_validation_key(int(request_id)),
-            json.dumps(validation, ensure_ascii=False),
+            validation,
+            encode=lambda v: json.dumps(v, ensure_ascii=False),
             ttl_seconds=_CASE_VALIDATION_TTL,
         )
     except Exception:

@@ -1490,10 +1490,19 @@ class TestScoreSurvivesTheForward(unittest.TestCase):
         ob._sessions.clear() if hasattr(ob, "_sessions") else None
 
     def test_validation_round_trips_by_request_id(self):
+        # The fakes MUST mirror session_store's real signatures —
+        # save(key, obj, *, encode, ttl_seconds) and load(key, *, decode).
+        # A stub with the wrong arity tests the mock, not the code: the first
+        # version of this test used `save(key, blob, *, ttl_seconds)`, passed
+        # green, and the real call raised
+        # "TypeError: save() missing 1 required keyword-only argument: 'encode'"
+        # in the container — swallowed by _put_case_validation's except, so the
+        # score silently stayed "-": the exact bug this class exists to prevent.
         store = {}
 
-        async def fake_save(key, blob, *, ttl_seconds):
-            store[key] = blob
+        async def fake_save(key, obj, *, encode, ttl_seconds):
+            store[key] = encode(obj)          # exercise the encoder for real
+            self.assertGreater(ttl_seconds, 0)
             return True
 
         async def fake_load(key, *, decode):
@@ -1508,6 +1517,17 @@ class TestScoreSurvivesTheForward(unittest.TestCase):
         self.assertEqual(got, v)
         # Keyed by the CASE, never by an officer channel.
         self.assertIn("bima:case_validation:77767", store)
+        self.assertIsInstance(store["bima:case_validation:77767"], str)
+
+    def test_helpers_bind_to_the_real_session_store_signature(self):
+        # The guard the round-trip test cannot give us: bind the ACTUAL
+        # session_store.save/load signatures against how we call them, so a
+        # drift in either fails HERE instead of silently in production.
+        import inspect
+
+        inspect.signature(ob.session_store.save).bind(
+            "k", {"a": 1}, encode=lambda v: "{}", ttl_seconds=1)
+        inspect.signature(ob.session_store.load).bind("k", decode=lambda s: {})
 
     def test_missing_validation_degrades_to_none_not_crash(self):
         async def fake_load(key, *, decode):
@@ -1519,7 +1539,7 @@ class TestScoreSurvivesTheForward(unittest.TestCase):
 
     def test_persist_is_best_effort_and_never_raises(self):
         # A store failure must never break a submission — it only costs a "-".
-        async def boom(key, blob, *, ttl_seconds):
+        async def boom(key, obj, *, encode, ttl_seconds):
             raise RuntimeError("redis down")
 
         with patch.object(ob.session_store, "save", new=boom):
@@ -1528,8 +1548,8 @@ class TestScoreSurvivesTheForward(unittest.TestCase):
     def test_nothing_persisted_without_a_score(self):
         store = {}
 
-        async def fake_save(key, blob, *, ttl_seconds):
-            store[key] = blob
+        async def fake_save(key, obj, *, encode, ttl_seconds):
+            store[key] = encode(obj)
             return True
 
         with patch.object(ob.session_store, "save", new=fake_save):
