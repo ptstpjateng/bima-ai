@@ -1016,5 +1016,62 @@ class TestNoEmojiInGuidedMessages(_GuidedFlowBase):
             self._assert_clean(_run(gs.maybe_handle(uid, "batal")))
 
 
+class TestPostSubmitAutofillNote(unittest.TestCase):
+    """The note that lands after the ticket reply.
+
+    It costs the citizen a whole extra WhatsApp notification, so it has to stay
+    short AND it must not ask for data BIMA has no way to receive: `_submit`
+    clears the session and leaves it Stage.DONE, so a reply carrying the missing
+    field falls through to the general chat handler and never reaches form 560.
+    """
+
+    FILLED = ["nama_kapal", "gt", "thn_bangun", "tipe", "alat", "bahan",
+              "galangan", "alamat", "nama_pemohon", "tgl_srt_permohonan"]
+
+    def test_no_roll_call_of_filled_fields(self):
+        note = gs._citizen_autofill_note("PPKP", self.FILLED, [], "Pak Rifqi")
+        for key in self.FILLED:
+            self.assertNotIn(
+                gs._citizen_form_label(key), note,
+                f"note re-lists '{key}' — the citizen already satisfied it",
+            )
+        self.assertIn("10 dari 10", note)
+        self.assertTrue(len(note) < 220, f"note is {len(note)} chars: {note}")
+
+    def test_never_promises_an_intake_that_does_not_exist(self):
+        note = gs._citizen_autofill_note(
+            "PPKP", self.FILLED, ["no_siup", "tgl_siup"], "Pak Rifqi"
+        )
+        # The exact false promise the old copy made.
+        self.assertNotIn("kirimkan datanya kepada saya", note.lower())
+        for lure in ("kirimkan", "kirim ke saya", "balas"):
+            self.assertNotIn(lure, note.lower(), f"note invites a reply ('{lure}')")
+        self.assertIn("Petugas", note)
+
+    def test_blanks_are_named_then_counted(self):
+        blanks = ["no_siup", "tgl_siup", "jenis_pengadaan", "perihal_surat_perm",
+                  "bahan", "alat"]
+        note = gs._citizen_autofill_note("PPKP", self.FILLED, blanks, "Pak Rifqi")
+        self.assertIn(gs._citizen_form_label("no_siup"), note)
+        self.assertIn("dan 2 lainnya", note)
+        self.assertNotIn(gs._citizen_form_label("alat"), note)
+        self.assertTrue(len(note) < 320, f"note is {len(note)} chars: {note}")
+
+    def test_uses_the_ktp_salutation(self):
+        note = gs._citizen_autofill_note("PPKP", self.FILLED, [], "Pak Rifqi")
+        self.assertTrue(note.startswith("Pak Rifqi,"), note[:40])
+
+    def test_degrades_to_neutral_salutation(self):
+        note = gs._citizen_autofill_note("PPKP", self.FILLED, [])
+        self.assertTrue(note.startswith("Bapak/Ibu,"), note[:40])
+
+    def test_never_repeats_the_ticket_reply(self):
+        note = gs._citizen_autofill_note(
+            "PPKP", self.FILLED, ["no_siup"], "Pak Rifqi"
+        )
+        for dup in ("tiket", "http", "Pantau status", "berhasil dikirim"):
+            self.assertNotIn(dup, note, f"note repeats the ticket reply ('{dup}')")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -620,14 +620,19 @@ class TestCitizenAutoFill(unittest.TestCase):
         self.assertIn("f1", pc["vision_documents"])
         self.assertEqual(pc["vision_documents"]["f1"]["content"], b"xx")
         self.assertEqual(pc["slot_documents"][0]["file_id"], 991)
-        # A follow-up WhatsApp was sent to the citizen, naming filled + blank
-        # field LABELS (not values).
+        # A follow-up WhatsApp was sent to the citizen: the blank field LABELS
+        # (never the values), the filled ones as a COUNT. It deliberately does
+        # not roll-call what was filled — that work is done and re-listing it
+        # was a second wall of text after the ticket reply.
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["recipient"], "628123456789")
         body = sent[0]["body"]
         self.assertIn("Bapak/Ibu", body)
-        self.assertIn("Nama Pemohon", body)      # filled label
+        self.assertIn("2 dari 5", body)          # filled counted, not listed
+        self.assertNotIn("Nama Pemohon", body)   # a filled label: not re-listed
         self.assertIn("Nama Kapal", body)        # blank label
+        # Never asks for data BIMA cannot receive: the session is gone by now.
+        self.assertNotIn("kirimkan", body.lower())
         # list_documents was consulted for the slot docs.
         self.assertEqual(fake_doc.list_calls, 1)
 
