@@ -29,7 +29,16 @@ services:
     networks:
       - bima-internal
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # `| grep -q PONG` is load-bearing, not style. redis-cli exits 0 on an
+      # ERROR REPLY and only exits non-zero when the connection itself fails —
+      # verified on this exact image: against a requirepass'd server, bare
+      # `redis-cli ping` prints "NOAUTH Authentication required." and still
+      # exits 0. So the bare check only proves the PORT IS OPEN, and reports
+      # healthy while redis rejects every command. ai-engine, admin-api and
+      # backend all gate on `redis: condition: service_healthy`, so a lie here
+      # is a lie the whole stack trusts. Matching the reply makes it mean what
+      # it claims: redis is actually serving commands.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
