@@ -333,3 +333,16 @@ def submission_key(user_id: str) -> str:
 
 def officer_key(channel_id: str) -> str:
     return f"bima:officer_session:{channel_id}"
+
+
+def case_validation_key(request_id: int | str) -> str:
+    """BIMA's score for a CASE, keyed by SIAP request_id — not by officer.
+
+    The score is a property of the REQUEST, not of whoever happens to be looking
+    at it. Storing it only inside an officer's session meant it died the moment
+    that officer forwarded: the forward closes (deletes) their session, and
+    `notify_next_step` rebuilds the next desk's session from SIAP, which has no
+    BIMA score. Every desk after the first therefore saw "Skor BIMA: -".
+    Keyed by request_id so it survives every desk in the chain.
+    """
+    return f"bima:case_validation:{request_id}"
