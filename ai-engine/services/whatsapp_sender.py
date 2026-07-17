@@ -106,6 +106,17 @@ def format_for_whatsapp(text: str) -> str:
     return out
 
 
+def _safe_body(resp) -> str:
+    """APTANA's response body, truncated, for diagnosing an accepted-but-undelivered
+    send. The RESPONSE carries ids/status, not the message text — but truncate
+    anyway so a surprise echo of the body can never dump a citizen's data to logs.
+    """
+    try:
+        return (resp.text or "")[:300].replace("\n", " ")
+    except Exception:
+        return "<unreadable>"
+
+
 async def send_text(recipient_phone: str, body: str, *, preview_url: bool = False) -> bool:
     """Send a freeform WhatsApp text message via APTANA.
 
@@ -153,9 +164,19 @@ async def send_text(recipient_phone: str, body: str, *, preview_url: bool = Fals
                 resp = await client.post(url, json=payload, headers=headers)
 
             if resp.status_code < 300:
+                # A 2xx from APTANA is ACCEPTANCE, not delivery — and not even
+                # proof it dispatched. Live 2026-07-17: two officer replies
+                # logged "APTANA send ok status=200 attempt=1" and Meta returned
+                # NO status callback at all (not even `sent`), while a template
+                # to the same number the minute before went to `delivered`. The
+                # officer saw nothing. We logged success for messages that never
+                # left. Log the body so the next failure explains itself instead
+                # of being invisible — a send that only checks the HTTP code is
+                # the same unverified claim we refuse to let the model make.
                 logger.info(
-                    "APTANA send ok | to=%s status=%d attempt=%d",
+                    "APTANA send accepted | to=%s status=%d attempt=%d body=%s",
                     masked_to, resp.status_code, attempt + 1,
+                    _safe_body(resp),
                 )
                 return True
 
