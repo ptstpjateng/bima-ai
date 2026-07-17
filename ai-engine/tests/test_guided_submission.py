@@ -1073,5 +1073,129 @@ class TestPostSubmitAutofillNote(unittest.TestCase):
             self.assertNotIn(dup, note, f"note repeats the ticket reply ('{dup}')")
 
 
+class TestRequirementQuestions(unittest.TestCase):
+    """The citizen asks about a requirement instead of uploading it.
+
+    Two bugs in one place. The visible one: BIMA answered a question with
+    "silakan upload dokumen persyaratannya" — not listening. The silent one,
+    verified live before the fix: `_capture_typed_field` stored the QUESTION as
+    the applicant's name ("dimana saya bisa dapat surat persetujuan nama kapal"
+    -> applicant_name='kapal') and replied "datanya sudah saya catat", carrying
+    that string into the salutation, form 560, the SK draft and the SIAP profile.
+    """
+
+    def _sess(self):
+        s = gs.SubmissionSession(user_id="wa-req-q")
+        s.license_id = 459
+        s.license_name = "PPKP"
+        s.stage = gs.Stage.COLLECTING_DOCS
+        return s
+
+    # --- the P1: a question must never become a name -----------------------
+
+    def test_question_is_never_stored_as_the_applicant_name(self):
+        for q in [
+            "dimana saya bisa dapat surat persetujuan nama kapal",
+            "gimana cara dapat surat persetujuan nama kapal ya",
+            "pakta integritas itu apa?",
+            "Surat Pesanan harus ngurus kemana?",
+        ]:
+            s = self._sess()
+            captured = gs._capture_typed_field(s, q)
+            self.assertFalse(captured, f"captured a question as a field: {q!r}")
+            self.assertIsNone(
+                s.fields.get("applicant_name"),
+                f"question stored as name: {q!r} -> {s.fields.get('applicant_name')!r}",
+            )
+
+    def test_a_real_name_still_captures(self):
+        # The guard must not break the thing it sits in front of.
+        s = self._sess()
+        self.assertTrue(gs._capture_typed_field(s, "Andi Wijaya"))
+        self.assertEqual(s.fields.get("applicant_name"), "Andi Wijaya")
+
+    def test_a_real_nik_still_captures(self):
+        s = self._sess()
+        self.assertTrue(gs._capture_typed_field(s, "3374012345678901"))
+        self.assertEqual(s.fields.get("nik"), "3374012345678901")
+
+    # --- the answer --------------------------------------------------------
+
+    def test_generate_doc_says_bima_drafts_it(self):
+        a = gs._answer_requirement_question(self._sess(), "pakta integritas itu apa?")
+        self.assertIsNotNone(a)
+        self.assertIn("drafnya saya buatkan", a)
+        self.assertNotIn("minta tinjau petugas", a)  # no escape needed — we have it
+
+    def test_names_the_issuer_the_guide_vouches_for(self):
+        a = gs._answer_requirement_question(
+            self._sess(), "dimana saya bisa dapat surat persetujuan nama kapal?"
+        )
+        self.assertIsNotNone(a)
+        self.assertIn("Hubla", a)
+
+    def test_admits_ignorance_rather_than_guessing_an_office(self):
+        # gambar_kapal carries no `where` — the guide vouches for no issuer.
+        a = gs._answer_requirement_question(
+            self._sess(), "gambar rancang bangun kapal dapatnya di mana?"
+        )
+        self.assertIsNotNone(a)
+        self.assertIn("belum punya informasi", a)
+        self.assertIn("minta tinjau petugas", a)
+
+    def test_never_invents_an_office_or_url(self):
+        # Whatever is asked, an answer may only ever name a vouched-for issuer.
+        vouched = {"Hubla", "OSS"}
+        for q in [
+            "gambar rancang bangun kapal dapatnya di mana?",
+            "spesifikasi teknis alat penangkapan ikan minta dimana?",
+            "KTP pemilik dapat di mana?",
+            "ini gimana ya",
+        ]:
+            a = gs._answer_requirement_question(self._sess(), q) or ""
+            self.assertNotIn("http", a, f"invented a URL for {q!r}")
+            self.assertNotIn(".go.id", a, f"invented a domain for {q!r}")
+            for office in ("Dinas", "Kantor", "Kementerian", "Ditjen"):
+                if office in a:
+                    self.assertTrue(
+                        any(v in a for v in vouched),
+                        f"named an office the guide does not vouch for: {q!r} -> {a!r}",
+                    )
+
+    def test_not_a_question_falls_through(self):
+        # A statement must return None so the capture path still runs.
+        self.assertIsNone(gs._answer_requirement_question(self._sess(), "Andi Wijaya"))
+        self.assertIsNone(gs._answer_requirement_question(self._sess(), "3374012345678901"))
+
+    def test_unmatched_question_does_not_guess(self):
+        a = gs._answer_requirement_question(self._sess(), "ini gimana ya")
+        self.assertIsNotNone(a)
+        self.assertIn("minta tinjau petugas", a)
+
+    # --- ordering ----------------------------------------------------------
+
+    def test_escalation_still_wins_over_the_question_path(self):
+        # "minta tinjau petugas" must escalate, not be answered as a question.
+        s = self._sess()
+        called = {"n": 0}
+
+        async def fake_escalate(sess):
+            called["n"] += 1
+            return "ESCALATED"
+
+        with patch.object(gs, "_escalate_to_officer", new=fake_escalate):
+            r = _run(gs._handle_collecting_docs_text(s, "minta tinjau petugas"))
+        self.assertEqual(r, "ESCALATED")
+        self.assertEqual(called["n"], 1)
+
+    def test_question_answered_before_capture_in_the_real_handler(self):
+        s = self._sess()
+        r = _run(gs._handle_collecting_docs_text(
+            s, "dimana saya bisa dapat surat persetujuan nama kapal?"))
+        self.assertIn("Hubla", r)
+        self.assertNotIn("sudah saya catat", r)
+        self.assertIsNone(s.fields.get("applicant_name"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

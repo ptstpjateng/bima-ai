@@ -201,6 +201,20 @@ def detect_submission_intent(message: str) -> bool:
 # A numeric pick from a disambiguation shortlist ("2").
 _NUMERIC_PICK_RE = re.compile(r"^\s*(\d{1,2})\s*$")
 
+# Is the citizen ASKING rather than answering? Deliberately a regex, not an LLM
+# call: it runs on every text at COLLECTING_DOCS (mostly typed NIKs and names),
+# and it gates `_v_name` — a Gemini round-trip would add latency to the hot path
+# and put a hallucination risk in front of an identity field. Indonesian
+# interrogatives plus the colloquial forms citizens actually type.
+_QUESTION_RE = re.compile(
+    r"(\?|\b(di\s*mana|dimana|kemana|ke\s*mana|bagaimana|gimana|gmn|"
+    r"apakah|apa\s+itu|kenapa|mengapa|kapan|siapa|berapa|"
+    r"cara(nya)?\s+(dapat|dapet|memperoleh|mendapat|mengurus|bikin|buat)|"
+    r"harus\s+(ke\s*mana|kemana|ngurus|mengurus)|"
+    r"minta\s+(di\s*)?mana|dapat(kan|in)?\s+di\s*mana)\b)",
+    re.IGNORECASE,
+)
+
 
 # ===========================================================================
 # Applicant fields — now EXTRACTED from documents, not asked via Q&A.
@@ -232,12 +246,26 @@ def _v_nik(raw: str) -> Optional[str]:
 
 
 def _v_name(raw: str) -> Optional[str]:
-    """Clean a name; reject too-short / no-letter / intent-phrase values."""
+    """Clean a name; reject too-short / no-letter / intent-phrase / question values."""
     s = re.sub(r"\s+", " ", (raw or "")).strip()
     if len(s) < 3 or not re.search(r"[A-Za-z]", s):
         return None
     # Defence in depth: a new-submission intent must never be stored as a name.
     if _SUBMISSION_INTENT_PATTERN.search(s) or re.search(r"ajukan\s+izin", s, re.IGNORECASE):
+        return None
+    # Nor must a QUESTION. At COLLECTING_DOCS `applicant_name` is empty by
+    # definition, so `_capture_typed_field` treats any prose as the name — and
+    # verified live, "dimana saya bisa dapat surat persetujuan nama kapal"
+    # landed as applicant_name='kapal', "pakta integritas itu apa?" landed
+    # whole. BIMA then answered "datanya sudah saya catat" and carried that
+    # string into the salutation, Formulir Isian 560 nama_pemohon, the SK and
+    # Surat Permohonan drafts, and the SIAP profile upsert. A citizen asking a
+    # question is the LEAST likely person to also be stating their name, so
+    # refusing here costs nothing real and stops a silent identity corruption.
+    # This is the last line, not the first: `_handle_collecting_docs_text`
+    # answers the question before capture is ever reached. Both exist because
+    # either alone is one classifier miss away from the same bug.
+    if _QUESTION_RE.search(s):
         return None
     return s
 
@@ -2748,6 +2776,15 @@ async def _handle_collecting_docs_text(sess: SubmissionSession, message: str) ->
     if submission_intent.is_escalation_request(msg):
         return await _escalate_to_officer(sess)
 
+    # The citizen is ASKING, not answering — must precede _capture_typed_field,
+    # which would otherwise read the question as their name. Verified live before
+    # this existed: "dimana saya bisa dapat surat persetujuan nama kapal" was
+    # stored as applicant_name='kapal' and answered "datanya sudah saya catat".
+    # (_v_name now refuses questions too; that is the backstop, this is the fix.)
+    answer = _answer_requirement_question(sess, msg)
+    if answer is not None:
+        return answer
+
     # Capture a typed correction/answer for a missing field (name / NIK).
     captured = _capture_typed_field(sess, msg)
     if captured:
@@ -2787,6 +2824,98 @@ async def _handle_collecting_docs_text(sess: SubmissionSession, message: str) ->
     )
 
 
+_ESCALATION_OFFER = (
+    'Kalau mau saya sambungkan ke petugas, balas *"minta tinjau petugas"*.'
+)
+
+
+def _match_guide_requirement(guide: Optional[dict], message: str) -> Optional[dict]:
+    """Which requirement is the citizen asking about? Longest label match wins.
+
+    Matches on the distinctive words of a label rather than the whole string —
+    nobody types "Surat Persetujuan nama kapal (Ditjen Hubla)" verbatim; they
+    type "surat persetujuan nama kapal". Returns None when no requirement is
+    clearly meant, which routes to the honest generic answer rather than a guess.
+    """
+    if not guide:
+        return None
+    low = " " + re.sub(r"[^\w\s]", " ", (message or "").lower()) + " "
+    best, best_len = None, 0
+    for req in guide.get("requirements") or []:
+        # Strip the parenthetical and stopwords; keep the identifying words.
+        label = re.sub(r"\(.*?\)", " ", req.get("label") or "").lower()
+        words = [w for w in re.findall(r"\w+", label)
+                 if len(w) > 2 and w not in ("dan", "atau", "yang", "dengan")]
+        if not words:
+            continue
+        hits = sum(1 for w in words if f" {w} " in low)
+        # Need most of the label's identifying words, so "kapal" alone doesn't
+        # collide with three different ship-related requirements.
+        if hits >= max(2, len(words) - 1) and hits > best_len:
+            best, best_len = req, hits
+    return best
+
+
+def _answer_requirement_question(
+    sess: SubmissionSession, message: str
+) -> Optional[str]:
+    """Answer 'dimana saya bisa dapat surat X?' — or admit BIMA doesn't know.
+
+    Returns None when this isn't a question, so the caller falls through to the
+    normal capture path.
+
+    NO HALLUCINATION, and the shape of the code enforces it rather than a prompt:
+    there is no model call here and no free text. Every answer is assembled from
+    the curated guide — `kind == 'generate'` means BIMA drafts it (a fact, not a
+    guess), and `where` is only ever present where the guide vouches for the
+    issuer. Anything else says so plainly and offers the officer, who is resolved
+    from SIAP's Alur Izin and can actually answer. Telling a citizen the wrong
+    office sends a real person to the wrong building; "saya belum punya info itu"
+    costs them one question to a human.
+    """
+    if not _QUESTION_RE.search(message or ""):
+        return None
+
+    from services import license_guides
+
+    guide = license_guides.get_guide(sess.license_id)
+    req = _match_guide_requirement(guide, message)
+
+    if req is None:
+        # A question we can't tie to a requirement. Don't guess what they meant.
+        return (
+            "Maaf, saya belum bisa memastikan maksud pertanyaannya — saya tidak "
+            "mau menebak soal dokumen perizinan. "
+            f"{_ESCALATION_OFFER}\n\n"
+            "Kalau dokumennya sudah ada, langsung upload saja di sini ya."
+        )
+
+    label = req.get("label") or "dokumen ini"
+
+    if req.get("kind") == "generate":
+        # The best possible answer: they don't have to find it at all.
+        return (
+            f"*{label}* tidak perlu Bapak/Ibu cari — itu salah satu yang "
+            "*drafnya saya buatkan*. Nanti tinggal ditandatangani + e-meterai.\n\n"
+            "Yang perlu disiapkan sendiri hanya dokumen yang memang terbit dari "
+            "pihak lain. Kirim KTP dulu ya, biar saya bisa mulai."
+        )
+
+    where = req.get("where")
+    if where:
+        return (
+            f"*{label}* diterbitkan oleh {where}. "
+            "Kalau sudah dapat, upload saja di sini ya."
+        )
+
+    # An upload doc whose issuer this guide does NOT vouch for. Say so.
+    return (
+        f"Untuk *{label}*, terus terang saya belum punya informasi cara "
+        "memperolehnya — dan saya tidak mau menebak soal dokumen perizinan. "
+        f"{_ESCALATION_OFFER}"
+    )
+
+
 def _capture_typed_field(sess: SubmissionSession, message: str) -> bool:
     """If the citizen TYPED a missing field (a bare NIK, a name, or 'NIK 33..'),
     store it. Returns True when a field was captured.
@@ -2797,6 +2926,15 @@ def _capture_typed_field(sess: SubmissionSession, message: str) -> bool:
     """
     msg = (message or "").strip()
     changed = False
+
+    # A question is never an answer. This must test the ORIGINAL message, not
+    # the cleaned candidate: `_name_candidate_cleanup` trims the interrogative
+    # away first, so "dimana saya bisa dapat surat persetujuan nama kapal"
+    # reaches `_v_name` as the perfectly name-shaped "kapal" — which is exactly
+    # how it got stored as the applicant's name. `_v_name`'s own guard cannot
+    # see what was already cut off, so the check belongs here too.
+    if _QUESTION_RE.search(msg):
+        return False
 
     if not sess.fields.get("nik"):
         m = _NIK_RUN_RE.search(msg)
