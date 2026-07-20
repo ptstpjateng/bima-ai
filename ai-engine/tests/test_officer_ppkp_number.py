@@ -375,10 +375,22 @@ class TestSetPpkpNumber(_SetPpkpBase):
         self.assertEqual(call["files"], {})
         # The form was DISCOVERED for (license_id, "no_ppkp"), not hardcoded.
         self.assertEqual(self._calls["get_form_id_for_field"], (459, "no_ppkp"))
-        # Confirmation echoes the exact number + steers to verify/Simpan.
+        # Confirmation echoes the exact number and names the form it landed in.
         self.assertIn("2026/1234/01", out)
         self.assertIn("Penomoran", out)
-        self.assertIn("Simpan", out)
+        # It must confirm the value is already stored...
+        self.assertIn("tersimpan", out)
+        # ...and must NOT steer the officer to go open the form and press Simpan.
+        # The upsert has already committed to ptsp.form_value and
+        # get_all_form_values reads it back (verified live on ticket 77773 with
+        # nobody touching the form), so that steer was busywork -- and officers
+        # read it as "the write failed".
+        #
+        # Asserted on the imperative, not the bare word "Simpan": the copy
+        # legitimately contains it in the negation "tidak perlu Anda buka atau
+        # Simpan lagi", which is the opposite of the instruction being banned.
+        self.assertNotIn("klik Simpan", out)
+        self.assertNotIn("buka form Penomoran", out)
 
     def test_trims_surrounding_whitespace(self):
         fc = _FakeFormClient()
