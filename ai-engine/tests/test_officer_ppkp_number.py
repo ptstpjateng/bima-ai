@@ -378,11 +378,19 @@ class TestSetPpkpNumber(_SetPpkpBase):
         # Confirmation echoes the exact number and names the form it landed in.
         self.assertIn("2026/1234/01", out)
         self.assertIn("Penomoran", out)
-        # It must NOT steer the officer to open the form and press Simpan. The
-        # upsert has already committed to ptsp.form_value and get_all_form_values
-        # sees it (verified live on ticket 77773 with nobody touching the form),
-        # so that steer was busywork -- and officers read it as "the write failed".
-        self.assertNotIn("Simpan", out)
+        # It must confirm the value is already stored...
+        self.assertIn("tersimpan", out)
+        # ...and must NOT steer the officer to go open the form and press Simpan.
+        # The upsert has already committed to ptsp.form_value and
+        # get_all_form_values reads it back (verified live on ticket 77773 with
+        # nobody touching the form), so that steer was busywork -- and officers
+        # read it as "the write failed".
+        #
+        # Asserted on the imperative, not the bare word "Simpan": the copy
+        # legitimately contains it in the negation "tidak perlu Anda buka atau
+        # Simpan lagi", which is the opposite of the instruction being banned.
+        self.assertNotIn("klik Simpan", out)
+        self.assertNotIn("buka form Penomoran", out)
 
     def test_trims_surrounding_whitespace(self):
         fc = _FakeFormClient()
