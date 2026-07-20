@@ -65,6 +65,13 @@ services:
         condition: service_healthy
     volumes:
       - chroma_data:/app/chroma_db
+      # Runtime state that MUST survive a rebuild: the transparency-poller
+      # cursor + the notification engagement/opt-out ledgers all live under
+      # /app/data. Without this volume every `up --build` wiped them — the
+      # cursor reset to 0 and the poller re-crawled the whole SIAP backlog.
+      # Head-seek + the freshness gate make an empty (first-deploy) volume
+      # harmless; from then on this keeps the cursor across deploys.
+      - ai_engine_state:/app/data
     networks:
       - bima-internal
       - bima-public
@@ -304,6 +311,9 @@ volumes:
   postgres_data:
   redis_data:
   chroma_data:
+  # ai-engine runtime state that must outlive a rebuild: transparency-poller
+  # cursor + notification engagement/opt-out ledgers (all under /app/data).
+  ai_engine_state:
   backend_storage:
   caddy_data:
   caddy_config:
