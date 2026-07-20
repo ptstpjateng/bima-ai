@@ -178,8 +178,13 @@ _SUBMISSION_INTENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# NOTE the ijin/izin pair: "ijin" is an extremely common Indonesian spelling and
+# citizens type it constantly. Missing it cost us a live rehearsal turn — "saya
+# mau urus ijin PKPP" failed the strict gate, fell through to the collecting-docs
+# handler, and got answered with the requirement-question deflection instead of
+# switching licence. Keep both spellings (and perijinan/perizinan) forever.
 _LICENSING_OBJECT_PATTERN = re.compile(
-    r"\b(izin|perizinan|permohonan|permit|licen[cs]e|lisensi|nib|"
+    r"\b(i[zj]in|per[iı][zj]inan|permohonan|permit|licen[cs]e|lisensi|nib|"
     r"sertifikat\s+standar|sertifikat)\b",
     re.IGNORECASE,
 )
@@ -2927,7 +2932,17 @@ def _answer_requirement_question(
     req = _match_guide_requirement(guide, message)
 
     if req is None:
-        # A question we can't tie to a requirement. Don't guess what they meant.
+        # Nothing matched. Do NOT hijack the turn — this handler runs early, and
+        # swallowing every unmatched question here starves the paths behind it.
+        # Live 2026-07-20: "Halo saya mau urus ijin PKPP gimana ya" is a request
+        # to CHANGE LICENCE, but "gimana" made it look like a question, nothing
+        # matched, and the citizen got "saya tidak mau menebak" instead of the
+        # licence switch. A message carrying a filing intent belongs to the
+        # new-submission path, so hand it back.
+        if detect_submission_intent(message) or detect_soft_submission_intent(message):
+            return None
+        # A genuine question we cannot tie to a requirement: say so honestly
+        # rather than guess at a permit document.
         return (
             "Maaf, saya belum bisa memastikan maksud pertanyaannya — saya tidak "
             "mau menebak soal dokumen perizinan. "
