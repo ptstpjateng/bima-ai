@@ -782,5 +782,82 @@ class TestSigningRolesMatchRealSiap(unittest.TestCase):
         self.assertNotIn("pemohon online", sdb._SK_SIGNING_ROLES)
 
 
+class TestFinalStepNotifySendsOneMessage(unittest.TestCase):
+    """A signing desk must receive exactly ONE message.
+
+    Regression for the live ticket 000077774 defect: the Kepala Dinas got BOTH
+    the signing brief AND the approved officer template, whose Meta-approved
+    body is REVIEW copy ("Berkas baru untuk diperiksa ... untuk mulai memeriksa
+    berkas") — telling the signer to review rather than sign, with no link.
+
+    ⚠️  PATCH AT THE TRANSPORT BOUNDARY. The rest of this file patches
+    `_send_officer_notify`, which the SIGNING path does not call. Patching that
+    here would leave the real `send_template` in the call graph, and
+    `whatsapp_template.send_template` guards only on the API token + sender
+    number being set — both ARE set inside the container, so the call would go
+    to live APTANA. A UTILITY template is the one message class designed to
+    penetrate a cold 24h window, and the fixtures carry real officer numbers.
+    It would land on an actual official's phone. Patch send_text/send_template.
+    """
+
+    _KWARGS = dict(license_name="PKPP", ticket="000077774", request_id=77774)
+
+    def test_default_sends_only_the_signing_brief(self):
+        wa = AsyncMock(return_value=True)
+        tpl = AsyncMock(return_value=True)
+        with patch.dict("os.environ", {"BIMA_SIGNING_COLD_TEMPLATE": "false"}, clear=False):
+            with patch("services.whatsapp_sender.send_text", new=wa):
+                with patch("services.whatsapp_template.send_template", new=tpl):
+                    ok = _run(ob._send_final_step_notify(
+                        ob.CHANNEL_WHATSAPP, "628123456789", **self._KWARGS
+                    ))
+        self.assertTrue(ok)
+        # Exactly one outbound, and it is NOT the review-copy template.
+        self.assertEqual(wa.await_count, 1)
+        self.assertEqual(tpl.await_count, 0)
+        body = wa.await_args.kwargs["body"]
+        self.assertIn("ditandatangani", body)          # signing copy, not review
+        self.assertNotIn("mulai memeriksa berkas", body)
+
+    def test_opt_in_flag_restores_the_cold_window_template(self):
+        wa = AsyncMock(return_value=True)
+        tpl = AsyncMock(return_value=True)
+        with patch.dict("os.environ", {"BIMA_SIGNING_COLD_TEMPLATE": "1"}, clear=False):
+            with patch("services.whatsapp_sender.send_text", new=wa):
+                with patch("services.whatsapp_template.send_template", new=tpl):
+                    ok = _run(ob._send_final_step_notify(
+                        ob.CHANNEL_WHATSAPP, "628123456789", **self._KWARGS
+                    ))
+        self.assertTrue(ok)
+        self.assertEqual(wa.await_count, 1)
+        self.assertEqual(tpl.await_count, 1)
+
+    def test_unaccepted_brief_reports_false_not_true(self):
+        # The old code returned `template_sent or link_sent`, so a brief that
+        # never left still logged sent=True. Silence must not read as success.
+        wa = AsyncMock(return_value=False)
+        tpl = AsyncMock(return_value=True)
+        with patch.dict("os.environ", {"BIMA_SIGNING_COLD_TEMPLATE": "false"}, clear=False):
+            with patch("services.whatsapp_sender.send_text", new=wa):
+                with patch("services.whatsapp_template.send_template", new=tpl):
+                    ok = _run(ob._send_final_step_notify(
+                        ob.CHANNEL_WHATSAPP, "628123456789", **self._KWARGS
+                    ))
+        self.assertFalse(ok)
+        self.assertEqual(tpl.await_count, 0)
+
+    def test_telegram_path_unaffected(self):
+        tg = AsyncMock(return_value=True)
+        tpl = AsyncMock(return_value=True)
+        with patch("services.telegram_sender.send_text", new=tg):
+            with patch("services.whatsapp_template.send_template", new=tpl):
+                ok = _run(ob._send_final_step_notify(
+                    ob.CHANNEL_TELEGRAM, "12345", **self._KWARGS
+                ))
+        self.assertTrue(ok)
+        self.assertEqual(tg.await_count, 1)
+        self.assertEqual(tpl.await_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

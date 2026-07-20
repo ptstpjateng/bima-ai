@@ -1858,6 +1858,20 @@ _OFFICER_TEMPLATE_NAME = os.getenv("BIMA_OFFICER_TEMPLATE_NAME", "bima_officer_n
 _OFFICER_TEMPLATE_LANG = os.getenv("BIMA_OFFICER_TEMPLATE_LANG", "id").strip() or "id"
 
 
+def _signing_cold_template_enabled() -> bool:
+    """Whether the SIGNING desk also gets the review-copy template as a
+    cold-window companion. OFF by default: that template says "Berkas baru
+    untuk diperiksa ... untuk mulai memeriksa berkas", which instructs a signer
+    to review rather than sign and carries no signing link. Read at call time
+    (not import time) so it can be flipped without a rebuild."""
+    return os.getenv("BIMA_SIGNING_COLD_TEMPLATE", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 async def _send_officer_notify(
     channel: str,
     channel_id: str,
@@ -1943,18 +1957,40 @@ async def _send_final_step_notify(
 ) -> bool:
     """Alert the LAST-step signer + hand them the SIAP signing magic-link.
 
-    WhatsApp: fire the approved template first (reaches a cold number outside
-    the 24h window), then best-effort a free-form message carrying the magic
-    link (delivered when inside the window; a bounce is harmless — the copilot
-    also surfaces the link on reply via get_siap_signing_link). Telegram gets
-    the link brief directly. Never raises."""
+    ONE message: the free-form signing brief, which carries both the correct
+    copy ("Berkas siap ditandatangani") and the SIAP signing link.
+
+    This used to ALSO fire the approved officer template. That template's
+    Meta-approved body is REVIEW copy — "Berkas baru untuk diperiksa ... Balas
+    pesan ini untuk mulai memeriksa berkas" — which is the wrong instruction for
+    a signer, and it carries no signing link. A Kepala Dinas therefore received
+    two messages telling them to do two different things, observed live on
+    ticket 000077774 (two accepted sends 0.2 s apart).
+
+    DELIBERATE TRADE-OFF: free-form only delivers inside WhatsApp's 24h customer
+    service window. A signer who has not messaged BIMA in 24h now gets NOTHING
+    from this call — they can still reach the link by replying, since signature
+    mode exposes get_siap_signing_link, but that is a pull, not a push. Set
+    BIMA_SIGNING_COLD_TEMPLATE=1 to restore the template as a companion send
+    where guaranteed delivery matters more than correct wording. The real fix is
+    a dedicated Meta-approved signing template (see BIMA_SIGNING_TEMPLATE_NAME
+    in the ops runbook); until that exists this is a choice between copy that
+    always lands and copy that is right.
+
+    Never raises."""
     sign_url = _build_sk_sign_url(request_id=request_id, ticket=ticket)
     brief = _render_sk_sign_brief(
         license_name=license_name, ticket=ticket, sign_url=sign_url
     )
 
-    if channel == CHANNEL_WHATSAPP and _OFFICER_TEMPLATE_NAME:
-        # Template alert (cold-window safe). Reuse the approved arity; the third
+    brief_sent = await _send(channel, channel_id, brief)
+
+    if (
+        channel == CHANNEL_WHATSAPP
+        and _OFFICER_TEMPLATE_NAME
+        and _signing_cold_template_enabled()
+    ):
+        # Opt-in companion for cold numbers. Reuses the approved arity; the third
         # param is a status label rather than a score at the signing desk.
         template_sent = False
         try:
@@ -1970,9 +2006,22 @@ async def _send_final_step_notify(
             logger.exception(
                 "final-step template send failed | officer=%s", _mask(channel_id)
             )
-        # Best-effort in-window link delivery; a bounce outside 24h is fine.
-        link_sent = await _send(channel, channel_id, brief)
-        return bool(template_sent or link_sent)
+        if not (brief_sent or template_sent):
+            logger.warning(
+                "final-step notify: NEITHER brief nor template accepted | "
+                "officer=%s | ticket=%s",
+                _mask(channel_id),
+                ticket,
+            )
+        return bool(brief_sent or template_sent)
 
-    # Telegram, or template disabled → free-form signing brief directly.
-    return await _send(channel, channel_id, brief)
+    if not brief_sent:
+        # Do not let a silent non-delivery read as success — the caller logs
+        # sent=<this>. Outside the 24h window this is the expected outcome.
+        logger.warning(
+            "final-step notify: signing brief NOT accepted (signer likely outside "
+            "the 24h window; link remains available on reply) | officer=%s | ticket=%s",
+            _mask(channel_id),
+            ticket,
+        )
+    return brief_sent
