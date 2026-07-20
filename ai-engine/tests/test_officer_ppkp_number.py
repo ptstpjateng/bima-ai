@@ -375,10 +375,14 @@ class TestSetPpkpNumber(_SetPpkpBase):
         self.assertEqual(call["files"], {})
         # The form was DISCOVERED for (license_id, "no_ppkp"), not hardcoded.
         self.assertEqual(self._calls["get_form_id_for_field"], (459, "no_ppkp"))
-        # Confirmation echoes the exact number + steers to verify/Simpan.
+        # Confirmation echoes the exact number and names the form it landed in.
         self.assertIn("2026/1234/01", out)
         self.assertIn("Penomoran", out)
-        self.assertIn("Simpan", out)
+        # It must NOT steer the officer to open the form and press Simpan. The
+        # upsert has already committed to ptsp.form_value and get_all_form_values
+        # sees it (verified live on ticket 77773 with nobody touching the form),
+        # so that steer was busywork -- and officers read it as "the write failed".
+        self.assertNotIn("Simpan", out)
 
     def test_trims_surrounding_whitespace(self):
         fc = _FakeFormClient()

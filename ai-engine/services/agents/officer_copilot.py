@@ -429,10 +429,18 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "berikan dan TIDAK PERNAH mengarang nomor izin. Bila petugas belum menyebut "
     "nomornya, MINTA dulu nomornya (jangan menulis apa pun). Tgl. Penetapan "
     "DITETAPKAN SIAP saat penetapan (bukan field yang bisa diisi) — biarkan kosong, "
-    "jangan mencoba menuliskannya. Setelah tool dijalankan, sampaikan agar petugas "
-    "membuka form Penomoran di SIAP, memeriksa nomornya, lalu klik Simpan; SK final "
-    "ber-TTE diterbitkan SIAP dari form itu. Ini BUKAN tindakan teruskan/keputusan — "
-    "jangan meneruskan atau memutuskan berkas setelahnya.\n\n"
+    "jangan mencoba menuliskannya. Setelah tool BERHASIL, nomor itu SUDAH "
+    "TERSIMPAN di form Penomoran SIAP dan SK akan memuatnya — JANGAN menyuruh "
+    "petugas membuka form Penomoran atau menekan Simpan; itu keliru dan membuat "
+    "petugas mengerjakan ulang hal yang sudah selesai. Cukup konfirmasi nomornya "
+    "sudah tersimpan, lalu tawarkan langkah berikutnya. Petugas boleh "
+    "memverifikasi di SIAP bila ingin, tetapi itu OPSIONAL, bukan keharusan. "
+    "Ini BUKAN tindakan teruskan/keputusan — jangan meneruskan atau memutuskan "
+    "berkas setelahnya.\n"
+    "Bila petugas menyebut nomor PPKP DI DALAM permintaan draf (mis. 'buatkan "
+    "draf SK dengan nomor 125/35/901'), tuliskan nomornya DULU dengan "
+    "`set_ppkp_number`, BARU panggil `draft_sk` — supaya drafnya langsung memuat "
+    "nomor itu dan petugas tidak perlu meminta dua kali.\n\n"
     "=== ATURAN MUTLAK — TINDAKAN YANG MENGUBAH DATA (forward & decision) ===\n"
     "Anda memiliki dua tool yang MENGUBAH data di SIAP: `forward_case` "
     "(meneruskan berkas ke meja berikutnya) dan `record_decision` "
@@ -2504,13 +2512,19 @@ async def set_ppkp_number(nomor_ppkp: str) -> str:
             + _siap_edit_link_line(request_id)
         )
 
-    # (g) SUCCESS — confirm, steer the officer to verify + Simpan, note that SIAP
-    #     issues the final SK ber-TTE from the form. Do NOT auto-forward/decide.
+    # (g) SUCCESS — the upsert has COMMITTED to ptsp.form_value (form 768) and is
+    #     already visible to the SK renderer via get_all_form_values; verified live
+    #     on ticket 77773 with nobody opening the form. So do NOT tell the officer
+    #     to open Penomoran and press Simpan — that is finished work, and asking
+    #     for it made officers think the write had failed. Confirm + offer the next
+    #     step instead. Verification stays available, but as an OPTION.
+    #     Still no auto-forward/decide.
     return (
-        f"No. PPKP sudah saya tuliskan ke form Penomoran PPKP di SIAP: {number}. "
-        "Langkah Anda: buka form Penomoran permohonan ini di SIAP, PERIKSA nomornya, "
-        "lalu klik Simpan. SK final ber-TTE diterbitkan SIAP dari form itu — saya "
-        "tidak meneruskan atau memutuskan berkas ini. "
+        f"No. PPKP {number} sudah tersimpan di form Penomoran PPKP di SIAP — "
+        "tidak perlu Anda buka atau Simpan lagi, dan SK yang dibuat akan memuat "
+        "nomor ini. Berikutnya, silakan minta saya menyusun draf SK-nya, atau "
+        "teruskan berkas bila sudah sesuai — saya tidak meneruskan atau "
+        "memutuskan berkas ini sendiri. "
         + _siap_edit_link_line(request_id)
     )
 
@@ -3328,8 +3342,12 @@ _FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
             "menulis PERSIS nilai yang petugas berikan — TIDAK PERNAH mengarang "
             "nomor izin. Bila petugas belum menyebut nomornya, MINTA dulu (jangan "
             "menulis apa pun). BUKAN tindakan keputusan/teruskan — hanya menulis "
-            "isian, jadi TIDAK perlu konfirmasi. SIAP menerbitkan SK final ber-TTE "
-            "dari form itu; petugas cukup memeriksa lalu Simpan."
+            "isian, jadi TIDAK perlu konfirmasi. Nomor langsung TERSIMPAN di SIAP "
+            "begitu tool berhasil — petugas TIDAK perlu membuka form atau menekan "
+            "Simpan. PENTING: bila petugas menyebut nomor PPKP di dalam permintaan "
+            "draf (mis. 'buatkan draf SK dengan nomor 125/35/901'), panggil tool "
+            "INI DULU dengan nomor tersebut, BARU panggil `draft_sk` — supaya "
+            "drafnya memuat nomor itu."
         ),
         "parameters": {
             "type": "object",
