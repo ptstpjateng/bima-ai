@@ -76,6 +76,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -117,8 +118,26 @@ _PAGE_LIMIT: int = int(os.getenv("TRANSPARENCY_POLL_LIMIT", "50") or "50")
 # how many changes a SINGLE tick will turn into notifications so a cold start
 # cannot fan out hundreds of WhatsApp messages at once. Excess changes in the
 # batch still advance the cursor (they are treated as already-historical).
+#
+# ⚠️  This cap is now the FALLBACK, not the primary cold-start defence. It only
+# skips the FIRST page (limit rows); the log tail after that is treated as live
+# traffic. The primary defence is head-seek (`_seek_head`, jump the cursor to
+# max(log_id) on a cold start) plus the freshness gate below. The cap only runs
+# when head-seek can't (SIAP DB unreachable). See _poll_once.
 _INITIAL_CATCHUP_CAP: int = int(
     os.getenv("TRANSPARENCY_INITIAL_CATCHUP_CAP", "0") or "0"
+)
+
+# Freshness gate — the STRUCTURAL safety invariant. A change older than this is
+# never turned into a notification, no matter how the cursor got to it (fresh
+# deploy, wiped cursor file, corrupt file → 0, a replayed backlog page). Even a
+# full-backlog replay sends nothing, because history is old. Fail CLOSED: a
+# missing or unparseable `changed_at` is treated as stale and skipped — we would
+# rather miss one fresh ping than replay ancient history to a live citizen.
+# 24h matches the WhatsApp customer-service window; only a handful of the ~310k
+# log rows fall inside it at any time.
+_MAX_EVENT_AGE_HOURS: float = float(
+    os.getenv("TRANSPARENCY_MAX_EVENT_AGE_HOURS", "24") or "24"
 )
 
 # Where the monotonic cursor is persisted. A JSON file, written atomically.
@@ -365,6 +384,33 @@ async def _resolve_ticket_and_license(
 
 
 # ---------------------------------------------------------------------------
+# Cold-start head seek — jump the cursor to the newest log_id in one query so a
+# fresh/wiped cursor does not crawl the entire backlog at limit-rows-per-tick.
+# ---------------------------------------------------------------------------
+
+_SQL_HEAD_LOG_ID = "SELECT max(log_id) AS head FROM ptsp.license_log"
+
+
+async def _seek_head() -> Optional[int]:
+    """Return the newest `log_id` in SIAP's change log, or None if the SIAP DB
+    is unconfigured/unreachable (the caller then falls back to the catch-up
+    cap). Reuses the same read-only pool as `_lookup_person`; `max(log_id)` is
+    an index scan on the primary key, not a table walk."""
+    if not is_siap_db_configured():
+        return None
+    try:
+        pool = await get_siap_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_HEAD_LOG_ID)
+    except Exception:  # pragma: no cover — never crash the loop
+        logger.exception("transparency head seek failed")
+        return None
+    if row is None or row["head"] is None:
+        return None
+    return int(row["head"])
+
+
+# ---------------------------------------------------------------------------
 # Change → notification-event mapping.
 #
 # Conservative by design (charter: "if a change doesn't clearly map, skip it,
@@ -420,6 +466,47 @@ _PROGRESS_TOKENS = (
 
 def _norm(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _parse_changed_at(raw: Any) -> Optional[datetime]:
+    """Parse a SIAP `changed_at` (from `log.created_on`) into a tz-aware UTC
+    datetime, or None if it cannot be parsed. Tolerant of the common shapes:
+    ISO with a trailing 'Z', ISO with a '+00:00' offset, and a naive
+    'YYYY-MM-DD HH:MM:SS[.ffffff]' (assumed UTC — SIAP stores created_on in
+    UTC). Returns None on anything else, so the caller can fail closed."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # Normalise a trailing 'Z' (fromisoformat only accepts it on 3.11+).
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    for candidate in (s, s.replace(" ", "T", 1)):
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        # A naive timestamp is UTC by SIAP's convention.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def _change_is_fresh(change: dict, *, now: Optional[datetime] = None) -> bool:
+    """True only if the change happened within `_MAX_EVENT_AGE_HOURS`.
+
+    FAIL CLOSED: a missing / unparseable `changed_at` returns False. Future
+    timestamps (SIAP slightly ahead of ai-engine, or clock skew) count as fresh
+    — the gate exists to reject ANCIENT history, not to police clocks. This is
+    the invariant that makes a wiped/reset cursor safe: replayed backlog rows
+    are old, so they never notify however the cursor reached them."""
+    ts = _parse_changed_at(change.get("changed_at"))
+    if ts is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (now - ts) <= timedelta(hours=_MAX_EVENT_AGE_HOURS)
 
 
 def _classify_change(change: dict) -> Optional[str]:
@@ -505,6 +592,20 @@ async def _process_change(change: dict) -> None:
 
     if log_id is None:
         logger.warning("transparency change missing log_id — skipped")
+        return
+
+    # Freshness gate — before ANY classification or send. A stale change (or one
+    # with no parseable timestamp) is skipped here; the caller still advances the
+    # cursor past it, so history is consumed but never notified. This is what
+    # keeps a wiped/reset cursor from replaying the backlog to live citizens.
+    if not _change_is_fresh(change):
+        logger.info(
+            "transparency change %s older than %.0fh (changed_at=%r) — skipped, "
+            "not notifying on historical events",
+            log_id,
+            _MAX_EVENT_AGE_HOURS,
+            change.get("changed_at"),
+        )
         return
 
     event = _classify_change(change)
@@ -625,6 +726,24 @@ async def _poll_once() -> None:
         return
 
     since = _load_cursor()
+
+    # Cold start (fresh deploy, wiped/corrupt cursor file → 0): jump straight to
+    # the newest log_id instead of crawling 300k+ rows at a page per tick. No
+    # historical notification is ever sent — the freshness gate would drop them
+    # anyway, this just skips the days-long crawl. If the SIAP DB is unreachable
+    # we fall through to the old cap-based guard below (and the freshness gate
+    # still protects every row).
+    if since == 0:
+        head = await _seek_head()
+        if head is not None and head > 0:
+            _save_cursor(head)
+            logger.warning(
+                "transparency cold start — fast-forwarded cursor 0 → %s (head); "
+                "no historical notifications sent",
+                head,
+            )
+            return
+
     data = await _fetch_changes(since)
     if data is None:
         return  # soft-fail already logged; retry next interval
